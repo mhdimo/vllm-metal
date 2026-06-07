@@ -18,6 +18,9 @@ _SPATIAL_MERGE_SIZE = 2
 _IMAGE_GRID_THW_2X2 = (1, 4, 4)
 _IMAGE_TOKEN_COUNT_2X2 = 4
 _RAW_PATCH_COUNT_2X2 = 16
+_TEXT_TOKEN_ID = 10
+_VISION_START_TOKEN_ID = 20
+_IMAGE_PLACEHOLDER_TOKEN_ID = 30
 
 
 class _RecordingLanguageModel:
@@ -90,6 +93,54 @@ class _RecordingVisual:
             }
         )
         return mx.ones((_IMAGE_TOKEN_COUNT_2X2, 8), dtype=mx.float32)
+
+
+class _RealPaddleOCRVLGetRopeIndexLanguageModel:
+    def __init__(self) -> None:
+        try:
+            from mlx_vlm.models.paddleocr_vl.config import (
+                ModelConfig,
+                TextConfig,
+                VisionConfig,
+            )
+            from mlx_vlm.models.paddleocr_vl.language import LanguageModel
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("mlx_vlm"):
+                pytest.skip("mlx-vlm is only installed on Darwin/arm64")
+            raise
+        except RuntimeError as exc:
+            if "No Metal device available" in str(exc):
+                pytest.skip("mlx-vlm import requires a Metal device")
+            raise
+
+        self._language_model_cls = LanguageModel
+        self.config = ModelConfig(
+            text_config=TextConfig(), vision_config=VisionConfig()
+        )
+        self.model = SimpleNamespace(embed_tokens=lambda input_ids: input_ids + 1)
+
+    @property
+    def image_token_id(self) -> int:
+        return int(self.config.image_token_id)
+
+    @property
+    def vision_start_token_id(self) -> int:
+        return int(self.config.vision_start_token_id)
+
+    def get_rope_index(
+        self,
+        input_ids: mx.array,
+        image_grid_thw: mx.array | None = None,
+        video_grid_thw: mx.array | None = None,
+        attention_mask: mx.array | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        return self._language_model_cls.get_rope_index(
+            self,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            attention_mask,
+        )
 
 
 def _adapter(
@@ -176,16 +227,51 @@ class TestPaddleOCRVLMultimodalAdapterValidation:
         with pytest.raises(error_type, match=match):
             _adapter().get_mrope_input_positions([1, 2, 3], [feature])
 
-    def test_multiple_images_per_request_rejected(self) -> None:
-        # Guard against mlx-vlm < 0.6 multi-image position corruption; see
-        # mlx-vlm#1282.  Remove together with the adapter guard on bump.
+    def test_multiple_images_per_request_delegated_in_offset_order(self) -> None:
+        language_model = _RecordingLanguageModel()
+        adapter = _adapter(language_model=language_model)
         features = [
-            _feature(offset=1, grid_thw=(1, 4, 4), length=4, raw_patches=16),
             _feature(offset=8, grid_thw=(1, 6, 4), length=6, raw_patches=24),
+            _feature(offset=2, grid_thw=(1, 4, 4), length=4, raw_patches=16),
         ]
+        input_tokens = (
+            [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+            + [_IMAGE_PLACEHOLDER_TOKEN_ID] * _IMAGE_TOKEN_COUNT_2X2
+            + [_TEXT_TOKEN_ID, _VISION_START_TOKEN_ID]
+            + [_IMAGE_PLACEHOLDER_TOKEN_ID] * 6
+            + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID]
+        )
 
-        with pytest.raises(NotImplementedError, match="mlx-vlm#1282"):
-            _adapter().get_mrope_input_positions([1] * 12, features)
+        adapter.get_mrope_input_positions(input_tokens, features)
+
+        call = language_model.rope_calls[0]
+        assert call["input_ids"].tolist() == [input_tokens]
+        assert call["image_grid_thw"].tolist() == [[1, 4, 4], [1, 6, 4]]
+
+    def test_multiple_images_exercise_real_mlx_vlm_rope_index(self) -> None:
+        language_model = _RealPaddleOCRVLGetRopeIndexLanguageModel()
+        adapter = _adapter(language_model=language_model)
+        features = [
+            _feature(offset=8, grid_thw=(1, 6, 4), length=6, raw_patches=24),
+            _feature(offset=2, grid_thw=(1, 4, 4), length=4, raw_patches=16),
+        ]
+        input_tokens = (
+            [_TEXT_TOKEN_ID, language_model.vision_start_token_id]
+            + [language_model.image_token_id] * _IMAGE_TOKEN_COUNT_2X2
+            + [_TEXT_TOKEN_ID, language_model.vision_start_token_id]
+            + [language_model.image_token_id] * 6
+            + [_TEXT_TOKEN_ID, _TEXT_TOKEN_ID]
+        )
+
+        positions, delta = adapter.get_mrope_input_positions(input_tokens, features)
+
+        assert positions.shape == (3, 1, 16)
+        assert delta == -5
+        assert positions[:, 0, :].tolist() == [
+            [0, 1, 2, 2, 2, 2, 4, 5, 6, 6, 6, 6, 6, 6, 9, 10],
+            [0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 10],
+            [0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 6, 7, 6, 7, 9, 10],
+        ]
 
 
 class TestPaddleOCRVLMultimodalAdapterPositions:
@@ -237,6 +323,23 @@ class TestPaddleOCRVLMultimodalAdapterEncodeMultimodal:
         assert call["pixel_values"].shape == (1, _RAW_PATCH_COUNT_2X2, 3, 14, 14)
         assert call["image_grid_thw"].tolist() == [[1, 4, 4]]
         assert call["output_hidden_states"] is False
+
+    def test_encodes_multiple_image_features(self) -> None:
+        visual = _RecordingVisual()
+        adapter = _adapter(visual=visual)
+        features = [
+            _feature(offset=1, grid_thw=(1, 4, 4), raw_patches=16),
+            _feature(offset=8, grid_thw=(1, 6, 4), raw_patches=24),
+        ]
+
+        outputs = adapter.encode_multimodal(features)
+
+        assert len(outputs) == 2
+        assert [call["image_grid_thw"].tolist() for call in visual.calls] == [
+            [[1, 4, 4]],
+            [[1, 6, 4]],
+        ]
+        assert visual.calls[1]["pixel_values"].shape == (1, 24, 3, 14, 14)
 
     @pytest.mark.parametrize("weight_dtype", [mx.float16, mx.bfloat16, mx.float32])
     def test_casts_pixel_values_to_visual_weight_dtype(
