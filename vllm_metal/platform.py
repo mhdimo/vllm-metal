@@ -260,9 +260,31 @@ class MetalPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_metal.v1.worker.MetalWorker"
 
-        # Set executor backend (use uniproc for single device)
+        # Resolve the executor backend. vLLM's ParallelConfig already defaults an
+        # unset backend to "mp" when world_size > 1 on non-CUDA/Ray/TPU (see
+        # config/parallel.py), so for the common PP>1 case mp is selected upstream
+        # before this hook runs. This branch only covers what vLLM leaves unset:
+        # the PP==1 default of "uni" (a single in-process worker), and the
+        # explicit "auto" string ("uni" cannot host PP's per-stage processes).
         if parallel_config.distributed_executor_backend in ("auto", None):
-            parallel_config.distributed_executor_backend = "uni"
+            if parallel_config.pipeline_parallel_size > 1:
+                parallel_config.distributed_executor_backend = "mp"
+            else:
+                parallel_config.distributed_executor_backend = "uni"
+        elif (
+            parallel_config.distributed_executor_backend == "uni"
+            and parallel_config.pipeline_parallel_size > 1
+        ):
+            # uni builds only rank 0, but PP needs one worker per stage. vLLM's
+            # UniProcExecutor does not reject this, so the lone worker would hang
+            # in gloo/ring rendezvous waiting for a stage that never spawns. Fail
+            # loud rather than silently flip the user's explicit executor choice.
+            raise NotImplementedError(
+                "Pipeline parallelism (pipeline_parallel_size > 1) requires the "
+                "'mp' or 'ray' executor; 'uni' runs a single process and cannot "
+                "place per-stage workers. Re-run with "
+                "--distributed-executor-backend mp (single node) or ray."
+            )
         elif parallel_config.distributed_executor_backend == "ray":
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
             # actor's get_node_and_gpu_ids would KeyError on
@@ -293,30 +315,77 @@ class MetalPlatform(Platform):
         # Disable features not supported on Metal
         parallel_config.disable_custom_all_reduce = True
 
-        # Pipeline parallelism is not supported on Metal/MLX yet: the MLX model
-        # runner has no cross-stage activation hand-off (see
-        # MetalModelRunner.execute_model). Fail fast at config time rather than
-        # deep inside a Ray actor on the first decode step.
-        if parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Metal/MLX does not support pipeline parallelism yet "
-                "(pipeline_parallel_size > 1)."
-            )
+        # Pipeline parallelism is supported on Metal/MLX: each stage runs in its
+        # own worker process and the inter-stage activations cross the
+        # mx.distributed data plane (point-to-point send/recv), wired in the
+        # model runner (see MetalModelRunner._start_paged_forward). The control
+        # plane stays on vLLM's gloo group; the two transports coexist.
 
         # Tensor parallelism is not supported on Metal/MLX yet: a single Apple
         # GPU per node cannot shard a TP>1 model, and there is no cross-device
         # collective wired in (mx.distributed). Only TP=1 is validated. Reject
         # at config time rather than hang on Ray placement-group creation (one
         # "mlx" resource per node) or silently misbehave. This is executor-
-        # agnostic: uni/mp are equally unable to run TP>1 on one device.
-        # Remove when mx.distributed tensor parallelism lands.
+        # agnostic: uni/mp are equally unable to run TP>1 on one device. This
+        # guard also rejects PP+TP — which must STAY rejected when TP support
+        # lands: PipelineGroup relies on global_rank == pipeline stage index,
+        # which only holds while world_size = PP * TP has TP == 1.
         if parallel_config.tensor_parallel_size > 1:
             raise NotImplementedError(
                 "Metal/MLX does not support tensor parallelism yet "
-                "(tensor_parallel_size > 1); only TP=1 is validated."
+                "(tensor_parallel_size > 1), alone or combined with pipeline "
+                "parallelism; only TP=1 is validated."
             )
 
         scheduler_config = vllm_config.scheduler_config
+
+        # Pipeline parallelism relays each sampled token to the first stage via the
+        # scheduler's CachedRequestData.new_token_ids — the first stage has no
+        # sampler and rebuilds the token stream from the scheduler (see
+        # MetalModelRunner._update_pp_stage_states). Async scheduling instead routes
+        # those tokens through a GPU broadcast we do not implement, which leaves
+        # new_token_ids empty. Fail loud rather than silently flip the user's
+        # scheduler config.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and scheduler_config.async_scheduling
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal requires synchronous scheduling. "
+                "Async scheduling delivers each sampled token to the first stage "
+                "through a GPU broadcast that is not implemented, so the stage "
+                "would starve. Re-run with --no-async-scheduling."
+            )
+
+        # Speculative decoding is not implemented under pipeline parallelism:
+        # the PP forward path produces no target hidden states and draft
+        # proposal runs only on the sampling (last) stage; no method has been
+        # validated. Reject loudly rather than run an untested combination.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and vllm_config.speculative_config is not None
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal does not support speculative "
+                "decoding; remove --speculative-config or run with "
+                "pipeline_parallel_size=1."
+            )
+
+        # LoRA is not supported under pipeline parallelism: non-last stages
+        # rebuild RequestState from the scheduler broadcast without lora_id
+        # (see MetalModelRunner._update_pp_stage_states), so per-step LoRA
+        # decode routing would silently run their layer slices without the
+        # adapter while the last stage applies it. The LoRA runtime is also
+        # wired to the full model before the stage slice. Reject loudly.
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and vllm_config.lora_config is not None
+        ):
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal does not support LoRA; "
+                "remove --enable-lora or run with pipeline_parallel_size=1."
+            )
+
         if getattr(scheduler_config, "enable_chunked_prefill", False):
             if config.use_paged_attention:
                 # The paged path uses a unified varlen Metal kernel that
@@ -378,6 +447,14 @@ class MetalPlatform(Platform):
             else None
         )
         if resolved_model is not None and is_stt_model(resolved_model):
+            # STT checkpoints use a dedicated STTModelRunner with no pipeline-
+            # split path. Reject PP here, with the other config-time PP guards,
+            # before any worker spawns.
+            if parallel_config.pipeline_parallel_size > 1:
+                raise NotImplementedError(
+                    "Pipeline parallelism (pipeline_parallel_size > 1) is not "
+                    "supported for speech-to-text models."
+                )
             was_async_scheduling = bool(scheduler_config.async_scheduling)
             apply_stt_scheduler_policy(model_config, scheduler_config)
             if was_async_scheduling and not scheduler_config.async_scheduling:

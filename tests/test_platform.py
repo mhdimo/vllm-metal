@@ -63,18 +63,145 @@ class TestMetalPlatform:
         with pytest.raises(ValueError, match="only supports device 0"):
             MetalPlatform.set_device(torch.device("cpu", 1))
 
-    def test_check_and_update_config_rejects_pipeline_parallel(self) -> None:
-        """Pipeline parallelism is unsupported on Metal; reject it at config time."""
+    def test_check_and_update_config_rejects_pipeline_with_tensor_parallel(
+        self,
+    ) -> None:
+        """PP is allowed, but combining PP>1 with TP>1 is rejected at config time."""
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                # "mp", not "uni": uni+PP>1 short-circuits to the uni-executor
+                # guard; "mp" reaches the PP+TP check this test targets.
+                distributed_executor_backend="mp",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=2,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+        )
+        with pytest.raises(
+            NotImplementedError, match="pipeline and tensor parallelism"
+        ):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_allows_pipeline_parallel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PP>1 with TP=1 is allowed and selects the multiproc executor."""
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+        reset_config()
+        try:
+            vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    worker_cls="auto",
+                    distributed_executor_backend="auto",
+                    pipeline_parallel_size=2,
+                    tensor_parallel_size=1,
+                    disable_custom_all_reduce=False,
+                ),
+                cache_config=SimpleNamespace(block_size=None),
+                model_config=SimpleNamespace(
+                    model="test-model",
+                    disable_cascade_attn=False,
+                    tokenizer=None,
+                    max_model_len=32768,
+                    multimodal_config=None,
+                    hf_config=SimpleNamespace(model_type="qwen3"),
+                ),
+                # PP requires synchronous scheduling: the first stage has no
+                # sampler and rebuilds tokens from the scheduler, so a valid PP
+                # config sets async_scheduling False (see the reject test below).
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=False,
+                    enable_chunked_prefill=True,
+                    max_num_batched_tokens=2048,
+                    max_num_scheduled_tokens=None,
+                ),
+                speculative_config=None,
+                lora_config=None,
+            )
+
+            # Does not raise: PP>1 with TP=1 and sync scheduling falls through.
+            MetalPlatform.check_and_update_config(vllm_config)
+
+            # "uni" cannot host two stages, so PP>1 defaults to the mp executor.
+            assert vllm_config.parallel_config.distributed_executor_backend == "mp"
+            assert (
+                vllm_config.parallel_config.worker_cls
+                == "vllm_metal.v1.worker.MetalWorker"
+            )
+        finally:
+            reset_config()
+
+    def test_check_and_update_config_rejects_pipeline_with_async_scheduling(
+        self,
+    ) -> None:
+        """PP>1 requires synchronous scheduling; async scheduling is rejected.
+
+        The first stage has no sampler and rebuilds the token stream from the
+        scheduler's new_token_ids, which async scheduling leaves empty (sampled
+        tokens would travel a GPU broadcast we do not implement). Fail loud
+        rather than silently flip the user's scheduler config.
+        """
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        )
+        with pytest.raises(NotImplementedError, match="synchronous scheduling"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_pipeline_with_speculative_decoding(
+        self,
+    ) -> None:
+        """PP>1 with speculative decoding is rejected at config time.
+
+        The PP forward path produces no target hidden states and draft proposal
+        runs only on the sampling (last) stage, so no speculative method is
+        implemented under PP. Reject loudly rather than run it unvalidated.
+        """
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=2,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            model_config=None,
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            speculative_config=SimpleNamespace(method="ngram"),
+        )
+        with pytest.raises(NotImplementedError, match="speculative decoding"):
+            MetalPlatform.check_and_update_config(vllm_config)
+
+    def test_check_and_update_config_rejects_uni_executor_with_pipeline_parallel(
+        self,
+    ) -> None:
+        """The single-process 'uni' executor cannot host PP's per-stage workers.
+
+        vLLM's UniProcExecutor builds only rank 0, so without this guard the lone
+        worker hangs in gloo/ring rendezvous waiting for a stage that never
+        spawns. Reject the explicit combination rather than flip it silently.
+        """
         vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(
                 worker_cls="auto",
                 distributed_executor_backend="uni",
                 pipeline_parallel_size=2,
+                tensor_parallel_size=1,
                 disable_custom_all_reduce=False,
             ),
             model_config=None,
         )
-        with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        with pytest.raises(NotImplementedError, match="single process"):
             MetalPlatform.check_and_update_config(vllm_config)
 
     def test_check_and_update_config_rejects_tensor_parallel(self) -> None:

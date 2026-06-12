@@ -33,7 +33,12 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    DraftTokenIds,
+    LogprobsLists,
+    ModelRunnerOutput,
+)
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
@@ -48,6 +53,12 @@ from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.config import get_config
+from vllm_metal.distributed import (
+    PipelinedModel,
+    PipelineGroup,
+    is_non_last_stage,
+    pipeline_send,
+)
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
 from vllm_metal.v1.cache_policy import ModelCachePolicy
@@ -319,6 +330,12 @@ class MetalModelRunner:
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
 
+        # Layer counts derived from the model config by ModelLifecycle after
+        # load (declared here so the type is fixed; apply_pipeline_split resets
+        # both to this stage's local slice under pipeline parallelism).
+        self.num_layers: int = 0
+        self.num_kv_cache_layers: int = 0
+
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
         self.head_dim_per_layer: list[int] | None = None
@@ -328,6 +345,14 @@ class MetalModelRunner:
         # Async forward state: stashed by execute_model, consumed by
         # sample_tokens (mirrors upstream's execute_model_state pattern).
         self._execute_model_state: _PagedForwardState | None = None
+
+        # Pipeline-parallel group (set by the worker when pipeline_parallel_size
+        # > 1). None means single-stage: the forward and sampling paths run
+        # exactly as before, with no cross-stage send/recv.
+        self.pp: PipelineGroup | None = None
+        # PP-aware forward wrapper for this stage, built in apply_pipeline_split
+        # when pp.size > 1; stays None on the single-stage path.
+        self._pp_model: PipelinedModel | None = None
 
         # Structured-output bitmask applier for the paged path.
         self._structured_output_applier = MetalStructuredOutputApplier()
@@ -452,6 +477,52 @@ class MetalModelRunner:
         for pr in prefill_pack:
             entries.append((pr.lora_id, len(pr.token_ids)))
         return entries
+
+    def apply_pipeline_split(self, pp: PipelineGroup) -> None:
+        """Slice the loaded model to this pipeline stage and fix layer counts.
+
+        Called by the worker after ``load_model`` (Phase 0 load-then-slice).
+        Delegates the in-place backbone slice to the adapter, then resets the
+        runner's layer accounting to the LOCAL slice so per-layer offset caches
+        (``_start_paged_forward``) and the KV-cache spec size only this stage's
+        layers — not the full model.
+
+        Only the validated path (uniform MHA, e.g. Qwen3) is supported under
+        pipeline parallelism: fail loud on YOCO / hybrid / MLA models whose
+        KV-cache layer accounting does not map cleanly onto a contiguous layer
+        slice yet.
+        """
+        if pp.size == 1:
+            return
+
+        unsupported = (
+            self._yoco_cache_mapping is not None
+            or self.is_hybrid
+            or self.is_mla
+            or self._is_pooling
+            or self._is_vlm
+            or not self.metal_config.use_paged_attention
+        )
+        if unsupported:
+            raise NotImplementedError(
+                "Pipeline parallelism on Metal is validated only for uniform-"
+                "attention generation on the paged path (e.g. Qwen3 with "
+                "VLLM_METAL_USE_PAGED_ATTENTION=1); YOCO / hybrid (GDN) / MLA / "
+                "pooling / VLM (multimodal) / non-paged configs are not "
+                "supported under PP yet."
+            )
+
+        self._model_adapter.apply_pipeline_split(self.model, pp)
+        # Mirror the sliced backbone's local layer count onto the runner so
+        # offset_caches and KV-cache sizing cover only this stage's layers.
+        local_num_layers = len(self._forward_model.model.layers)
+        self.num_layers = local_num_layers
+        self.num_kv_cache_layers = local_num_layers
+
+        # Install the PP-aware forward wrapper for this stage. It owns the stage
+        # forward (recv -> local layers -> final norm + head on the last stage);
+        # the runner owns the downstream send (see the PP branch in the forward).
+        self._pp_model = PipelinedModel(self._forward_model, pp)
 
     def _gdn_alloc_slot(self, req_id: str) -> int:
         """Allocate a stable GDN state pool slot for a request."""
@@ -1029,6 +1100,8 @@ class MetalModelRunner:
         target_hidden_states: mx.array | None = None
         pooling_hidden_states: mx.array | None = None
         mm_prefill_deltas: dict[str, int] = {}
+        # Lazy send op for the non-last pipeline stage (None otherwise).
+        pp_send_handle: mx.array | None = None
 
         prepare_unified(decode_info, prefill_info, self._paged_block_size)
         try:
@@ -1061,6 +1134,21 @@ class MetalModelRunner:
                 logits = self._extract_logits(model_output)
                 target_hidden_states = None
                 del model_output
+            elif self.pp is not None and self.pp.size > 1:
+                # Pipeline-parallel stage. The PP-aware wrapper owns the forward
+                # (recv the upstream hidden state if not first -> this stage's
+                # layer slice -> final norm + head on the last stage). The runner
+                # owns the downstream send: only the last stage has logits; every
+                # other stage hands its raw hidden state to pipeline_send, whose
+                # lazy op is forced by the async_eval below.
+                assert self._pp_model is not None
+                stage_output = self._pp_model(input_ids, cache=offset_caches)
+                if self.pp.is_last:
+                    logits = self._extract_logits(stage_output)
+                else:
+                    logits = None
+                    pp_send_handle = pipeline_send(stage_output, self.pp)
+                target_hidden_states = None
             else:
                 target_output = self._target_forward(
                     input_ids,
@@ -1077,6 +1165,12 @@ class MetalModelRunner:
         if has_pooling_work:
             assert pooling_hidden_states is not None
             mx.async_eval(pooling_hidden_states)
+        elif pp_send_handle is not None:
+            # Non-last pipeline stage: no logits, just push the hidden state to
+            # the next stage. async_eval on the send forces both the transfer
+            # and (transitively, via the sent activations) this stage's paged
+            # KV-cache writes.
+            mx.async_eval(pp_send_handle)
         else:
             assert logits is not None
             # For GDN prefill, state-cache updates are side effects that the
@@ -1885,6 +1979,54 @@ class MetalModelRunner:
                 lora_id=lora_id,
             )
 
+    def _update_pp_stage_states(self, scheduler_output: SchedulerOutput) -> None:
+        """Maintain ``_request_states`` on a non-last pipeline stage.
+
+        Only the last stage samples, and that is where the normal request-state
+        lifecycle is built (``_sample_paged_batch`` needs the sampled token). A
+        non-last stage would otherwise have no state and emit a placeholder for
+        every cached step in :meth:`_collect_cached_requests`, skipping the
+        forward + ``pipeline_send`` the downstream stage is blocked on (its ring
+        ``recv`` then trips the Metal command-buffer watchdog and aborts).
+
+        Mirror upstream vLLM's ``_update_states`` (``gpu_model_runner.py``, the
+        ``if not is_last_rank`` branch): seed state from the scheduler's
+        ``NewRequestData`` and advance it with the sampled tokens the scheduler
+        broadcasts in ``CachedRequestData.new_token_ids`` — the first stage never
+        samples, it reconstructs the token stream from the scheduler. Block ids
+        are left to :meth:`_update_cached_request_blocks`, which runs next and
+        already guards a missing state.
+        """
+        for new_req in scheduler_output.scheduled_new_reqs:
+            token_ids = list(new_req.prompt_token_ids or [])
+            self._request_states[new_req.req_id] = RequestState(
+                token_ids=token_ids,
+                prompt_len=len(token_ids),
+                cache=[],
+                sampling_params=new_req.sampling_params or SamplingParams(),
+                pooling_params=new_req.pooling_params,
+                block_ids=list(new_req.block_ids[0]) if new_req.block_ids else [],
+            )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        if not cached.new_token_ids:
+            return
+        for i, req_id in enumerate(cached.req_ids):
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
+            new_token_ids = cached.new_token_ids[i]
+            # Append only the tokens not already reflected in token_ids (mirrors
+            # upstream's num_new_tokens; tolerates >1 sampled token per step).
+            num_new = (
+                cached.num_computed_tokens[i]
+                + len(new_token_ids)
+                - len(state.token_ids)
+            )
+            if num_new > 0:
+                state.token_ids.extend(new_token_ids[-num_new:])
+                state.generated_tokens = len(state.token_ids) - state.prompt_len
+
     def _update_cached_request_blocks(
         self,
         cached_reqs: CachedRequestData,
@@ -2223,6 +2365,14 @@ class MetalModelRunner:
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
         )
 
+        # Non-last PP stages have no sampler, so the request-state lifecycle that
+        # _sample_paged_batch builds from the sampled token never runs for them.
+        # Seed/advance their state from the scheduler's broadcast instead, so the
+        # forward + pipeline_send have live state to work from. No-op on the last
+        # stage and the single-process path.
+        if is_non_last_stage(self.pp):
+            self._update_pp_stage_states(scheduler_output)
+
         cached_reqs = scheduler_output.scheduled_cached_reqs
         self._update_cached_request_blocks(cached_reqs)
         self._collect_cached_requests(batch, cached_reqs, scheduler_output)
@@ -2286,6 +2436,13 @@ class MetalModelRunner:
         """
         # Paged path: wait for MLX forward, apply grammar bitmask, sample tokens.
         if self._execute_model_state is not None:
+            # Pipeline parallelism: only the last stage holds logits and samples.
+            # Non-last stages produced no logits (they piped their hidden state
+            # downstream), so clear the stash and return an empty output — the
+            # engine collects results from the last stage only.
+            if is_non_last_stage(self.pp):
+                self._execute_model_state = None
+                return EMPTY_MODEL_RUNNER_OUTPUT
             batch, scheduler_output = self._sample_paged_batch(grammar_output)
             self._gdn_materialize_pending_state_cache()
             self._validate_scheduled_outputs(batch, scheduler_output)
