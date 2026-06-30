@@ -161,7 +161,4 @@ def test_awq_e2e_paged_runner_smoke():
         model_lifecycle.reset_model_cache()
         del llm
         gc.collect()
-        if hasattr(mx, "clear_cache"):
-            mx.clear_cache()
-        elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
-            mx.metal.clear_cache()
+        mx.clear_cache()

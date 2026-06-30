@@ -85,10 +85,7 @@ def _release_metal_state() -> None:
     """
     model_lifecycle.reset_model_cache()
     gc.collect()
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
-    elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
-        mx.metal.clear_cache()
+    mx.clear_cache()
 
 
 def _collect_awq_dtype_pins(model, *, expected_non_quant_dtype):

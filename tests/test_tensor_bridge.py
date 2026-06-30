@@ -179,9 +179,7 @@ class TestSynchronization:
     def test_sync_mlx_uses_barrier_when_available(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Sync should call the MX barrier when present."""
-        if not hasattr(tensor_bridge.mx, "synchronize"):
-            pytest.skip("mlx.core.synchronize not available")
+        """Sync should call the pinned MLX barrier."""
 
         called = False
 
@@ -190,42 +188,6 @@ class TestSynchronization:
             called = True
 
         monkeypatch.setattr(tensor_bridge.mx, "synchronize", fake_sync)
-        sync_mlx()
-        assert called is True
-
-    def test_sync_mlx_falls_back_to_eval_when_missing_barrier(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """If barrier is absent, we should still force evaluation."""
-        monkeypatch.delattr(tensor_bridge.mx, "synchronize", raising=False)
-
-        called = False
-
-        def fake_eval(value: mx.array) -> None:
-            nonlocal called
-            called = True
-
-        monkeypatch.setattr(tensor_bridge.mx, "eval", fake_eval)
-        sync_mlx()
-        assert called is True
-
-    def test_sync_mlx_falls_back_to_eval_when_barrier_signature_incompatible(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """If barrier exists but can't be called with no args, fall back."""
-
-        def fake_sync(_stream: object) -> None:
-            return None
-
-        monkeypatch.setattr(tensor_bridge.mx, "synchronize", fake_sync)
-
-        called = False
-
-        def fake_eval(value: mx.array) -> None:
-            nonlocal called
-            called = True
-
-        monkeypatch.setattr(tensor_bridge.mx, "eval", fake_eval)
         sync_mlx()
         assert called is True
 
