@@ -29,7 +29,6 @@ from vllm_metal.attention.runtime.mla import MLAPagedAttentionRuntime
 from vllm_metal.attention.runtime.protocol import PagedAttentionRuntime
 from vllm_metal.attention.yoco import try_enable_gemma4_yoco_fast_prefill
 from vllm_metal.config import (
-    PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
     MetalConfig,
     get_config,
@@ -46,7 +45,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 HYBRID_GDN_GROWTH_CUSHION_SLOTS = 2
-VLLM_GPU_MEMORY_UTILIZATION_DEFAULT = 0.92
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -745,59 +743,34 @@ class WorkerCachePlanner:
         )
 
     def _memory_fraction(self) -> float:
-        """Resolve the Metal-memory fraction for the paged KV cache.
+        """Resolve the paged KV memory fraction.
 
         Precedence:
-        1. ``VLLM_METAL_MEMORY_FRACTION`` set explicitly (not ``auto``) wins,
-           since it is the Metal-specific knob.
-        2. Otherwise (``auto``) honor ``--gpu-memory-utilization`` so the
-           standard vLLM flag controls the KV-cache budget on Metal too.
-        3. If ``gpu_memory_utilization`` is unavailable, fall back to
-           ``PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION``.
+        1. Numeric VLLM_METAL_MEMORY_FRACTION, for example 0.6, wins.
+        2. Otherwise, VLLM_METAL_MEMORY_FRACTION=auto uses the user-provided
+           --gpu-memory-utilization value.
+        3. If the user did not provide --gpu-memory-utilization, vLLM 0.25.1
+           supplies its default value, 0.92.
         """
-        gpu_memory_utilization = getattr(
-            self._worker.vllm_config.cache_config,
-            "gpu_memory_utilization",
-            None,
-        )
+        metal_config = self._worker.metal_config
 
-        if not self._worker.metal_config.is_auto_memory:
-            fraction = self._worker.metal_config.memory_fraction
+        if not metal_config.is_auto_memory:
+            metal_memory_fraction = metal_config.memory_fraction
             logger.info(
                 "Paged attention: using VLLM_METAL_MEMORY_FRACTION=%.2f",
-                fraction,
+                metal_memory_fraction,
             )
+            return metal_memory_fraction
 
-            if (
-                gpu_memory_utilization is not None
-                and gpu_memory_utilization != VLLM_GPU_MEMORY_UTILIZATION_DEFAULT
-                and gpu_memory_utilization != fraction
-            ):
-                logger.warning(
-                    "--gpu-memory-utilization=%.2f has no effect on Metal "
-                    "because VLLM_METAL_MEMORY_FRACTION=%.2f is set; the "
-                    "KV-cache budget uses %.2f (controlled by the env var).",
-                    gpu_memory_utilization,
-                    fraction,
-                    fraction,
-                )
-            return fraction
-
-        if gpu_memory_utilization is not None:
-            fraction = gpu_memory_utilization
-            logger.info(
-                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
-                "using gpu_memory_utilization=%.2f",
-                fraction,
-            )
-        else:
-            fraction = PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
-            logger.info(
-                "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
-                "gpu_memory_utilization unavailable, defaulting to %.2f",
-                fraction,
-            )
-        return fraction
+        vllm_memory_fraction = (
+            self._worker.vllm_config.cache_config.gpu_memory_utilization
+        )
+        logger.info(
+            "Paged attention: VLLM_METAL_MEMORY_FRACTION=auto, "
+            "using --gpu-memory-utilization=%.2f",
+            vllm_memory_fraction,
+        )
+        return vllm_memory_fraction
 
     def _metal_limit_bytes(self) -> int:
         device_info = mx.device_info()

@@ -420,33 +420,20 @@ class TestPagedAttentionPlanDiagnostics:
         assert "kv_budget=-1.10GB" in message
 
     @pytest.mark.parametrize(
-        "is_auto, memory_fraction, gpu_mem_util, expected_fraction, expects_warning",
+        "is_auto, memory_fraction, gpu_mem_util, expected_fraction",
         [
-            pytest.param(True, -1.0, 0.92, 0.92, False, id="auto_default_flag"),
-            pytest.param(True, -1.0, 0.5, 0.5, False, id="auto_flag_lowered"),
-            pytest.param(False, 0.5, 0.92, 0.5, False, id="env_explicit_default_flag"),
-            pytest.param(False, 0.5, 0.7, 0.5, True, id="env_explicit_flag_conflict"),
-            pytest.param(False, 0.5, 0.5, 0.5, False, id="env_explicit_flag_match"),
+            pytest.param(True, -1.0, 0.92, 0.92, id="auto_uses_vllm_default"),
+            pytest.param(True, -1.0, 0.5, 0.5, id="auto_uses_vllm_flag"),
+            pytest.param(False, 0.5, 0.7, 0.5, id="metal_env_wins"),
         ],
     )
     def test_memory_fraction_precedence(
         self,
-        monkeypatch,
         is_auto: bool,
         memory_fraction: float,
         gpu_mem_util: float,
         expected_fraction: float,
-        expects_warning: bool,
     ) -> None:
-        from vllm_metal.v1.cache_policy import logger as policy_logger
-
-        warn_messages: list[str] = []
-        monkeypatch.setattr(
-            policy_logger,
-            "warning",
-            lambda msg, *args: warn_messages.append(msg % args),
-        )
-
         worker = _make_worker(
             SimpleNamespace(is_hybrid=False), use_paged_attention=True
         )
@@ -457,7 +444,3 @@ class TestPagedAttentionPlanDiagnostics:
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
         assert fraction == expected_fraction
-        assert bool(warn_messages) == expects_warning
-        if expects_warning:
-            assert "VLLM_METAL_MEMORY_FRACTION" in warn_messages[0]
-            assert "--gpu-memory-utilization" in warn_messages[0]
