@@ -568,12 +568,14 @@ class MetalModelRunner:
         *,
         cache: Any | None = None,
         collect_hidden_states: bool = False,
+        capture_layer_ids: list[int] | None = None,
     ) -> TargetModelForwardOutput:
         return self._model_adapter.target_forward(
             self._forward_model,
             input_ids,
             cache=cache,
             collect_hidden_states=collect_hidden_states,
+            capture_layer_ids=capture_layer_ids,
         )
 
     def _target_input_embeddings(self, input_ids: mx.array) -> mx.array:

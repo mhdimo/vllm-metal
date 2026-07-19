@@ -5,8 +5,14 @@ an arbitrary selection of layers and fuse them.
 Both the existing Gemma4 MTP path (last layer) and DSpark (several specific
 intermediate layers) become users of this one helper. Mirrors the explicit
 transformer-layer traversal used by the reference implementation: embed,
-mask, loop over layers calling ``layer(h, mask, c)``, capture the residual
-after each requested index, concatenate along the feature axis.
+mask, loop over layers calling ``layer(h, mask, c)``, apply the final norm,
+and capture the residual after each requested index (concatenated along the
+feature axis).
+
+``run_backbone_with_capture`` returns BOTH the post-norm final hidden (so the
+target's own logits can be computed from the same forward — the integrated path
+cannot afford a second pass) and the fused intermediate captures (for the
+drafter). ``capture_layer_hidden_states`` is a fused-only view over it.
 """
 
 from __future__ import annotations
@@ -16,14 +22,14 @@ from typing import Any
 import mlx.core as mx
 
 
-def capture_layer_hidden_states(
+def run_backbone_with_capture(
     backbone: Any,
     input_ids: mx.array,
     *,
     cache: Any,
     layer_ids: list[int],
-) -> mx.array:
-    """Run ``backbone``'s layer loop and return the residuals after ``layer_ids``.
+) -> tuple[mx.array, mx.array]:
+    """Run ``backbone``'s full layer loop, returning final + fused residuals.
 
     Args:
         backbone: an MLX transformer body exposing ``embed_tokens``, ``layers``,
@@ -37,10 +43,12 @@ def capture_layer_hidden_states(
             this order along the feature axis.
 
     Returns:
-        ``[batch, tokens, len(layer_ids) * hidden]`` — the fused residual stream.
+        ``(final, fused)`` where ``final`` is the post-norm hidden after the last
+        layer (suitable for the target lm_head) and ``fused`` is
+        ``[batch, tokens, len(layer_ids) * hidden]``.
     """
     if not layer_ids:
-        raise ValueError("capture_layer_hidden_states requires at least one layer_id")
+        raise ValueError("run_backbone_with_capture requires at least one layer_id")
     layers = backbone.layers
     if any(i < 0 or i >= len(layers) for i in layer_ids):
         raise IndexError(
@@ -59,4 +67,25 @@ def capture_layer_hidden_states(
         h = layer(h, mask, c)
         if i in tapset:
             captured.append(h)
-    return mx.concatenate(captured, axis=-1)
+    final = backbone.norm(h)
+    fused = mx.concatenate(captured, axis=-1)
+    return final, fused
+
+
+def capture_layer_hidden_states(
+    backbone: Any,
+    input_ids: mx.array,
+    *,
+    cache: Any,
+    layer_ids: list[int],
+) -> mx.array:
+    """Fused-only view over :func:`run_backbone_with_capture`.
+
+    Returns ``[batch, tokens, len(layer_ids) * hidden]`` — just the fused
+    intermediate residuals, for callers (e.g. the M0 sanity harness) that feed
+    a drafter without needing the target's own logits.
+    """
+    _, fused = run_backbone_with_capture(
+        backbone, input_ids, cache=cache, layer_ids=layer_ids
+    )
+    return fused
