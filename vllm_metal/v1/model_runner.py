@@ -712,8 +712,28 @@ class MetalModelRunner:
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
+        from vllm_metal.v1.dspark.loader import is_dspark_drafter
+
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.uses_draft_model() and is_dspark_drafter(spec.draft_model_config):
+            from vllm_metal.v1.dspark.loader import load_drafter
+            from vllm_metal.v1.dspark_proposer import DSparkProposer
+
+            drafter_model, drafter_cfg = load_drafter(spec.draft_model_config.model)
+            self._drafter = DSparkProposer(
+                drafter=drafter_model,
+                config=drafter_cfg,
+                runner=self,
+                controller=self._spec_decode_controller,
+            )
+            logger.info(
+                "DSpark drafter loaded for speculative decoding: %s "
+                "(block_size=%d, target_layer_ids=%s)",
+                spec.draft_model_config.model,
+                drafter_cfg.block_size,
+                drafter_cfg.target_layer_ids,
+            )
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
@@ -1102,10 +1122,16 @@ class MetalModelRunner:
                     pp_send_handle = pipeline_send(stage_output, self.pp)
                 target_hidden_states = None
             else:
+                capture_layer_ids = (
+                    getattr(self._drafter, "capture_layer_ids", None)
+                    if collect_target_hidden_states
+                    else None
+                )
                 target_output = self._target_forward(
                     input_ids,
                     cache=offset_caches,
                     collect_hidden_states=collect_target_hidden_states,
+                    capture_layer_ids=capture_layer_ids,
                 )
                 logits = target_output.logits
                 target_hidden_states = target_output.hidden_states
