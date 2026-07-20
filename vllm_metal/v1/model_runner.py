@@ -716,11 +716,19 @@ class MetalModelRunner:
 
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
-        elif spec.uses_draft_model() and is_dspark_drafter(spec.draft_model_config):
+        elif spec.method == "dspark" or (
+            spec.uses_draft_model() and is_dspark_drafter(spec.draft_model_config)
+        ):
             from vllm_metal.v1.dspark.loader import load_drafter
             from vllm_metal.v1.dspark_proposer import DSparkProposer
 
-            drafter_model, drafter_cfg = load_drafter(spec.draft_model_config.model)
+            # vLLM resolves a Qwen3DSparkModel draft to method="dspark" and puts
+            # the drafter repo on `spec.model`; the draft_model path carries it on
+            # draft_model_config. Cover both.
+            drafter_repo = (
+                spec.model if spec.method == "dspark" else spec.draft_model_config.model
+            )
+            drafter_model, drafter_cfg = load_drafter(drafter_repo)
             self._drafter = DSparkProposer(
                 drafter=drafter_model,
                 config=drafter_cfg,
@@ -730,7 +738,7 @@ class MetalModelRunner:
             logger.info(
                 "DSpark drafter loaded for speculative decoding: %s "
                 "(block_size=%d, target_layer_ids=%s)",
-                spec.draft_model_config.model,
+                drafter_repo,
                 drafter_cfg.block_size,
                 drafter_cfg.target_layer_ids,
             )
