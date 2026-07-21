@@ -274,8 +274,9 @@ class MetalPlatform(Platform):
         manager connects to Ray without forwarding ``parallel_config.ray_runtime_env``
         to ``ray.init`` (see ``vllm/v1/engine/utils.py``), so the hook wired into
         ``ray_runtime_env`` for the single-stage Ray executor never reaches the
-        per-replica ``RayWorkerProc`` workers, and ``get_node_and_gpu_ids`` would
-        ``KeyError`` on the custom "mlx" resource. We initialize Ray ourselves with
+        per-replica ``RayWorkerProc`` workers, and
+        ``get_node_and_physical_gpu_ids`` would ``KeyError`` on the custom "mlx"
+        resource. We initialize Ray ourselves with
         the hook in the job runtime_env before the engine connects; the engine's
         later ``ray.init`` reuses this session.
 
@@ -382,7 +383,7 @@ class MetalPlatform(Platform):
             )
         elif parallel_config.distributed_executor_backend == "ray":
             # Apple GPUs are not a Ray accelerator family, so the Ray worker
-            # actor's get_node_and_gpu_ids would KeyError on
+            # actor's get_node_and_physical_gpu_ids would KeyError on
             # get_accelerator_ids()[ray_device_key].  Install our override (see
             # vllm_metal.compat._patch_ray_distributed) in every Ray worker via a
             # worker_process_setup_hook, which runs at worker startup before the
@@ -757,7 +758,13 @@ class MetalPlatform(Platform):
         a hybrid model, explaining the cache-block-size translation mechanism
         (PR #235).
         """
+        from vllm_metal.compat import ensure_vllm_auto_fit_null_block_patch
         from vllm_metal.config import get_config
+
+        # Runs in the engine process after vLLM is fully imported, right before
+        # KV sizing: the reliable spot to (re-)install the auto-fit null-block
+        # patch that plugin activation may have skipped mid-import.
+        ensure_vllm_auto_fit_null_block_patch()
 
         metal_config = get_config()
         model_config = vllm_config.model_config
