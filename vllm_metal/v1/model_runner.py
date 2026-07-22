@@ -111,6 +111,7 @@ from vllm_metal.v1.pooling.validation import validate_pooling_request
 from vllm_metal.v1.prompt_logprobs import (
     PromptLogprobsTracker,
     full_prompt_logprobs,
+)
 from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
     MetalProposer,
@@ -1027,7 +1028,6 @@ class MetalModelRunner:
                 drafter_cfg.target_layer_ids,
             )
         elif spec.uses_draft_model():
-
             # `num_blocks` is the scheduler-visible committed-KV capacity for
             # the draft group (see cache_policy._draft_layer_specs); the
             # physical backend needs `scratch_reserve_blocks` on top of that
@@ -1036,6 +1036,8 @@ class MetalModelRunner:
             # budget already reserved this many blocks' worth of bytes off
             # the top (WorkerCachePlanner._paged_attention_plan), so this is
             # guaranteed to fit.
+            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
@@ -1047,9 +1049,10 @@ class MetalModelRunner:
                 dtype=self.kv_cache_dtype,
             )
         elif spec.method == "ngram":
-
             # N-gram drafts from token history alone — no model, no KV cache, so
             # num_blocks/block_size are unused here.
+            from vllm_metal.v1.ngram_proposer import NgramProposer
+
             self._drafter = NgramProposer.build(
                 vllm_config=self.vllm_config,
                 controller=self._spec_decode_controller,

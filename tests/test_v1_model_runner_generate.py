@@ -2220,7 +2220,7 @@ class TestStartPagedForwardSelectiveLogits:
         captured: dict[str, object] = {}
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states
             captured["logits_indices"] = (
@@ -2924,7 +2924,7 @@ class TestDeferredDecodeSampleThreading:
         captured: dict[str, object] = {}
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["input_ids"] = input_ids.tolist()
@@ -3347,7 +3347,7 @@ class TestIntermediateBodyOnlyForward:
             )
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["full_forward_tokens"] = input_ids.tolist()
@@ -3387,7 +3387,7 @@ class TestIntermediateBodyOnlyForward:
         runner._intermediate_forward_supported = False
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, collect_hidden_states, logits_indices
             captured["full_forward_tokens"] = input_ids.tolist()
@@ -3460,7 +3460,7 @@ class TestIntermediateBodyOnlyForward:
         )
 
         def fake_target_forward(
-            input_ids, *, cache, collect_hidden_states, logits_indices=None
+            input_ids, *, cache, collect_hidden_states, logits_indices=None, **kwargs
         ):
             del cache, logits_indices
             captured["collect_hidden_states"] = collect_hidden_states
