@@ -743,7 +743,6 @@ class MetalModelRunner:
                 drafter_cfg.target_layer_ids,
             )
         elif spec.uses_draft_model():
-
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 controller=self._spec_decode_controller,
@@ -763,7 +762,6 @@ class MetalModelRunner:
                     "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
                 )
         elif spec.method == "ngram":
-
             # N-gram drafts from token history alone — no model, no KV cache, so
             # num_blocks/block_size are unused here.
             self._drafter = NgramProposer.build(
@@ -1129,7 +1127,7 @@ class MetalModelRunner:
                 target_hidden_states = None
             else:
                 capture_layer_ids = (
-                    self._drafter.capture_layer_ids
+                    getattr(self._drafter, "capture_layer_ids", None)
                     if collect_target_hidden_states
                     else None
                 )
