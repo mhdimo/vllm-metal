@@ -85,6 +85,8 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.dspark.loader import is_dspark_drafter, load_drafter
+from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
     Gemma4MTPAssistantSource,
@@ -109,7 +111,6 @@ from vllm_metal.v1.pooling.validation import validate_pooling_request
 from vllm_metal.v1.prompt_logprobs import (
     PromptLogprobsTracker,
     full_prompt_logprobs,
-)
 from vllm_metal.v1.proposer import (
     Gemma4MTPProposer,
     MetalProposer,
@@ -771,6 +772,7 @@ class MetalModelRunner:
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> TargetModelForwardOutput:
         return self._model_adapter.target_forward(
             self._forward_model,
@@ -778,6 +780,7 @@ class MetalModelRunner:
             cache=cache,
             collect_hidden_states=collect_hidden_states,
             logits_indices=logits_indices,
+            capture_layer_ids=capture_layer_ids,
         )
 
     def _paged_logits_layout(
@@ -997,10 +1000,33 @@ class MetalModelRunner:
         spec = self.vllm_config.speculative_config
         if spec is None:
             return
+
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "dspark" or (
+            spec.uses_draft_model() and is_dspark_drafter(spec.draft_model_config)
+        ):
+            # vLLM resolves a Qwen3DSparkModel draft to method="dspark" and puts
+            # the drafter repo on `spec.model`; the draft_model path carries it on
+            # draft_model_config. Cover both.
+            drafter_repo = (
+                spec.model if spec.method == "dspark" else spec.draft_model_config.model
+            )
+            drafter_model, drafter_cfg = load_drafter(drafter_repo)
+            self._drafter = DSparkProposer(
+                drafter=drafter_model,
+                config=drafter_cfg,
+                runner=self,
+                controller=self._spec_decode_controller,
+            )
+            logger.info(
+                "DSpark drafter loaded for speculative decoding: %s "
+                "(block_size=%d, target_layer_ids=%s)",
+                drafter_repo,
+                drafter_cfg.block_size,
+                drafter_cfg.target_layer_ids,
+            )
         elif spec.uses_draft_model():
-            from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
             # `num_blocks` is the scheduler-visible committed-KV capacity for
             # the draft group (see cache_policy._draft_layer_specs); the
@@ -1021,7 +1047,6 @@ class MetalModelRunner:
                 dtype=self.kv_cache_dtype,
             )
         elif spec.method == "ngram":
-            from vllm_metal.v1.ngram_proposer import NgramProposer
 
             # N-gram drafts from token history alone — no model, no KV cache, so
             # num_blocks/block_size are unused here.
@@ -1473,6 +1498,14 @@ class MetalModelRunner:
                     and all(pr.prompt_len is None for pr in prefill_reqs)
                     and self._drafter is None
                 )
+                # A drafter may request specific layers' residuals; forward its
+                # selection alongside the hidden-state request. Drafters without
+                # a capture selection (e.g. Gemma4 MTP) contribute None.
+                capture_layer_ids = (
+                    getattr(self._drafter, "capture_layer_ids", None)
+                    if collect_target_hidden_states and self._drafter is not None
+                    else None
+                )
                 # Prompt-logprobs requests need a logits row for every prompt
                 # position, so their steps skip both head-pruning paths: the
                 # projection-free intermediate forward (no logits at all) and
@@ -1501,6 +1534,7 @@ class MetalModelRunner:
                         cache=offset_caches,
                         collect_hidden_states=collect_target_hidden_states,
                         logits_indices=logits_layout.indices,
+                        capture_layer_ids=capture_layer_ids,
                     )
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
