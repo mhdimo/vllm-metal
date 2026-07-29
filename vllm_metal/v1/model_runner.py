@@ -14,7 +14,7 @@ Key contracts:
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
-from typing import Any, Literal, NamedTuple, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import mlx.core as mx
 import numpy as np
@@ -124,6 +124,13 @@ from vllm_metal.v1.spec_decode import (
 )
 from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
+if TYPE_CHECKING:
+    # Kept out of the runtime import graph: draft_model_proposer.py pulls in
+    # mlx_lm's model loader at module scope, which should only load when
+    # draft_model speculative decoding is actually configured (see the lazy
+    # runtime import in __init__ and in install_drafter).
+    from vllm_metal.v1.draft_model_proposer import DraftDims
+
 logger = init_logger(__name__)
 
 
@@ -182,6 +189,12 @@ class RequestState:
     # Decode reconstructs M-RoPE positions as
     # ``len(token_ids) - 1 + mrope_position_delta``; ``None`` for text-only.
     mrope_position_delta: int | None = None
+    # Scheduler-reconciled prefix-cache-hit boundary (the same value used to
+    # resume the target's own paged prefill, see `_add_new_requests`).
+    # DraftModelProposer reuses this as the committed-KV group's ingest
+    # boundary instead of self-tracking it, so a cache hit shared across
+    # requests skips re-ingest for the draft's KV too (#482).
+    num_computed_tokens: int = 0
 
 
 class PrefillRequest(NamedTuple):
@@ -356,6 +369,16 @@ class MetalModelRunner:
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
+        # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
+        # can size a scheduler-visible KV-cache group for the draft model
+        # before `determine_available_memory()`/`get_kv_cache_spec()` run.
+        # The draft's MLX weights load later, in `install_drafter`.
+        self._draft_dims: DraftDims | None = None
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.uses_draft_model():
+            from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
+
+            self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
         self.encoder_cache: EncoderCache | None = None
 
         # Request state cache for incremental decoding
@@ -755,6 +778,14 @@ class MetalModelRunner:
         """Bytes for one request's linear attention state across all GDN layers."""
         return self._cache_policy.linear_cache_bytes_per_slot()
 
+    def draft_scratch_reserve_blocks(self) -> int:
+        """Blocks reserved for the draft model's speculative lookahead tail."""
+        return self._cache_policy.draft_scratch_reserve_blocks()
+
+    def draft_scratch_reserve_bytes(self) -> int:
+        """Bytes held out of the KV budget for the draft's scratch tail."""
+        return self._cache_policy.draft_scratch_reserve_bytes()
+
     def profile_run(self) -> int:
         """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
 
@@ -876,24 +907,24 @@ class MetalModelRunner:
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
+            # `num_blocks` is the scheduler-visible committed-KV capacity for
+            # the draft group (see cache_policy._draft_layer_specs); the
+            # physical backend needs `scratch_reserve_blocks` on top of that
+            # for the speculative lookahead tail, which the scheduler never
+            # sees or assigns (see draft_scratch_reserve_blocks). The KV
+            # budget already reserved this many blocks' worth of bytes off
+            # the top (WorkerCachePlanner._paged_attention_plan), so this is
+            # guaranteed to fit.
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
+                parallel_config=self.vllm_config.parallel_config,
                 controller=self._spec_decode_controller,
                 extract_logits=self._model_adapter.extract_logits,
-                num_blocks=num_blocks,
+                committed_num_blocks=num_blocks,
+                scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
             )
-            max_num_seqs = self.scheduler_config.max_num_seqs
-            extra_per_req = (spec.num_speculative_tokens + block_size - 1) // block_size
-            if num_blocks < max_num_seqs * extra_per_req:
-                raise ValueError(
-                    f"Draft KV cache too small: {num_blocks} blocks cannot "
-                    f"support {max_num_seqs} concurrent requests each needing "
-                    f"{extra_per_req} extra block(s) for "
-                    f"{spec.num_speculative_tokens} speculative tokens. "
-                    "Raise VLLM_METAL_MEMORY_FRACTION or lower --max-num-seqs."
-                )
         elif spec.method == "ngram":
             from vllm_metal.v1.ngram_proposer import NgramProposer
 
@@ -1702,6 +1733,7 @@ class MetalModelRunner:
                     block_ids=prefill.block_ids,
                     lora_id=prefill.lora_id,
                     mrope_position_delta=mm_delta,
+                    num_computed_tokens=prefill.start_pos,
                 )
                 continue
 
@@ -2207,6 +2239,7 @@ class MetalModelRunner:
                         generated_tokens=0,
                         block_ids=sched_block_ids,
                         lora_id=lora_id,
+                        num_computed_tokens=computed_tokens,
                     )
                 continue
 

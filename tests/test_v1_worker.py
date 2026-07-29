@@ -328,6 +328,7 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=2),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         worker = _make_worker(runner, use_paged_attention=True)
         worker.metal_config.is_auto_memory = False
@@ -368,6 +369,7 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=256),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -409,6 +411,7 @@ class TestPagedAttentionPlanDiagnostics:
             scheduler_config=SimpleNamespace(max_num_seqs=1),
             cache_config=SimpleNamespace(mamba_cache_mode="none"),
             linear_cache_bytes_per_slot=MagicMock(return_value=64_400_000),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -444,6 +447,7 @@ class TestPagedAttentionPlanDiagnostics:
             # produces six physical pools: 600 steady bytes per block plus
             # one 100-byte old pool retained during growth.
             linear_cache_bytes_per_slot=MagicMock(return_value=1_800),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
         )
         planner = self._make_planner(
             runner,
@@ -472,7 +476,10 @@ class TestPagedAttentionPlanDiagnostics:
         assert plan.num_blocks == 10
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
-        runner = SimpleNamespace(is_hybrid=False)
+        runner = SimpleNamespace(
+            is_hybrid=False,
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
         planner = self._make_planner(runner, memory_fraction=0.1)
         monkeypatch.setattr(
             WorkerCachePlanner,

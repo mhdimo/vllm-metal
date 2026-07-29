@@ -9,7 +9,7 @@ path. All require synchronous scheduling and greedy sampling.
 | Target models | Gemma4 (paged) | Any paged-attention model | Any paged-attention model |
 | Draft source | MTP assistant checkpoint (reads target KV cache) | Separate smaller model (own KV cache) | Prompt/output token history (no model) |
 | `num_speculative_tokens` | 1 | Configurable (3–5 typical) | Configurable (3–5 typical) |
-| Extra memory | None (reads target KV cache) | Second un-budgeted KV cache | None |
+| Extra memory | None (reads target KV cache) | Second scheduler-managed KV cache | None |
 
 All three methods:
 
@@ -126,11 +126,16 @@ Confirm speculative decoding is active: the server log shows
 
 ### Limitations
 
-- **Draft KV cache is un-budgeted.** The draft gets its own KV cache sized to
-  the target's `num_blocks`, allocated after the target KV budget and not
-  subtracted from it. Keep `VLLM_METAL_MEMORY_FRACTION` well below 1.0.
-- **SWA draft models untested.** The draft block allocator assumes full
-  attention.
+- **Draft KV cache is scheduler-managed.** The committed portion of the
+  draft's KV is a scheduler-owned KV-cache group, hashed, matched, admitted,
+  and evicted like the target's own groups and counted against the shared
+  Metal KV budget. Only the speculative lookahead tail
+  (`num_speculative_tokens` positions ahead of the committed length) is a
+  small proposer-local scratch reservation, pre-reserved before the budget is
+  divided.
+- **No sliding-window or hybrid draft models.** The draft block allocator
+  assumes full attention; ``resolve_draft_dims`` rejects draft configs with
+  ``sliding_window`` or mixed ``layer_types`` at startup.
 - **No pipeline parallelism.** `pipeline_parallel_size>1` with speculative
   config raises at startup.
 

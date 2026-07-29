@@ -36,7 +36,8 @@ def _proposer(model, **kwargs) -> DraftModelProposer:
     return DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
-        num_blocks=64,
+        committed_num_blocks=64,
+        scratch_reserve_blocks=0,
         num_layers=1,
         controller=None,
         extract_logits=lambda logits: logits,
@@ -53,6 +54,7 @@ def _plan(n_ingest: int, draft_seq_len: int) -> _DraftPlan:
         committed_len=committed,
         draft_seq_len=draft_seq_len,
         ingest_tokens=list(range(100, 100 + n_ingest)),
+        is_drafting=True,
     )
 
 
