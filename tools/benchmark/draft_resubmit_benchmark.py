@@ -39,8 +39,12 @@ Notes on methodology:
 - ``propose_first_ms`` times the first ``propose()`` call, which on the
   scheduler-managed tree can be an empty call that precedes the first plan;
   prefer the plan columns and wall/tpot for conclusions.
-- The reference run creates a separate non-speculative ``LLM`` instance.
-  Pass ``--skip-lossless`` to skip it if memory is tight.
+- The reference run executes in its own subprocess: an in-process
+  ``del llm`` / ``gc.collect()`` does not release Metal memory
+  (``mx.clear_cache()`` neither, and ``gpu_memory_utilization`` has no
+  effect on this backend), so the reference's KV would still be resident
+  when the spec run profiles its budget. The subprocess exit releases
+  everything. Pass ``--skip-lossless`` to skip it if memory is tight.
 
 Output: one JSON object with ``reference`` (or ``null``) and ``spec_runs``
 (array of per-generate records), prefixed with ``RESULT ``.
@@ -57,6 +61,7 @@ import argparse
 import gc
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -148,8 +153,6 @@ def _run_reference(args, prompt: str) -> dict | None:
     out = llm.generate([prompt], sp)
     dt = time.perf_counter() - t0
     ids = list(out[0].outputs[0].token_ids)
-    del llm
-    gc.collect()
     sys.stderr.write("=== reference done ===\n")
     sys.stderr.flush()
     return {
@@ -159,6 +162,39 @@ def _run_reference(args, prompt: str) -> dict | None:
         "tpot_ms": round(dt / max(len(ids), 1) * 1000, 2),
         "token_ids": ids,
     }
+
+
+def _run_reference_subprocess(args) -> dict:
+    """Run the reference generate in its own process.
+
+    The reference's Metal allocations (weights + KV) are only guaranteed
+    released once its process exits; in-process teardown of the ``LLM``
+    object does not free them before the spec run profiles its KV budget,
+    so on tight ``VLLM_METAL_MEMORY_FRACTION`` values the spec run would
+    see a reduced or negative ``kv_budget`` and fail.
+    """
+    cmd = [
+        sys.executable,
+        __file__,
+        "--reference-only",
+        "--model",
+        args.model,
+        "--prefix",
+        str(args.prefix),
+        "--gen",
+        str(args.gen),
+    ]
+    # stderr passes through so the child's progress markers stay visible.
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"reference subprocess failed with exit code {proc.returncode}"
+            " (see its stderr above)"
+        )
+    for line in proc.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return json.loads(line[len("RESULT") :].lstrip())
+    raise RuntimeError("reference subprocess produced no RESULT line")
 
 
 def _run_spec(args, prompt: str, reference_ids: list[int] | None) -> list[dict]:
@@ -229,15 +265,26 @@ def main() -> None:
         action="store_true",
         help="Skip the non-speculative reference run (saves memory/time).",
     )
+    ap.add_argument(
+        "--reference-only",
+        action="store_true",
+        help=argparse.SUPPRESS,  # internal: spawned by the parent process
+    )
     args = ap.parse_args()
 
     prompt = _build_prompt(args.model, args.prefix)
 
+    if args.reference_only:
+        print("RESULT " + json.dumps(_run_reference(args, prompt)))
+        return
+
     # -- Reference: no speculative decoding ------------------------------------
+    # In its own subprocess so its Metal memory is fully released before the
+    # spec run profiles the KV budget.
     reference = None
     reference_ids = None
     if not args.skip_lossless:
-        reference = _run_reference(args, prompt)
+        reference = _run_reference_subprocess(args)
         reference_ids = reference["token_ids"]
 
     # -- Spec-decode runs with instrumentation ---------------------------------
