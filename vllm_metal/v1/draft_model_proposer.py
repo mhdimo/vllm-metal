@@ -580,13 +580,6 @@ class DraftModelProposer:
     def _ingest_and_draft_first(
         self, plans: list[_DraftPlan], offset_caches: list[OffsetCache]
     ) -> mx.array:
-        packed: list[int] = []
-        last_rows: list[int] = []
-        for plan in plans:
-            packed.extend(plan.ingest_tokens)
-            last_rows.append(len(packed) - 1)
-        input_ids = mx.array([packed], dtype=mx.int32)
-
         # The steady-state ingest (K+1 committed tokens per accepted round)
         # rides the decode path as one single-query segment per token — the
         # same shape the target's verify rows use. Submitting it as a prefill
@@ -595,6 +588,12 @@ class DraftModelProposer:
         # per pass at an 8k prefix (#482, Problem 2). Large ingests (the
         # first-propose catch-up) stay on the tiled path, where it wins.
         if max(len(plan.ingest_tokens) for plan in plans) <= _DECODE_INGEST_MAX_TOKENS:
+            packed: list[int] = []
+            last_rows: list[int] = []
+            for plan in plans:
+                packed.extend(plan.ingest_tokens)
+                last_rows.append(len(packed) - 1)
+            input_ids = mx.array([packed], dtype=mx.int32)
             decode_specs = [
                 (plan.block_ids, plan.draft_seq_len, len(plan.ingest_tokens))
                 for plan in plans
@@ -612,18 +611,58 @@ class DraftModelProposer:
                 merge_verify_windows=self._merge_ingest_windows
                 and envs.VLLM_METAL_SPEC_VERIFY_WINDOW,
             )
-        else:
-            prefill_specs = [
-                (plan.block_ids, len(plan.ingest_tokens), plan.draft_seq_len)
-                for plan in plans
-            ]
-            prepare_unified([], prefill_specs, self._block_size)
-        try:
-            logits = self._extract_logits(self._model(input_ids, cache=offset_caches))
-        finally:
-            clear_context()
+            try:
+                logits = self._extract_logits(
+                    self._model(input_ids, cache=offset_caches)
+                )
+            finally:
+                clear_context()
 
-        last = mx.take(logits[0], mx.array(last_rows, dtype=mx.int32), axis=0)
+            last = mx.take(logits[0], mx.array(last_rows, dtype=mx.int32), axis=0)
+            return mx.argmax(last, axis=-1)
+
+        # Cold ingest: a fresh prefix re-ingests the whole prompt into the
+        # draft cache in one tiled prefill forward, stalling the engine for
+        # the full prompt length (#482, direction 3). Run it in chunks so
+        # each dispatch is bounded (default 1024 tokens, ~2 ms of draft-model
+        # work) and the logits peak allocation scales with the chunk, not the
+        # prompt. The chunk start maps to draft position
+        # ``draft_seq_len + start``, and the final row of each plan's last
+        # chunk is the last ingested token, whose logits predict the plan's
+        # first draft token — identical to the single-forward path.
+        max_len = max(len(plan.ingest_tokens) for plan in plans)
+        chunk_size = envs.VLLM_METAL_SPEC_INGEST_CHUNK
+        if chunk_size <= 0:
+            chunk_size = max_len  # "0" restores the single-forward behavior
+        final_rows: dict[int, mx.array] = {}
+        for start in range(0, max_len, chunk_size):
+            round_packed: list[int] = []
+            prefill_specs: list[tuple[list[int], int, int]] = []
+            final_row_indices: list[tuple[int, int]] = []
+            for plan_index, plan in enumerate(plans):
+                ingest_len = len(plan.ingest_tokens)
+                end = min(start + chunk_size, ingest_len)
+                if end <= start:
+                    continue
+                round_packed.extend(plan.ingest_tokens[start:end])
+                prefill_specs.append(
+                    (plan.block_ids, end - start, plan.draft_seq_len + start)
+                )
+                final_row_indices.append((plan_index, len(round_packed) - 1))
+            input_ids = mx.array([round_packed], dtype=mx.int32)
+            prepare_unified([], prefill_specs, self._block_size)
+            try:
+                logits = self._extract_logits(
+                    self._model(input_ids, cache=offset_caches)
+                )
+            finally:
+                clear_context()
+            for plan_index, row in final_row_indices:
+                final_rows[plan_index] = logits[0][row]
+
+        last = mx.stack(
+            [final_rows[plan_index] for plan_index in range(len(plans))], axis=0
+        )
         return mx.argmax(last, axis=-1)
 
     def _draft_step(

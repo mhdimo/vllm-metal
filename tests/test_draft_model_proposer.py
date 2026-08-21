@@ -45,6 +45,35 @@ class _StubDraftModel:
         return mx.zeros((1, int(input_ids.shape[1]), VOCAB_SIZE), dtype=mx.float32)
 
 
+class _PositionEncodingDraftModel(_StubDraftModel):
+    """Logits keyed on each row's true KV position, read from the paged
+    context (per-segment RoPE offsets + cu_seqlens) -- the same position
+    signal the real attention gets -- so chunk boundaries and cross-plan
+    packing order cannot leak into the logits.  Argmax at the row whose
+    true position is p is p % VOCAB_SIZE.
+    """
+
+    def __call__(self, input_ids: mx.array, *, cache: list[OffsetCache]) -> mx.array:
+        n = int(input_ids.shape[1])
+        ctx = get_context()
+        assert ctx is not None
+        assert ctx.cu_seqlens is not None
+        self.block_tables.append([list(block_ids) for block_ids in ctx.block_tables])
+        self.input_lens.append(n)
+        positions = [
+            position
+            for segment_index, (start, end) in enumerate(
+                zip(ctx.cu_seqlens[:-1], ctx.cu_seqlens[1:], strict=True)
+            )
+            for position in range(
+                ctx.offsets[segment_index],
+                ctx.offsets[segment_index] + end - start,
+            )
+        ]
+        assert len(positions) == n
+        return mx.eye(VOCAB_SIZE)[mx.array(positions) % VOCAB_SIZE][None]
+
+
 def _proposer(
     model: _StubDraftModel,
     *,
@@ -101,6 +130,43 @@ def _context(
         request_states=request_states,
         cu_seqlens=[],
         num_decode_segments=1,
+        num_speculative_tokens=num_speculative_tokens,
+        finished_req_ids=set(),
+    )
+
+
+def _prefills_context(
+    prefills: list[tuple[str, list[int]]],
+    *,
+    num_speculative_tokens: int = 1,
+) -> ProposeContext:
+    """Context whose requests are final-chunk prefills (greedy, drafting)."""
+    prefill_reqs = [
+        PrefillRequest(
+            req_id=req_id,
+            token_ids=list(token_ids),
+            sampling_params=SamplingParams(temperature=0.0),
+            block_ids=[[0]],
+            generator=None,
+            prompt_len=None,
+            start_pos=0,
+            full_prompt_token_ids=None,
+        )
+        for req_id, token_ids in prefills
+    ]
+    return ProposeContext(
+        target_hidden_states=None,
+        decode_reqs=[],
+        decode_segments=[],
+        decode_token_ids=[],
+        prefill_reqs=prefill_reqs,
+        prefill_token_ids=[],
+        prefill_result_modes=["final"] * len(prefill_reqs),
+        request_states={
+            req_id: _request_state(committed_block_ids=[0]) for req_id, _ in prefills
+        },
+        cu_seqlens=[],
+        num_decode_segments=0,
         num_speculative_tokens=num_speculative_tokens,
         finished_req_ids=set(),
     )
@@ -461,6 +527,104 @@ def test_spec_kv_ledger_cleared_on_release() -> None:
     )
 
     assert model.input_lens[ingest] == 4  # no skip: ledger gone
+
+
+# -- Chunked cold ingest (#482 direction 3) ----------------------------------
+
+
+def test_chunked_ingest_forwards_per_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A >16-token cold ingest runs one forward per chunk: a 20-token prompt
+    with a 16-token chunk runs 16 then 4, and the predicted token comes from
+    the final ingested row (position 19), not a chunk boundary."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
+
+    assert model.input_lens == [16, 4]
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE]]
+
+
+def test_ingest_chunk_exact_multiple_two_equal_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 32-token ingest with a 16-token chunk splits 16 / 16; the final
+    row of the second round (position 31) predicts."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(32)))]))
+
+    assert model.input_lens == [16, 16]
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[31 % VOCAB_SIZE]]
+
+
+def test_ingest_chunk_larger_than_prompt_single_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chunk bigger than the ingest keeps the single-forward behavior."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
+
+    assert model.input_lens == [20]
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE]]
+
+
+def test_ingest_chunk_size_zero_single_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chunk "0" restores the pre-chunk single-forward behavior."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "0")
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(20)))]))
+
+    assert model.input_lens == [20]
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE]]
+
+
+def test_small_ingest_ignores_chunk_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ingests at or below the decode threshold keep the single decode-path
+    forward whatever the chunk size -- the knob only governs cold ingests."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1")
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(_prefills_context([("r1", list(range(16)))]))
+
+    assert model.input_lens == [16]
+    assert drafts is not None
+    assert drafts.draft_token_ids == [[15 % VOCAB_SIZE]]
+
+
+def test_mixed_chunk_lengths_share_rounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """20- and 25-token ingests with a 16-token chunk: round 0 carries both
+    plans' first 16 tokens, round 1 the two tails; each plan predicts from
+    its own final row (positions 19 and 24)."""
+    monkeypatch.setenv("VLLM_METAL_SPEC_INGEST_CHUNK", "16")
+    model = _PositionEncodingDraftModel()
+    proposer = _proposer(model)
+
+    drafts = proposer.propose(
+        _prefills_context([("r1", list(range(20))), ("r2", list(range(25)))])
+    )
+
+    assert model.input_lens == [32, 13]
+    assert drafts is not None
+    assert drafts.req_ids == ["r1", "r2"]
+    assert drafts.draft_token_ids == [[19 % VOCAB_SIZE], [24 % VOCAB_SIZE]]
 
 
 # -- Sliding-window / hybrid draft rejection ---------------------------------
