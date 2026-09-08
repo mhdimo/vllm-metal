@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _APPLIED = False
+_POOLING_LOAD_SCOPE = False
 _QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
@@ -917,6 +919,27 @@ def _wrap_model_sanitize(
     return True
 
 
+@contextmanager
+def pooling_load_scope(*, enabled: bool = True) -> Iterator[None]:
+    """Mark the wrapped model load as a pooling load for compat shims.
+
+    The Qwen3 flat-prefix shim below drops mlx_lm's ``lm_head`` module only
+    inside this scope. Pooling reads body hidden states and never calls
+    logits. Generation and classify need the head, so outside this scope the
+    module stays and strict load fails with the honest missing-tensor error.
+    """
+    global _POOLING_LOAD_SCOPE  # noqa: PLW0603
+    if not enabled:
+        yield
+        return
+    previous = _POOLING_LOAD_SCOPE
+    _POOLING_LOAD_SCOPE = True
+    try:
+        yield
+    finally:
+        _POOLING_LOAD_SCOPE = previous
+
+
 def _qwen3_flat_weight_prefix(
     model: Any, weights: Mapping[str, Any]
 ) -> Mapping[str, Any]:
@@ -930,9 +953,10 @@ def _qwen3_flat_weight_prefix(
 
     ``lm_head.weight`` keeps its top-level name: upstream ``sanitize`` drops it
     for tied embeddings, and untied checkpoints own it there. When an untied
-    checkpoint ships no head tensor at all (the official 8B embedding), drop
-    the module mlx_lm constructed: embed pooling reads body hidden states and
-    never this module, and mlx ``nn.Module.__delattr__`` removes it from
+    checkpoint ships no head tensor at all (the official 8B embedding) and the
+    load runs inside ``pooling_load_scope()``, drop the module mlx_lm
+    constructed: embed pooling reads body hidden states and never this
+    module, and mlx ``nn.Module.__delattr__`` removes it from
     ``parameters()``, so strict load stops demanding a tensor Qwen never
     wrote.
     """
@@ -946,6 +970,7 @@ def _qwen3_flat_weight_prefix(
         "lm_head.weight" not in weights
         and not model.args.tie_word_embeddings
         and getattr(model, "lm_head", None) is not None
+        and _POOLING_LOAD_SCOPE
     ):
         delattr(model, "lm_head")
     return {

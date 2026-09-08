@@ -921,9 +921,27 @@ class TestQwen3FlatWeightPrefixTransform:
 
         assert out == weights
 
-    def test_untied_headless_checkpoint_drops_lm_head_module(self) -> None:
+    def test_untied_headless_checkpoint_drops_lm_head_module_in_pooling_scope(
+        self,
+    ) -> None:
         # The official 8B embedding checkpoint ships tie_word_embeddings=false
-        # but no lm_head tensor at all; strict load must not demand one.
+        # but no lm_head tensor at all; a pooling load must not demand one.
+        fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)
+        assert fake_self.lm_head is not None
+
+        with compat.pooling_load_scope():
+            out = compat._qwen3_flat_weight_prefix(
+                fake_self, _flat_official_qwen3_weights()
+            )
+
+        assert "model.norm.weight" in out
+        assert not hasattr(fake_self, "lm_head")
+
+    def test_untied_headless_checkpoint_keeps_lm_head_module_outside_pooling(
+        self,
+    ) -> None:
+        # Generation and classify need the head. Outside the pooling scope the
+        # module stays, so strict load fails with the missing-tensor error.
         fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)
         assert fake_self.lm_head is not None
 
@@ -932,7 +950,7 @@ class TestQwen3FlatWeightPrefixTransform:
         )
 
         assert "model.norm.weight" in out
-        assert not hasattr(fake_self, "lm_head")
+        assert fake_self.lm_head is not None
 
     def test_headful_checkpoint_keeps_lm_head_module(self) -> None:
         fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)

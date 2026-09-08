@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
-from vllm_metal.compat import apply_compat_patches
+from vllm_metal.compat import apply_compat_patches, pooling_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
@@ -153,7 +153,11 @@ class ModelLifecycle:
             return
 
         request = GenerationLoadRequest.from_runner(self._runner, self._model_adapter)
-        loaded_model = self._load_generation(request)
+        # Pooling-only compat shims (the Qwen3 headless lm_head drop) must stay
+        # off for generation loads: strict load has to fail there, not the
+        # first forward pass.
+        with pooling_load_scope(enabled=self._runner._is_pooling):
+            loaded_model = self._load_generation(request)
 
         self._install_generation_model(loaded_model, request)
 
