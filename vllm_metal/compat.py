@@ -915,6 +915,7 @@ def _wrap_model_sanitize(
         return original_sanitize(self, transform(self, weights))
 
     setattr(_patched_sanitize, sentinel_attr, True)
+    _patched_sanitize._vllm_metal_original_sanitize = original_sanitize
     model_cls.sanitize = _patched_sanitize
     return True
 
@@ -979,7 +980,7 @@ def _qwen3_flat_weight_prefix(
     }
 
 
-def _patch_mlx_lm_qwen3_flat_weight_prefix() -> None:
+def _patch_mlx_lm_qwen3_flat_weight_prefix() -> bool:
     """Teach mlx_lm's Qwen3 loader to accept flat official Qwen3 checkpoints.
 
     Qwen ships the Qwen3-Embedding checkpoints (0.6B/4B/8B) with backbone keys
@@ -999,7 +1000,7 @@ def _patch_mlx_lm_qwen3_flat_weight_prefix() -> None:
     from importlib.util import find_spec
 
     if find_spec("mlx_lm.models.qwen3") is None:
-        return
+        return False
     try:
         qwen3 = import_module("mlx_lm.models.qwen3")
     except ImportError as exc:
@@ -1008,17 +1009,19 @@ def _patch_mlx_lm_qwen3_flat_weight_prefix() -> None:
             "Qwen3 weight prefix compatibility patch: %s",
             exc,
         )
-        return
+        return False
     model_cls = getattr(qwen3, "Model", None)
     if model_cls is None:
         logger.warning(
             "Could not install the flat Qwen3 weight prefix compatibility "
             "patch: mlx_lm.models.qwen3 has no Model class."
         )
-        return
-    if _wrap_model_sanitize(
+        return False
+    patched = _wrap_model_sanitize(
         model_cls,
         "_vllm_metal_qwen3_flat_prefix_patch",
         _qwen3_flat_weight_prefix,
-    ):
+    )
+    if patched:
         logger.debug("Patched mlx_lm Qwen3 flat weight prefix compatibility")
+    return patched

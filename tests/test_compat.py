@@ -810,35 +810,44 @@ class TestInstallMetalOverride:
                 delattr(RayWorkerProc, "_metal_patched")
 
 
-def _install_fake_qwen3_module(monkeypatch):
-    mlx_lm_pkg = ModuleType("mlx_lm")
-    mlx_lm_models = ModuleType("mlx_lm.models")
-    mlx_lm_pkg.models = mlx_lm_models
-    monkeypatch.setitem(sys.modules, "mlx_lm", mlx_lm_pkg)
-    monkeypatch.setitem(sys.modules, "mlx_lm.models", mlx_lm_models)
+def _unwrap_qwen3_sanitize(model_cls) -> bool:
+    """Restore upstream sanitize if this session already wrapped it."""
+    original = getattr(model_cls.sanitize, "_vllm_metal_original_sanitize", None)
+    if original is None:
+        return False
+    model_cls.sanitize = original
+    return True
 
-    qwen3_module = ModuleType("mlx_lm.models.qwen3")
 
-    class Model:
-        def __init__(self, tie_word_embeddings: bool = False) -> None:
-            self.args = SimpleNamespace(tie_word_embeddings=tie_word_embeddings)
+def _tiny_qwen3_args(tie_word_embeddings: bool):
+    from mlx_lm.models.qwen3 import ModelArgs
 
-        def sanitize(self, weights):
-            if self.args.tie_word_embeddings:
-                weights.pop("lm_head.weight", None)
-            return weights
+    return ModelArgs(
+        model_type="qwen3",
+        hidden_size=16,
+        num_hidden_layers=1,
+        intermediate_size=32,
+        num_attention_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        rope_theta=10000.0,
+        head_dim=8,
+        tie_word_embeddings=tie_word_embeddings,
+    )
 
-    qwen3_module.Model = Model
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.qwen3", qwen3_module)
-    mlx_lm_models.qwen3 = qwen3_module
 
-    def _fake_find_spec(name: str):
-        if name == "mlx_lm.models.qwen3":
-            return object()
-        return None
+def _official_flat_weights(model) -> dict[str, object]:
+    """Backbone tensors in the official flat layout: no ``model.`` prefix."""
+    from mlx.nn.utils import tree_flatten
 
-    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
-    return qwen3_module
+    flat = dict(tree_flatten(model.parameters()))
+    return {
+        key.removeprefix("model."): value
+        for key, value in flat.items()
+        if key.startswith("model.")
+    }
 
 
 def _flat_official_qwen3_weights() -> dict[str, object]:
@@ -974,37 +983,88 @@ class TestQwen3FlatWeightPrefixTransform:
         assert not hasattr(fake_self, "lm_head")
 
 
-class TestQwen3FlatPrefixCompatPatch:
-    def test_wraps_sanitize_and_remaps_flat_checkpoints(self, monkeypatch) -> None:
-        qwen3_module = _install_fake_qwen3_module(monkeypatch)
+class TestQwen3FlatPrefixRealStrictLoad:
+    """Prove the #730 failure path on the real mlx_lm qwen3.Model.
 
-        compat._patch_mlx_lm_qwen3_flat_weight_prefix()
-        # A second registration must not stack a second remap.
-        compat._patch_mlx_lm_qwen3_flat_weight_prefix()
+    ``mlx_lm.load`` calls ``model.sanitize(weights)`` and then
+    ``model.load_weights(..., strict=True)``, so the tests below exercise the
+    same sequence with the real class instead of a local stand-in.
+    """
 
-        model = qwen3_module.Model(tie_word_embeddings=True)
-        sanitized = model.sanitize(
-            {**_flat_official_qwen3_weights(), "lm_head.weight": "W-head"}
-        )
+    @pytest.fixture()
+    def real_qwen3_cls(self):
+        pytest.importorskip("mlx.core")
+        qwen3 = pytest.importorskip("mlx_lm.models.qwen3")
+        pre_test_sanitize = qwen3.Model.__dict__.get("sanitize")
+        yield qwen3.Model
+        if pre_test_sanitize is None:
+            delattr(qwen3.Model, "sanitize")
+        else:
+            qwen3.Model.sanitize = pre_test_sanitize
 
-        assert "model.embed_tokens.weight" in sanitized
-        assert "model.norm.weight" in sanitized
-        assert "embed_tokens.weight" not in sanitized
-        # The tied lm_head is dropped by upstream sanitize, not by the remap.
-        assert "lm_head.weight" not in sanitized
+    @staticmethod
+    def _load_like_mlx_lm(model, flat) -> None:
+        """Mirror ``mlx_lm.load``: sanitize first, then strict load."""
+        weights = model.sanitize(dict(flat))
+        model.load_weights(list(weights.items()), strict=True)
 
-    def test_untied_checkpoint_keeps_top_level_lm_head_after_sanitize(
-        self, monkeypatch
+    def test_flat_tied_checkpoint_strict_loads_after_patch(
+        self, real_qwen3_cls
     ) -> None:
-        qwen3_module = _install_fake_qwen3_module(monkeypatch)
+        import mlx.core as mx
 
-        compat._patch_mlx_lm_qwen3_flat_weight_prefix()
+        model_cls = real_qwen3_cls
+        _unwrap_qwen3_sanitize(model_cls)
+        try:
+            # The #730 failure: official flat keys, upstream sanitize, strict load.
+            flat = _official_flat_weights(
+                model_cls(_tiny_qwen3_args(tie_word_embeddings=True))
+            )
+            flat["norm.weight"] = mx.full((16,), 7.0)
+            with pytest.raises(ValueError, match="embed_tokens.weight"):
+                self._load_like_mlx_lm(
+                    model_cls(_tiny_qwen3_args(tie_word_embeddings=True)), flat
+                )
 
-        model = qwen3_module.Model(tie_word_embeddings=False)
-        sanitized = model.sanitize(
-            {**_flat_official_qwen3_weights(), "lm_head.weight": "W-head"}
-        )
+            assert compat._patch_mlx_lm_qwen3_flat_weight_prefix() is True
+            # A second install must not stack a second remap.
+            assert compat._patch_mlx_lm_qwen3_flat_weight_prefix() is False
 
-        assert sanitized["lm_head.weight"] == "W-head"
-        assert "model.lm_head.weight" not in sanitized
-        assert "model.layers.0.self_attn.q_proj.weight" in sanitized
+            loaded = model_cls(_tiny_qwen3_args(tie_word_embeddings=True))
+            self._load_like_mlx_lm(loaded, flat)
+            assert float(loaded.model.norm.weight[0]) == 7.0
+        finally:
+            _unwrap_qwen3_sanitize(model_cls)
+
+    def test_headless_untied_checkpoint_loads_only_under_pooling_scope(
+        self, real_qwen3_cls
+    ) -> None:
+        model_cls = real_qwen3_cls
+        _unwrap_qwen3_sanitize(model_cls)
+        try:
+            # The official 8B shape: untied config, but no lm_head tensor.
+            flat = _official_flat_weights(
+                model_cls(_tiny_qwen3_args(tie_word_embeddings=False))
+            )
+            assert "lm_head.weight" not in flat
+            with pytest.raises(ValueError, match="embed_tokens.weight"):
+                self._load_like_mlx_lm(
+                    model_cls(_tiny_qwen3_args(tie_word_embeddings=False)), flat
+                )
+
+            assert compat._patch_mlx_lm_qwen3_flat_weight_prefix() is True
+
+            # Generation keeps the module: strict load fails with the honest
+            # missing-tensor error instead of a failure at first logits.
+            generation = model_cls(_tiny_qwen3_args(tie_word_embeddings=False))
+            with pytest.raises(ValueError, match="Missing 1 parameters"):
+                self._load_like_mlx_lm(generation, flat)
+            assert generation.lm_head is not None
+
+            # Pooling never calls logits: the module is dropped, load passes.
+            with compat.pooling_load_scope():
+                pooling = model_cls(_tiny_qwen3_args(tie_word_embeddings=False))
+                self._load_like_mlx_lm(pooling, flat)
+            assert not hasattr(pooling, "lm_head")
+        finally:
+            _unwrap_qwen3_sanitize(model_cls)
