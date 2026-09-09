@@ -987,6 +987,13 @@ def _patch_mlx_lm_qwen3_flat_weight_prefix() -> None:
     ``model.layers.0....``; upstream ``sanitize`` never remaps, so
     ``load_weights(strict=True)`` rejects all tensors. Mirrors the Qwen3.5 FP8
     patch: narrow to the affected model module, upstream control flow intact.
+
+    This is an upstream key-layout shim, not permanent vllm-metal behavior.
+
+    TODO: remove when the pinned mlx_lm remaps flat official
+    checkpoints in ``mlx_lm.models.qwen3.Model.sanitize``. No upstream
+    mlx-lm issue or PR tracks this layout as of 0.32.0; vllm-metal
+    issue #730 carries the report.
     """
     from importlib import import_module
     from importlib.util import find_spec
