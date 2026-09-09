@@ -938,7 +938,7 @@ class TestQwen3FlatWeightPrefixTransform:
         fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)
         assert fake_self.lm_head is not None
 
-        with compat.pooling_load_scope():
+        with compat.embedding_load_scope():
             out = compat._qwen3_flat_weight_prefix(
                 fake_self, _flat_official_qwen3_weights()
             )
@@ -949,8 +949,8 @@ class TestQwen3FlatWeightPrefixTransform:
     def test_untied_headless_checkpoint_keeps_lm_head_module_outside_pooling(
         self,
     ) -> None:
-        # Generation and classify need the head. Outside the pooling scope the
-        # module stays, so strict load fails with the missing-tensor error.
+        # Generation and classify need the head. Outside the embedding scope
+        # the module stays, so strict load fails with the missing-tensor error.
         fake_self = _HeadfulQwen3Self(tie_word_embeddings=False)
         assert fake_self.lm_head is not None
 
@@ -1061,8 +1061,9 @@ class TestQwen3FlatPrefixRealStrictLoad:
                 self._load_like_mlx_lm(generation, flat)
             assert generation.lm_head is not None
 
-            # Pooling never calls logits: the module is dropped, load passes.
-            with compat.pooling_load_scope():
+            # Embedding pooling never calls logits: the module is dropped, the
+            # strict load passes.
+            with compat.embedding_load_scope():
                 pooling = model_cls(_tiny_qwen3_args(tie_word_embeddings=False))
                 self._load_like_mlx_lm(pooling, flat)
             assert not hasattr(pooling, "lm_head")

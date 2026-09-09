@@ -53,6 +53,22 @@ class DecoderModelView:
         return body if callable(body) else None
 
 
+EMBED_POOLING_ARCH_SUFFIXES = ("ForCausalLM", "ForTextEncoding", "EmbeddingModel")
+
+
+def is_embed_pooling_architecture(architectures: Any) -> bool:
+    """True when the architecture list reads as a decoder embedding model.
+
+    Shared between the LAST-token pooler support check and the load-time
+    embedding-only compat scope, so both apply the same rule: pooling
+    classify archs (for example Qwen3 rerankers) never count as embedding.
+    """
+    return any(
+        str(architecture).endswith(EMBED_POOLING_ARCH_SUFFIXES)
+        for architecture in architectures
+    )
+
+
 class LastTokenEmbeddingPooler:
     """Pool decoder hidden states into normalized LAST-token embeddings."""
 
@@ -109,12 +125,7 @@ class LastTokenEmbeddingPooler:
         return mx.contiguous(vector / norm)
 
     def _is_decoder_embedding(self) -> bool:
-        return any(
-            architecture.endswith("ForCausalLM")
-            or architecture.endswith("ForTextEncoding")
-            or architecture.endswith("EmbeddingModel")
-            for architecture in self.config.architectures
-        )
+        return is_embed_pooling_architecture(self.config.architectures)
 
 
 class MetalDecoderPoolingBackend:

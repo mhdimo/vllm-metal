@@ -35,6 +35,7 @@ from vllm_metal.v1.pooling.backends.decoder.models.qwen3 import (  # noqa: E402
 from vllm_metal.v1.pooling.backends.decoder.runtime import (  # noqa: E402
     DecoderModelView,
     MetalDecoderPoolingBackend,
+    is_embed_pooling_architecture,
 )
 from vllm_metal.v1.pooling.backends.encoder.factory import (  # noqa: E402
     load_encoder_pooling_backend,
@@ -419,6 +420,21 @@ def _execute_pooling(runner, sched):
     out = runner.execute_model(sched)
     assert out is not None
     return out
+
+
+class TestEmbedPoolingArchitecture:
+    def test_accepts_embedding_architectures(self) -> None:
+        assert is_embed_pooling_architecture(["Qwen3ForCausalLM"]) is True
+        assert is_embed_pooling_architecture(["Qwen3EmbeddingModel"]) is True
+
+    def test_rejects_pooling_classify_architectures(self) -> None:
+        # Qwen3 reranker classify reads lm_head; it is not an embedding arch.
+        assert (
+            is_embed_pooling_architecture(["Qwen3ForSequenceClassification"]) is False
+        )
+
+    def test_rejects_empty_architectures(self) -> None:
+        assert is_embed_pooling_architecture([]) is False
 
 
 class TestMetalPoolingCapabilities:
