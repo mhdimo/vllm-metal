@@ -11,6 +11,11 @@ import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 
+from vllm_metal.v1.dspark.sampling import (
+    DSparkProposal,
+    RequestRandomStreams,
+    SamplingTransforms,
+)
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.spec_decode import (
     PagedDecodeSegment,
@@ -421,6 +426,197 @@ class TestVerifyGreedySpecDecode:
                 [("r0", _request_state(temperature=0.7))],
                 (segment,),
             )
+
+
+def _sharp_logits(token_ids: list[int], vocab_size: int = 16) -> mx.array:
+    """Rows whose float32 softmax is exactly a point mass on ``token_ids``."""
+    rows = []
+    for token_id in token_ids:
+        row = [0.0] * vocab_size
+        row[token_id] = 40.0
+        rows.append(row)
+    return mx.array([rows])
+
+
+def _segment(
+    req_id: str, start_row: int, drafts: tuple[int, ...]
+) -> PagedDecodeSegment:
+    return PagedDecodeSegment(
+        req_id=req_id,
+        input_token_ids=(6, *drafts),
+        start_row=start_row,
+        num_query_tokens=len(drafts) + 1,
+        draft_token_ids=drafts,
+        cache_start_pos=1,
+        block_ids=((0,),),
+    )
+
+
+def _record(
+    state, token_ids, *, anchor_position=1, anchor_token=6, owner=None, vocab_size=16
+):
+    rows = []
+    for token_id in token_ids:
+        row = [0.0] * vocab_size
+        row[token_id] = 0.5
+        row[(token_id + 5) % vocab_size] = 0.5
+        rows.append(row)
+    return DSparkProposal(
+        owner=state if owner is None else owner,
+        anchor_position=anchor_position,
+        anchor_token=anchor_token,
+        token_ids=list(token_ids),
+        distributions=mx.array(rows, dtype=mx.float32),
+        transforms=SamplingTransforms.from_params(state.sampling_params),
+        streams=RequestRandomStreams.for_request(1, engine_seed=0, ordinal=1),
+    )
+
+
+class TestVerifyMixedModes:
+    def test_mixed_batch_dispatches_by_sampling_mode(self) -> None:
+        greedy, stochastic = _request_state(), _request_state(temperature=1.0)
+        segments = (_segment("g", 0, (7, 8)), _segment("s", 3, (7, 8)))
+        # Greedy rejects at its second draft; the stochastic target puts all
+        # its float32 mass on the drafts, so every draft is accepted and the
+        # bonus row (a point mass) supplies the last token.
+        logits = _sharp_logits([7, 5, 9, 7, 8, 9])
+        output = SpeculativeDecodeController().verify(
+            logits,
+            [("g", greedy), ("s", stochastic)],
+            segments,
+            proposals={"s": _record(stochastic, [7, 8])},
+            vocab_size=16,
+        )
+        assert output == [[7, 5], [7, 8, 9]]
+
+    def test_stochastic_rejection_samples_the_residual(self) -> None:
+        stochastic = _request_state(temperature=0.7)
+        output = SpeculativeDecodeController().verify(
+            _sharp_logits([7, 5, 9]),
+            [("s", stochastic)],
+            (_segment("s", 0, (7, 8)),),
+            proposals={"s": _record(stochastic, [7, 8])},
+            vocab_size=16,
+        )
+        # p_1 is a point mass on 5 while q_1 has no mass there: the residual
+        # is that point mass, so the second token is 5 and the bonus is skipped.
+        assert output == [[7, 5]]
+
+    def test_scheduler_clipped_drafts_use_the_record_prefix(self) -> None:
+        stochastic = _request_state(temperature=1.0)
+        output = SpeculativeDecodeController().verify(
+            _sharp_logits([7, 3]),
+            [("s", stochastic)],
+            (_segment("s", 0, (7,)),),
+            proposals={"s": _record(stochastic, [7, 8, 4])},
+            vocab_size=16,
+        )
+        assert output == [[7, 3]]
+
+    @pytest.mark.parametrize(
+        "fault", ["missing", "owner", "anchor", "tokens", "transforms", "vocab"]
+    )
+    def test_stochastic_drafts_without_a_matching_record_fail_closed(
+        self, fault
+    ) -> None:
+        stochastic = _request_state(temperature=1.0)
+        record = _record(stochastic, [7, 8])
+        if fault == "owner":
+            record = _record(stochastic, [7, 8], owner=object())
+        elif fault == "anchor":
+            record = _record(stochastic, [7, 8], anchor_position=2)
+        elif fault == "tokens":
+            record = _record(stochastic, [7, 9])
+        elif fault == "transforms":
+            record = _record(_request_state(temperature=0.5), [7, 8])
+        elif fault == "vocab":
+            record = _record(stochastic, [7, 8], vocab_size=12)
+        proposals = {} if fault == "missing" else {"s": record}
+        with pytest.raises(RuntimeError, match="no matching proposal record"):
+            SpeculativeDecodeController().verify(
+                _sharp_logits([7, 8, 9]),
+                [("s", stochastic)],
+                (_segment("s", 0, (7, 8)),),
+                proposals=proposals,
+                vocab_size=16,
+            )
+
+    def test_stochastic_drafts_need_records_and_vocab(self) -> None:
+        stochastic = _request_state(temperature=1.0)
+        with pytest.raises(NotImplementedError, match="greedy sampling only"):
+            SpeculativeDecodeController().verify(
+                _sharp_logits([7, 8, 9]),
+                [("s", stochastic)],
+                (_segment("s", 0, (7, 8)),),
+            )
+
+    def test_undraftable_parameters_with_drafts_raise(self) -> None:
+        state = SimpleNamespace(
+            sampling_params=SamplingParams(temperature=0.7, presence_penalty=0.5)
+        )
+        with pytest.raises(NotImplementedError, match="not draftable"):
+            SpeculativeDecodeController().verify(
+                _sharp_logits([7, 8, 9]),
+                [("s", state)],
+                (_segment("s", 0, (7, 8)),),
+                proposals={},
+                vocab_size=16,
+            )
+
+    def test_empty_batch_and_greedy_only_batch(self) -> None:
+        controller = SpeculativeDecodeController()
+        assert controller.verify(_sharp_logits([7]), [], ()) == []
+        greedy = _request_state()
+        assert controller.verify(
+            _sharp_logits([7, 8, 9]), [("g", greedy)], (_segment("g", 0, (7, 8)),)
+        ) == [[7, 8, 9]]
+
+    @pytest.mark.parametrize(
+        "params,mode",
+        [
+            ({"temperature": 0.0}, "greedy"),
+            # vLLM normalizes a greedy request's top-k/top-p away.
+            ({"temperature": 0.0, "top_k": 3}, "greedy"),
+            ({"temperature": 0.8}, "stochastic"),
+            ({"temperature": 0.8, "top_k": 3, "top_p": 0.9, "seed": 2}, "stochastic"),
+            ({"temperature": 0.8, "min_p": 0.1}, None),
+            ({"temperature": 0.8, "logit_bias": {1: 2.0}}, None),
+            ({"temperature": 0.8, "repetition_penalty": 1.1}, None),
+            ({"temperature": 0.8, "logprobs": 1}, None),
+            ({"temperature": 0.8, "bad_words_token_ids": [[3]]}, None),
+            ({"temperature": 0.8, "allowed_token_ids": [1, 2]}, None),
+        ],
+    )
+    def test_draft_mode_classification(self, params, mode) -> None:
+        if "bad_words_token_ids" in params:
+            # The tokenizer fills this read-only field on real requests.
+            base = SamplingParams(temperature=0.8)
+            fields = {
+                name: getattr(base, name)
+                for name in (
+                    "temperature",
+                    "top_k",
+                    "top_p",
+                    "min_p",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "repetition_penalty",
+                    "num_logprobs",
+                    "allowed_token_ids",
+                    "logit_bias",
+                    "structured_outputs",
+                )
+            }
+            sampling_params = SimpleNamespace(**{**fields, **params})
+            state = SimpleNamespace(sampling_params=sampling_params)
+        else:
+            state = SimpleNamespace(sampling_params=SamplingParams(**params))
+        controller = SpeculativeDecodeController()
+        assert controller.draft_mode(state) == mode
+        assert controller.can_draft("r", state, allow_stochastic=True) == (
+            mode is not None
+        )
+        assert controller.can_draft_greedy("r", state) == (mode == "greedy")
 
 
 class TestSchedulerPaddedDrafts:

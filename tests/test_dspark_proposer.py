@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 
@@ -14,6 +15,11 @@ from tests.test_dspark_contracts import draft_hf_config
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
+from vllm_metal.v1.dspark.sampling import (
+    RequestRandomStreams,
+    SamplingTransforms,
+    sample_from_distribution,
+)
 from vllm_metal.v1.dspark_proposer import DSparkProposer, _DraftPlan, _RequestContext
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.proposer import ProposeContext
@@ -241,13 +247,156 @@ def test_mixed_spans_and_admission_skip_still_ingest_every_request():
 
 
 @pytest.mark.parametrize(
-    "params", [{"temperature": 0.8}, {"repetition_penalty": 1.1}, {"logprobs": 2}]
+    "params",
+    [
+        {"repetition_penalty": 1.1},
+        {"logprobs": 2},
+        {"temperature": 0.8, "presence_penalty": 0.5},
+        {"temperature": 0.8, "min_p": 0.1},
+        {"temperature": 0.8, "logit_bias": {1: 1.0}},
+    ],
 )
-def test_non_greedy_requests_keep_context_without_drafting(params):
+def test_undraftable_requests_keep_context_without_drafting(params):
     proposer = _proposer()
     state = _state([1, 2, 3], **params)
     assert _seed(proposer, state) is None
     _assert_context(proposer, "r", [0, 1])
+    assert "r" not in proposer.proposals
+
+
+def _stochastic_state(tokens, **params):
+    return _state(tokens, temperature=0.8, top_p=0.9, **params)
+
+
+def test_stochastic_requests_draft_from_recorded_distributions():
+    proposer = _proposer()
+    proposer._runner.model_config.seed = 0
+    state = _stochastic_state([1, 2, 3], seed=4)
+    drafts = _seed(proposer, state, k=2)
+    assert drafts.req_ids == ["r"] and len(drafts.draft_token_ids[0]) == 2
+    record = proposer.proposals["r"]
+    assert record.owner is state
+    assert record.anchor_position == 2 and record.anchor_token == 3
+    assert record.token_ids == drafts.draft_token_ids[0]
+    assert record.transforms == SamplingTransforms(0.8, 0, 0.9)
+    rows = np.array(record.distributions.tolist())
+    assert rows.shape == (2, 64)
+    assert np.allclose(rows.sum(axis=1), 1.0, atol=1e-6)
+    assert all(rows[i][t] > 0 for i, t in enumerate(record.token_ids))
+    assert (rows == 0).any()  # top-p truncation leaves zero-mass tokens
+    # Replaying the request's own proposal stream reproduces every drafted
+    # token from the recorded rows: the tokens came from exactly these q.
+    replay = RequestRandomStreams.for_request(4, engine_seed=0, ordinal=1)
+    expected = sample_from_distribution(
+        record.distributions, mx.array(replay.proposal.random(2), dtype=mx.float32)
+    )
+    assert expected.tolist() == record.token_ids
+
+
+def test_records_are_spent_on_the_next_schedule_and_released_with_the_request():
+    proposer = _proposer()
+    proposer._runner.model_config.seed = 0
+    state = _stochastic_state([1, 2, 3])
+    _seed(proposer, state, k=2)
+    drafted = proposer.proposals["r"].token_ids
+    # The scheduler verified one draft and committed a correction token.
+    state.token_ids.extend([drafted[0], 9])
+    proposer.propose(
+        _context(decode=[("r", state, 2, [3, *drafted], [drafted[0], 9])], k=2)
+    )
+    record = proposer.proposals["r"]
+    assert record.anchor_position == 4 and record.anchor_token == 9
+    assert proposer._streams["r"] is record.streams
+    # A scheduled request without a new draft (K=0 step) leaves no stale record.
+    state.token_ids.extend(record.token_ids[:1] + [8])
+    proposer.propose(
+        _context(
+            decode=[("r", state, 4, [9, *record.token_ids], [record.token_ids[0], 8])],
+            k=0,
+        )
+    )
+    assert "r" not in proposer.proposals
+    proposer.release_requests({"r"})
+    assert "r" not in proposer._streams
+
+
+def test_mixed_greedy_and_stochastic_rows_match_independent_rows():
+    proposer = _proposer()
+    specs = [(6, 3, None), (0, 2, 5), (2, 3, 6), (4, 1, None), (2, 2, 7)]
+
+    def plans():
+        built = []
+        for ordinal, (length, cap, seed) in enumerate(specs, start=1):
+            owner = (
+                _stochastic_state([2] * (length + 1))
+                if seed
+                else _state([2] * (length + 1))
+            )
+            caches = proposer._drafter.make_ctx_cache()
+            if length:
+                proposer._drafter.update_context(
+                    _features(list(range(length)))[None], 0, caches
+                )
+            transforms = streams = None
+            if seed:
+                transforms = SamplingTransforms.from_params(owner.sampling_params)
+                streams = RequestRandomStreams.for_request(
+                    seed, engine_seed=0, ordinal=ordinal
+                )
+            built.append(
+                _DraftPlan(
+                    f"{ordinal}",
+                    2,
+                    _RequestContext(owner, caches, length),
+                    cap,
+                    transforms,
+                    streams,
+                )
+            )
+        return built
+
+    alone = [proposer._batch_draft([plan]) for plan in plans()]
+    _, batched_rows, batched_records = proposer._batch_draft(plans())
+    for (_length, cap, seed), (_, rows, records), row in zip(
+        specs, alone, batched_rows, strict=True
+    ):
+        assert row == rows[0] and len(row) == cap
+        if seed:
+            (key,) = records
+            record, batched = records[key], batched_records[key]
+            assert batched.token_ids == record.token_ids
+            # The padded multi-row backbone and the single-row backbone differ
+            # by summation order only; the recorded rows are the ones the
+            # tokens were sampled from in either case.
+            assert np.allclose(
+                np.array(batched.distributions.tolist()),
+                np.array(record.distributions.tolist()),
+                atol=1e-6,
+                rtol=1e-5,
+            )
+            assert batched.distributions.shape == (cap, 64)
+    assert set(batched_records) == {"2", "3", "5"}
+
+
+def test_request_streams_survive_other_requests_and_reuse_ordinals_deterministically():
+    def run(with_other: bool):
+        mx.random.seed(11)  # identical drafter weights in both runs
+        proposer = _proposer()
+        proposer._runner.model_config.seed = 0
+        state = _stochastic_state([1, 2, 3])
+        _seed(proposer, state, k=2)
+        first = proposer.proposals["r"].token_ids
+        if with_other:
+            other = _stochastic_state([4, 5, 6])
+            _seed(proposer, other, "other", k=2)
+            proposer.release_requests({"other"})
+        state.token_ids.extend([first[0], 9])
+        proposer.propose(
+            _context(decode=[("r", state, 2, [3, *first], [first[0], 9])], k=2)
+        )
+        return first, proposer.proposals["r"].token_ids
+
+    assert run(False) == run(True)
 
 
 @pytest.mark.parametrize("event", ["finish", "cancel", "preempt", "resume"])

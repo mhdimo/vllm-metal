@@ -7,8 +7,8 @@ and serving qualification gates pass.
 
 For the verified integration revision, M5 Max setup, exact reproduction commands,
 raw-evidence transfer and remaining implementation sequence, start with the
-[development handoff](dspark-handoff.md), checked on 2026-09-10. M4 is
-qualified on the M5 Max destination machine (sections below); M5-M8 remain open.
+[development handoff](dspark-handoff.md), checked on 2026-09-10. M4 and M5 are
+qualified on the M5 Max destination machine (sections below); M6-M8 remain open.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ qualified on the M5 Max destination machine (sections below); M5-M8 remain open.
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
 | M4: Fixed-greedy serving | Complete on M5 Max for the pinned 4B pair: M4a parity contract ([record](dspark-m4-parity.md)), M4b admission fairness, M4c HTTP serving semantics, M4d fixed-K performance | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; admission caps measured on a real engine; the HTTP matrix passes with every divergence a tie; fixed K=2-4 gives +36-49% tokens/s at one request on short prompts and loses 4-28% at four concurrent requests (multi-row verification cost), so adaptive bypass is M6 work. |
-| M5: Stochastic verification | Planned | Exact proposal-distribution ownership, rejection/bonus sampling and distribution tests. |
+| M5: Stochastic verification | Complete on M5 Max for the pinned 4B pair | Exact float32 proposal distributions kept with every scheduled draft, rejection/residual/bonus sampling from per-request streams, enumerated oracle and powered distribution tests, real-engine distribution and mixed-workload gate. |
 | M6: Calibrated adaptive planning | Planned | Recipe-specific confidence calibration, measured cost curves and causal admission/planning. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
 | M8: Additional standalone pairs | Planned | Pair-specific target adapters, precision, capacity and serving qualification within 48 GB. |
@@ -585,3 +585,137 @@ concurrent requests and the multi-row target verification cost is the M7
 profiling target. Validation on M5 Max: the tool statistics helpers are unit
 tested, 2,338 non-slow tests passed, ruff, mypy and the strict docs build
 clean.
+
+## M5: exact stochastic verification (M5 Max, `ac114d7`)
+
+DSpark now drafts plain temperature/top-k/top-p requests and verifies them by
+exact rejection sampling; greedy requests keep the argmax draft chain and the
+exact greedy verifier, and the two kinds mix freely in one batch.
+`SpeculativeDecodeController.draft_mode` classifies every request once:
+penalties, logprobs and allowed/bad-token constraints exclude a request from
+drafting in every mode (target-only with the existing observable reason),
+greedy drafting needs plain argmax sampling (vLLM normalizes a greedy
+request's top-k/top-p away), and stochastic drafting additionally excludes
+structured output (its grammar state would have to evolve along the drafted
+prefix), `min_p` and `logit_bias` (the platform rejects both anyway).
+
+`vllm_metal/v1/dspark/sampling.py` owns the arithmetic. A stochastic row's
+proposal distribution at block position k is the float32 softmax of the
+drafter's logits plus the Markov step bias of the previous drafted token,
+divided by the request's temperature and masked to its top-k/top-p candidate
+set with the Metal sampler's own mask function (vLLM's tie and boundary
+semantics), so `q` is exactly what a target-only server would sample from at
+that request's settings; the token is drawn by inverse CDF over the float32
+cumulative sum against a float64 uniform rounded to float32 (a zero-mass token
+can never be selected; a cumulative sum that falls short of the uniform by
+rounding selects the last token with positive mass). The proposer keeps every
+sampled row in a `DSparkProposal` record attached to the scheduled proposal:
+the request generation (`RequestState` identity), the anchor position and
+token, the drafted tokens, the `[K, vocab]` float32 rows, the transforms, the
+precision statement and the request's random streams. Verification builds the
+target distribution `p` of every verify row from the target logits with the
+same transforms, accepts draft `x_k` with probability `min(1, p_k(x_k) /
+q_k(x_k))`, samples the first rejected position from the normalized positive
+residual `max(p_k - q_k, 0)` (falling back to `p_k` when the float32 residual
+mass is at most 1e-8, the reference evaluator's rule) and samples the bonus
+token from the last row after full acceptance. Every uniform comes from the
+owning request's own streams (proposal, acceptance, target: three PCG64
+generators spawned from the request seed, or from the engine seed and the
+request's admission ordinal, or from entropy when the engine has no seed);
+the acceptance stream advances by the scheduled width every step, so another
+request's scheduling, cancellation or reordering never consumes this
+request's draws, and a seeded request reproduces. A record is spent the next
+time the scheduler schedules the request (verified, clipped to a prefix, or
+dropped for a prefill chunk: vLLM clears a request's drafts on every
+scheduling) and released with the request; drafts on a stochastic request
+whose record does not match the request generation, anchor, tokens,
+transforms or vocabulary are invalid state and raise rather than being
+verified against the wrong `q`. The memory plan reserves the stored rows and
+the per-position temporaries (`rows x (block + 6) x vocab x 4` bytes, 253 MB
+for the 4B pair at 32 contexts). The runner passes the proposer's records and
+the vocabulary size to the controller's `verify`, which dispatches per
+request; the other Metal proposers stay greedy-only. The drafter's dead
+`sample_block_probs` (an import of a module that never existed) is removed.
+
+Tests. `tests/test_dspark_sampling.py`: the transform matches the sampler's
+mask semantics (top-k ties survive, top-p keeps the leader, padded lm_head
+columns carry no mass), batched rows equal rows computed alone, inverse-CDF
+edges (leading zeros, boundaries, a uniform rounded to 1.0, unnormalized
+rows, zero-mass tokens never selected over a dense grid), residual clipping
+and fallback, zero-proposal-mass reporting, an enumerated two-position
+tiny-vocabulary oracle that walks every branch of `verify_rows` with uniforms
+chosen inside each interval and exact interval weights (the emitted first
+token matches `p_0` and the second, given acceptance, matches `p_1`, to 1e-9),
+a predefined 20,000-draw chi-square gate against the target with real request
+streams (statistic 15.7 against the 0.001 critical value 20.5) whose negative
+control, verifying against a proposal distribution the drafts were not
+sampled from, scores above 100, zero-support and truncated proposals, and
+stream seeding and isolation. `tests/test_dspark_proposer.py`: stochastic
+requests draft with records whose rows sum to one, carry the truncation's
+zeros and reproduce the drafted tokens when the request's proposal stream is
+replayed from its seed; records are spent on the next schedule and released
+with the request; mixed greedy and stochastic rows drafted in one batch equal
+the rows drafted alone (tokens exactly, rows within summation order);
+creating and releasing another request leaves a request's draws unchanged;
+undraftable parameters keep their context without drafting.
+`tests/test_spec_decode_metadata.py`: mixed-mode dispatch, residual sampling
+at the first rejection, scheduler-clipped drafts using the record prefix,
+fail-closed records (missing, other owner, other anchor, other tokens, other
+transforms, other vocabulary), drafts on undraftable parameters, and the mode
+classification.
+
+Real-engine gate. `tools/dspark_stochastic_check.py` runs the pinned pair
+offline as a K=7 engine, a target-only engine and (with
+`--control-max-num-seqs`) a second target-only engine at another scheduler
+batch size, in separate worker processes with the multiprocess-free engine
+core (`results/m5max-m5-stochastic-04`; model length 512, 64 sequences, 512
+batch tokens, engine seed 0). Distribution: 8,000 unseeded requests on one
+natural prompt, three output tokens each, at temperature 1.0 and at
+temperature 0.7 with top-p 0.9; the first token comes from the prefill
+sampler on every engine, the second and third are verified drafts on the K=7
+engine. Each position's marginal histogram is compared between engines with a
+two-sample chi-square over the tokens holding at least ten observations in
+either sample (rarer tokens pooled) at significance 0.001, a test fixed
+before the run; the last column repeats the same test between the two
+target-only engines, which differ only in batch composition:
+
+| Scenario | Position | Buckets | Chi-square | p-value | TV detectable at 80% power | Control chi-square / p (target-only, 16 vs 64 sequences) |
+| --- | --- | --- | --- | --- | --- | --- |
+| t1.0 | 0: prefill sampler, not drafted (built-in control) | 45 | 22.6 | 0.997 | 0.055 | 26.1 / 0.992 |
+| t1.0 | 1: first verified position | 103 | 96.6 | 0.633 | 0.065 | 97.1 / 0.563 |
+| t1.0 | 2: second verified position | 99 | 136.2 | 0.006 | 0.065 | 130.6 / 0.016 |
+| t0.7-p0.9 | 0: prefill sampler, not drafted (built-in control) | 5 | 3.4 | 0.491 | 0.038 | 0.9 / 0.927 |
+| t0.7-p0.9 | 1: first verified position | 38 | 43.9 | 0.201 | 0.054 | 28.7 / 0.802 |
+| t0.7-p0.9 | 2: second verified position | 41 | 36.6 | 0.624 | 0.054 | 57.5 / 0.022 |
+
+Every comparison passes the predefined gate. The two smallest p-values sit at
+the second verified position, and the target-only control reproduces them
+(0.016 and 0.022 against 0.006 and 0.624): the target's own multi-row
+arithmetic (the M4a numerics contract) moves the sampled distributions by
+about that much without any drafting, so the speculative engine is
+indistinguishable from a target-only engine at the sensitivity the run
+affords (a total-variation distance of 0.04 to 0.07 at 80% power). Draft
+work in those runs: t1.0: 7,880 draft tokens, 4,050 accepted (51.4%); t0.7-p0.9: 7,985 draft tokens, 5,803 accepted (72.7%).
+
+Mixed workload on the K=7 engine (20 requests in one batch,
+run twice with the same seeds):
+
+| Request kind | Requests | Draft tokens | Accepted | Settings and outcome |
+| --- | --- | --- | --- | --- |
+| greedy | 4 | 418 | 124 | temperature 0; parity with the target-only engine judged by the M4a rule |
+| stochastic | 4 | 428 | 119 | temperature 0.8, top-p 0.95, seeded |
+| seeded-topk | 2 | 212 | 63 | temperature 1.0, top-k 40, seeded |
+| logprobs | 2 | 0 | 0 | greedy with `logprobs`: target-only |
+| penalty | 2 | 0 | 0 | repetition penalty 1.2: target-only |
+| short-budget | 2 | 9 | 3 | temperature 0.9, `max_tokens` 5 |
+| stochastic-eos | 1 | 708 | 153 | temperature 0.7, 256-token budget |
+| greedy-eos | 1 | 562 | 172 | temperature 0, 256-token budget |
+| stop-token | 2 | 133 | 25 | temperature 0.8, `stop_token_ids` on the period token; both ended on the stop token |
+
+Greedy outputs against the target-only engine: 4 equal and
+3 ties (logprob gaps 0.125, 0.125, 0.125); logprobs and penalty
+requests received no drafts; every output respected its budget; no token
+followed an EOS or stop token, and both stop-token requests ended on the stop
+token after drafting; the repeated batch reproduced every output token for
+token. Validation on M5 Max: 2,377 non-slow tests passed, ruff, mypy and the
+strict docs build clean.

@@ -428,39 +428,6 @@ class DSparkDrafter(nn.Module):
             prev = nxt
         return mx.concatenate(tokens)
 
-    def sample_block_probs(
-        self,
-        base_logits: mx.array,
-        first_prev_token: int,
-        temperature: float,
-        top_p: float = 1.0,
-        top_k: int = 0,
-    ) -> tuple[mx.array, mx.array]:
-        """Temperature draft for speculative *sampling*: sample each block position from
-        its (temperature-scaled, optionally top-p/top-k truncated) distribution and return
-        ``(tokens [k], probs [k, V])``. ``probs[i]`` is the draft distribution q_i that token
-        i was sampled from — the verifier needs it for the accept test ``min(1, p_i/q_i)`` and
-        residual resampling. Truncating q here (same top-p/top-k as the target) keeps
-        acceptance from collapsing when a client asks for nucleus sampling; losslessness comes
-        from the *target* side (see ``_spec_sample_accept``). Sequential because the Markov
-        bias for position i depends on the token sampled at i-1."""
-        from .sampling import sample_probs, truncate_probs
-
-        k = base_logits.shape[0]
-        inv_t = 1.0 / temperature
-        tokens, probs = [], []
-        prev = mx.array([first_prev_token])
-        for i in range(k):
-            logits = base_logits[i]
-            if self.markov_head is not None:
-                logits = logits + self.markov_head.step_bias(prev)[0]
-            q = truncate_probs(mx.softmax(logits * inv_t, axis=-1), top_p, top_k)
-            probs.append(q)
-            nxt = sample_probs(q).reshape(1)
-            tokens.append(nxt)
-            prev = nxt
-        return mx.concatenate(tokens), mx.stack(probs, axis=0)
-
     def confidence_logits(self, block_hidden, prev_token_ids):
         if self.confidence_head is None:
             return None

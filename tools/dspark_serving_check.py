@@ -7,7 +7,8 @@ HTTP path with vLLM's multiprocess engine core: output limits 1/2/31/128,
 natural EOS, stop strings, the platform's ``min_tokens`` rejection, streaming
 versus non-streaming,
 staggered concurrent arrivals, a client disconnect mid-stream, ``logprobs``
-and non-greedy requests (target-only fallback), long prompts that need
+requests (target-only fallback) and a sampled request (drafted since M5,
+length-checked here), long prompts that need
 several prefill chunks, and, on servers with prefix caching, repeated and
 shared prefixes. Servers with prefix caching are optional (``--prefix-widths``).
 

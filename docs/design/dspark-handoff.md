@@ -32,7 +32,7 @@ record the actual checkout SHA when starting new experiments.
 | M3b: full resource planning and bounded storage | Complete, [PR #5](https://github.com/mhdimo/vllm-metal/pull/5), feature `b4aa6958bcf5208901b755552d98f7e2d25383fc` |
 | M3c: resource, recovery and precision qualification | Complete for its named 4B envelope, [PR #6](https://github.com/mhdimo/vllm-metal/pull/6), feature `bae84f915d4d30c9bb30382bd9445c7f12f12fc7` |
 | M4: complete fixed-greedy serving and performance | Complete on M5 Max for the pinned 4B pair: M4a, the extended exact-token failures are ties or target-unstable prefixes under the [parity contract](dspark-m4-parity.md); M4b, configurable admission caps measured on a real engine; M4c, the HTTP serving matrix passes with every divergence a tie; M4d, fixed K=2-4 meets the 10% gate at one request (+36-49% on short prompts, +10-14% on 1,024-token prompts) and every width loses 4-28% at four concurrent requests because multi-row verification is expensive on this Metal path (see the [progress record](dspark-progress.md)). |
-| M5: exact stochastic verification | Open; current drafter/proposer does not implement this supported serving path. |
+| M5: exact stochastic verification | Complete on M5 Max for the pinned 4B pair: plain temperature/top-k/top-p requests draft from exact float32 proposal distributions kept with the scheduled proposal and are verified by rejection sampling with per-request random streams; enumerated tiny-vocabulary oracle, powered distribution tests and the real-engine `tools/dspark_stochastic_check.py` gate (see the [progress record](dspark-progress.md)). Penalties, logprobs, constraints and structured output stay target-only. |
 | M6: confidence calibration and adaptive planning | Open; confidence is not used by the current proposer. |
 | M7: production performance and reliability | Open; no qualifying HTTP soak or production speedup result. |
 | M8: additional standalone model pairs | Open; each pair needs its own adapter, precision, capacity and serving gates. |
@@ -568,9 +568,9 @@ It lasted about 14.6 minutes with instrumentation. This is neither a controlled
 speed benchmark nor the required M7 production soak. Preserve positive draft
 work counters: target-only fallback throughout cannot qualify acceleration.
 
-### 7. M4 admission, HTTP serving and fixed-K performance gates (M5 Max)
+### 7. M4 and M5 gates on the real pair (M5 Max)
 
-The M4b, M4c and M4d gates run against the same pinned pair after steps 1-6.
+The M4b, M4c, M4d and M5 gates run against the same pinned pair after steps 1-6.
 The admission checker records, per request, the steps it held a complete
 context and the steps it was drafted; the serving harness launches real
 `vllm serve` processes and judges every divergence by the K=0 server's own
@@ -590,6 +590,8 @@ python -m tools.dspark_step_profile --target "$DSPARK_TARGET" --draft "$DSPARK_D
 python -m tools.dspark_perf_bench --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" --repo . \
   --widths 1,2,4,7 --buckets 128x128,1024x128,128x512 --concurrency 1,4 --repetitions 5 \
   --async-reference --output-dir "$DSPARK_RUN/bench"
+python -m tools.dspark_stochastic_check --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" \
+  --width 7 --samples 8000 --control-max-num-seqs 16 --output-dir "$DSPARK_RUN/stochastic"
 ```
 
 The serving harness exits nonzero on any failure and prints `GATE PASS`
@@ -598,7 +600,12 @@ otherwise; `summary.json` lists every scenario's verdict per server and each
 benchmark writes `results.json` with every repetition, the paired summaries
 and the gate verdict per cell; the profiler writes one result per width and a
 `summary.json`. Results and the qualification criteria are in the progress
-record (M4b, M4c, M4d). The tools bind the default `VLLM_USE_V2_MODEL_RUNNER=0`,
+record (M4b, M4c, M4d, M5). The stochastic check compares the speculative and
+target-only engines' sampled distributions position by position, runs the
+mixed greedy/stochastic/logprobs/penalty/short-budget/stop-token batch and the
+seeded-reproducibility repeat, and with `--control-max-num-seqs` also reports
+the target-only-versus-target-only statistics at another batch size as the
+numerics floor. The tools bind the default `VLLM_USE_V2_MODEL_RUNNER=0`,
 source-built kernels and offline Hugging Face access themselves.
 
 ## Remaining implementation and acceptance plan
@@ -615,7 +622,7 @@ not counted as a completed M4 serving feature by inspection alone.
 | M4b: fixed-K admission | Done on M5 Max: configurable context cap (`VLLM_METAL_DSPARK_MAX_CONTEXTS`) budgeted by the planner, per-step draft cap (`VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP`) with least-recently-drafted rotation, per-row caps proven against independent rows, and `tools/dspark_admission_check.py` real-engine evidence (see the progress record). Remaining: repeat on the M4 machine when available. |
 | M4c: serving semantics | Done on M5 Max: `tools/dspark_serving_check.py` drives real `vllm serve` processes (multiprocess engine core) for K=0 and K=1/2/4/7, with and without prefix caching, through output limits 1/2/31/128, natural EOS, stop strings, the platform's `min_tokens` rejection, streaming, long prompts, staggered arrivals, a mid-stream disconnect, `logprobs` and sampled requests, and prefix repeats; parity is judged by the M4a tie rule from the K=0 server's own logprobs; positive draft work and idle metrics are asserted. Results in the progress record. Remaining: repeat on the M4 machine when available. |
 | M4d: fixed-K performance | Done on M5 Max: `tools/dspark_step_profile.py` attributes per-step draft, verify, context and host costs in process; `tools/dspark_perf_bench.py` runs the paired streamed HTTP protocol (three buckets, C=1/4, five alternating repetitions, bootstrap intervals, SLO goodput, asynchronous target-only reference). Gate met at C=1 for K=1/2/4/7 on 128-token inputs and K=2/4 on 1,024-token inputs; not met at C=4 (progress record). Remaining: repeat on the M4 machine; the multi-row target verification cost is the M7 profiling target and the reason M6 must bypass at higher concurrency. |
-| M5: stochastic verification | Own exact normalized q and transforms per request generation/position; accept with min(1,p/q), sample rejection from normalized positive residual and full-acceptance bonus from p. Test finite/zero support, stops, penalties and RNG isolation under reorder/cancel. Use an enumerated tiny-vocabulary oracle and powered, predefined distribution tests. Unsupported transforms retain explicit target-only fallback. |
+| M5: stochastic verification | Done on M5 Max: `vllm_metal/v1/dspark/sampling.py` owns the exact float32 proposal distributions (temperature, top-k, top-p with the Metal sampler's mask semantics), inverse-CDF sampling with explicit finite-precision rules, the residual and bonus draws and the per-request proposal/acceptance/target streams; the proposer keeps a `DSparkProposal` record per scheduled draft and the controller's `verify` dispatches greedy and stochastic requests per row. Tests: enumerated two-position tiny-vocabulary oracle, a 20,000-draw chi-square gate with a negative control, zero-support and truncated proposals, stream isolation, scheduler-clipped drafts, fail-closed records; `tools/dspark_stochastic_check.py` compares the speculative and target-only engines' output distributions and runs a mixed greedy/stochastic/logprobs/penalty/short-budget batch on the real pair (progress record). Penalties, logprobs, allowed/bad tokens, `min_p`, `logit_bias` and structured output remain target-only with an observable reason. Remaining: repeat on the M4 machine. |
 | M6: calibrated planning | Implement confidence/Markov semantics, recording with correct censored survival labels, per-position STS fit/apply, disjoint calibration/evaluation data and recipe-matched manifests. Report ECE, Brier, reliability and uncertainty. Fit separate measured draft/verify/host cost curves; make causal admission and K=0 bypass decisions before affected candidates are sampled. Test against a pure planner oracle, including early stopping and history cleanup. |
 | M7: production hardening | Profile before kernel optimization; qualify actual HTTP mixed arrivals, streaming, disconnects/timeouts, prefix and memory pressure. Run **at least one hour AND at least 10,000 completed/cancelled requests**, with memory/resource/fallback and latency evidence. Validate packaged deployment, not just in-process instrumented checkers. |
 | M8: more standalone pairs | After 4B correctness, evaluate Qwen3-8B, then 14B, then Gemma4-12B where capacity and backend support permit. Pin target/tokenizer/draft, implement family-specific adapters, repeat every relevant parity/precision/lifecycle/stochastic/calibration/performance gate per serving recipe. |

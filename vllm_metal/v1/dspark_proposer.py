@@ -15,15 +15,23 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import mlx.core as mx
+import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import CONTEXT_ALIGNMENT, DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
+from vllm_metal.v1.dspark.sampling import (
+    DSparkProposal,
+    RequestRandomStreams,
+    SamplingTransforms,
+    batched_transformed_distribution,
+    sample_from_distribution,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from vllm_metal.v1.model_runner import MetalModelRunner, RequestState
     from vllm_metal.v1.proposer import ProposeContext
@@ -62,10 +70,20 @@ class _DraftPlan:
     pending: int
     context: _RequestContext
     cap: int
+    # ``None`` drafts greedily (argmax chain); otherwise the request's target
+    # transforms shape the proposal distributions and ``streams`` draws them.
+    transforms: SamplingTransforms | None = None
+    streams: RequestRandomStreams | None = None
 
 
 class DSparkProposer:
-    """Greedy DSpark proposer with contiguous per-request feature coverage."""
+    """DSpark proposer with contiguous per-request feature coverage.
+
+    Greedy requests draft the argmax Markov chain and are verified exactly;
+    plain temperature/top-k/top-p requests draft by sampling from exact
+    float32 proposal distributions that stay attached to the scheduled
+    proposal (:class:`DSparkProposal`) until the next step verifies them.
+    """
 
     def __init__(
         self,
@@ -98,6 +116,17 @@ class DSparkProposer:
         # in, so a binding cap rotates least-recently-drafted requests first.
         self._last_drafted: dict[str, int] = {}
         self._draft_step = 0
+        # Stochastic proposals of the most recent draft per request, consumed
+        # by the verifier at the request's next scheduled step, and the
+        # request-owned random streams behind them.
+        self._proposals: dict[str, DSparkProposal] = {}
+        self._streams: dict[str, RequestRandomStreams] = {}
+        self._stream_ordinal = 0
+
+    @property
+    def proposals(self) -> Mapping[str, DSparkProposal]:
+        """Proposal records of the drafts handed to the scheduler last step."""
+        return self._proposals
 
     def needs_target_hidden_states(
         self,
@@ -112,11 +141,31 @@ class DSparkProposer:
         for req_id in req_ids:
             self._contexts.pop(req_id, None)
             self._last_drafted.pop(req_id, None)
+            self._proposals.pop(req_id, None)
+            self._streams.pop(req_id, None)
+
+    def _streams_for(self, req_id: str, state: RequestState) -> RequestRandomStreams:
+        streams = self._streams.get(req_id)
+        record = self._contexts.get(req_id)
+        if streams is None or record is None or record.owner is not state:
+            self._stream_ordinal += 1
+            streams = RequestRandomStreams.for_request(
+                state.sampling_params.seed,
+                engine_seed=getattr(self._runner.model_config, "seed", None),
+                ordinal=self._stream_ordinal,
+            )
+            self._streams[req_id] = streams
+        return streams
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         scheduled = {seg.req_id for seg in ctx.decode_segments}
         scheduled.update(req_id for req_id, _ in ctx.decode_reqs)
         scheduled.update(pr.req_id for pr in ctx.prefill_reqs)
+        # The scheduler consumes a request's drafts the next time it schedules
+        # the request (verified this step, clipped, or dropped for a prefill
+        # chunk), so a record of a scheduled request is spent either way.
+        for req_id in scheduled:
+            self._proposals.pop(req_id, None)
         try:
             self._ingest_step(ctx)
             # Materialize once per step, including K=0 and intermediate chunks.
@@ -138,6 +187,7 @@ class DSparkProposer:
                 ctx.prefill_reqs,
                 ctx.prefill_result_modes,
                 ctx.request_states,
+                allow_stochastic=True,
             )
             plans = []
             for req_id, state in eligible:
@@ -151,14 +201,27 @@ class DSparkProposer:
                 ):
                     continue
                 cap = self._draft_cap(state, ctx.num_speculative_tokens)
-                if cap > 0:
-                    plans.append(_DraftPlan(req_id, state.token_ids[-1], record, cap))
+                if cap <= 0:
+                    continue
+                if self._controller.draft_mode(state) == "stochastic":
+                    plan = _DraftPlan(
+                        req_id,
+                        state.token_ids[-1],
+                        record,
+                        cap,
+                        SamplingTransforms.from_params(state.sampling_params),
+                        self._streams_for(req_id, state),
+                    )
+                else:
+                    plan = _DraftPlan(req_id, state.token_ids[-1], record, cap)
+                plans.append(plan)
             if not plans:
                 return None
             if not self._memory_available():
                 logger.debug("DSpark draft skipped: workspace memory budget exhausted")
                 return None
-            req_ids, rows = self._batch_draft(self._select_plans(plans))
+            req_ids, rows, proposals = self._batch_draft(self._select_plans(plans))
+            self._proposals.update(proposals)
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
         except Exception as error:
             # A partially written layer set cannot survive an ingest/draft
@@ -406,7 +469,16 @@ class DSparkProposer:
 
     def _batch_draft(
         self, plans: list[_DraftPlan]
-    ) -> tuple[list[str], list[list[int]]]:
+    ) -> tuple[list[str], list[list[int]], dict[str, DSparkProposal]]:
+        """Draft every plan in one backbone pass.
+
+        Returns the request ids, one draft row per plan (clipped to its cap)
+        and the proposal records of the stochastic rows. Greedy rows take the
+        argmax of each block position's logits plus the Markov step bias of
+        the previous token; stochastic rows sample the same corrected logits
+        through the request's transforms with their own proposal stream, and
+        keep the exact distribution of every sampled position.
+        """
         # Keep all trained block positions even when a row requests fewer heads.
         noise = self._drafter.embed(
             mx.array(
@@ -465,20 +537,65 @@ class DSparkProposer:
         )
         cap = max(plan.cap for plan in plans)
         logits = self._drafter.compute_logits(hidden[:, :cap])
-        if self._drafter.markov_head is not None:
-            previous = mx.array([plan.pending for plan in plans])
-            drafts = []
-            for index in range(cap):
-                previous = mx.argmax(
-                    logits[:, index] + self._drafter.markov_head.step_bias(previous),
-                    axis=-1,
-                )
-                drafts.append(previous)
-            draft_array = mx.stack(drafts, axis=1)
-        else:
-            draft_array = mx.argmax(logits, axis=-1)
-        mx.eval(draft_array)
-        rows = cast("list[list[int]]", draft_array.tolist())
-        return [plan.req_id for plan in plans], [
-            row[: plan.cap] for row, plan in zip(rows, plans, strict=True)
+        stochastic = [
+            index for index, plan in enumerate(plans) if plan.transforms is not None
         ]
+        transforms = [
+            cast("SamplingTransforms", plans[index].transforms) for index in stochastic
+        ]
+        # Draw every proposal uniform up front from each request's own stream.
+        uniforms = (
+            np.stack(
+                [
+                    cast("RequestRandomStreams", plans[index].streams).proposal.random(
+                        cap
+                    )
+                    for index in stochastic
+                ]
+            )
+            if stochastic
+            else None
+        )
+        rows_index = mx.array(stochastic, dtype=mx.int32)
+        markov = self._drafter.markov_head
+        previous = mx.array([plan.pending for plan in plans], dtype=mx.int32)
+        drafts, distributions = [], []
+        for index in range(cap):
+            step = logits[:, index]
+            if markov is not None:
+                step = step + markov.step_bias(previous)
+            tokens = mx.argmax(step, axis=-1).astype(mx.int32)
+            if uniforms is not None:
+                q = batched_transformed_distribution(
+                    step[rows_index], transforms, vocab_size=self._config.vocab_size
+                )
+                tokens[rows_index] = sample_from_distribution(
+                    q, mx.array(uniforms[:, index], dtype=mx.float32)
+                )
+                distributions.append(q)
+            drafts.append(tokens)
+            previous = tokens
+        draft_array = mx.stack(drafts, axis=1)
+        slices = []
+        if distributions:
+            stacked = mx.stack(distributions, axis=1)
+            slices = [
+                stacked[position, : plans[index].cap]
+                for position, index in enumerate(stochastic)
+            ]
+        mx.eval(draft_array, *slices)
+        rows = cast("list[list[int]]", draft_array.tolist())
+        clipped = [row[: plan.cap] for row, plan in zip(rows, plans, strict=True)]
+        proposals = {}
+        for position, index in enumerate(stochastic):
+            plan = plans[index]
+            proposals[plan.req_id] = DSparkProposal(
+                owner=plan.context.owner,
+                anchor_position=plan.context.covered_end,
+                anchor_token=plan.pending,
+                token_ids=clipped[index],
+                distributions=slices[position],
+                transforms=cast("SamplingTransforms", plan.transforms),
+                streams=cast("RequestRandomStreams", plan.streams),
+            )
+        return [plan.req_id for plan in plans], clipped, proposals

@@ -91,11 +91,21 @@ class DSparkMemoryPlan:
         scores = rows * config.num_attention_heads * block * (length + block) * 4
         # Base logits, sequential Markov correction and the corrected output.
         logits = 3 * rows * block * config.vocab_size * 4
+        # Stochastic proposals keep one float32 distribution per drafted
+        # position until verification, and build each position's rows through
+        # scaled, sorted, masked, softmax and cumulative-sum temporaries.
+        proposals = rows * (block + 6) * config.vocab_size * 4
         return cls(
             rows,
             length,
             tokens,
             kv_bytes,
             capture,
-            copies + ingest + draft + scores + logits + KERNEL_RESERVE_BYTES,
+            copies
+            + ingest
+            + draft
+            + scores
+            + logits
+            + proposals
+            + KERNEL_RESERVE_BYTES,
         )

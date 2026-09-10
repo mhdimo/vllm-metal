@@ -158,8 +158,10 @@ attention and LoRA. The prototype's drafter still uses the existing MLX 4-bit
 recipe. The loader validates the resolved checkpoint, admits conversion memory,
 and materializes draft weights before target KV planning. Broader model-pair
 precision qualification is tracked in the roadmap.
-Set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly. Request sampling eligibility remains
-greedy-only, with unsupported requests following the existing target-only path.
+Set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly. Greedy requests and plain
+temperature/top-k/top-p requests are drafted; requests with penalties,
+logprobs, allowed or bad token constraints, `min_p`, `logit_bias` or structured
+output follow the existing target-only path.
 
 `tools/dspark_serving_check.py` qualifies the HTTP path against a target-only
 server (output limits, EOS and stop strings, streaming, long prompts, staggered
@@ -184,7 +186,14 @@ Draft acceptance rate` reflects the live acceptance.
 
 ### Characteristics
 
-- **Greedy only**, like every Metal spec-decode method.
+- **Greedy and stochastic requests.** Greedy requests are verified exactly.
+  A plain temperature/top-k/top-p request samples its drafts from exact
+  float32 proposal distributions that stay attached to the scheduled proposal,
+  and verification accepts each draft with probability `min(1, p/q)`, samples
+  the first rejected position from the normalized residual and the bonus
+  token from the target distribution, all from the request's own random
+  streams (seeded requests reproduce). The emitted distribution equals the
+  target's; the tokens at a given seed differ from target-only serving.
 - **Batched drafting.** The backbone runs across selected requests with padded
   per-request contexts. Memory is reserved for up to
   `min(max_num_seqs, VLLM_METAL_DSPARK_MAX_CONTEXTS)` complete contexts
@@ -200,8 +209,8 @@ Draft acceptance rate` reflects the live acceptance.
 
 - **Matched models required.** Do not infer support for another target from a
   similar model name or tensor shape.
-- **Incomplete DSpark features.** Stochastic verification, calibrated confidence
-  scheduling and production serving qualification remain roadmap work.
+- **Incomplete DSpark features.** Calibrated confidence scheduling and
+  production serving qualification remain roadmap work.
 - **Bounded context and workspace.** The planner subtracts the draft context,
   capture and execution reservation before sizing target KV. Context buffers
   grow in reusable chunks up to the planned model length. Insufficient startup
