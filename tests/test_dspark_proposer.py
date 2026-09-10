@@ -12,6 +12,7 @@ from vllm.sampling_params import SamplingParams
 
 from tests.stub_runner import make_stub_runner
 from tests.test_dspark_contracts import draft_hf_config
+from vllm_metal.v1.dspark.calibration import ConfidenceRecorder
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
@@ -375,7 +376,17 @@ def test_mixed_greedy_and_stochastic_rows_match_independent_rows():
                 rtol=1e-5,
             )
             assert batched.distributions.shape == (cap, 64)
-    assert set(batched_records) == {"2", "3", "5"}
+        else:
+            (key,) = records
+            assert records[key].distributions is None
+            assert batched_records[key].distributions is None
+        # Every drafted row carries one raw confidence logit per drafted position.
+        (key,) = records
+        assert len(records[key].confidence) == cap
+        assert np.allclose(
+            records[key].confidence, batched_records[key].confidence, atol=1e-4
+        )
+    assert set(batched_records) == {"1", "2", "3", "4", "5"}
 
 
 def test_request_streams_survive_other_requests_and_reuse_ordinals_deterministically():
@@ -617,3 +628,67 @@ def test_per_step_cap_above_eligible_drafts_everyone_in_batch_order():
         state.generated_tokens += 1
         decode.append((req_id, state, start, [previous], [9]))
     assert proposer.propose(_context(decode=decode, k=2)).req_ids == ["x", "y"]
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2])
+def test_recorder_observes_verified_outcomes_with_censoring(accepted):
+    proposer = _proposer()
+    proposer._runner.model_config.seed = 0
+    recorder = ConfidenceRecorder()
+    proposer.recorder = recorder
+    state = _state([1, 2, 3])
+    drafts = _seed(proposer, state, k=3)
+    record = proposer.proposals["r"]
+    assert len(record.confidence) == 3
+    assert record.distributions is None  # greedy rows keep no distributions
+    drafted = list(drafts.draft_token_ids[0])
+    # The scheduler clipped the proposal to two positions and verification
+    # accepted ``accepted`` of them; the runner committed the prefix plus one.
+    scheduled = drafted[:2]
+    outputs = scheduled[:accepted] + [9]
+    state.token_ids.extend(outputs)
+    proposer.propose(_context(decode=[("r", state, 2, [3, *scheduled], outputs)], k=3))
+    (sample,) = recorder.samples
+    assert sample.mode == "greedy" and sample.scheduled == 2
+    assert sample.accepted == accepted
+    assert sample.logits == tuple(record.confidence[:2])
+    assert sample.survival == tuple(1 if i < accepted else 0 for i in range(2))
+    # A scheduled step without drafts (nothing to verify) records nothing.
+    proposer.recorder = ConfidenceRecorder()
+    later = proposer.proposals["r"]
+    state.token_ids.extend([later.token_ids[0], 8])
+    proposer.propose(
+        _context(
+            decode=[
+                (
+                    "r",
+                    state,
+                    len(state.token_ids) - 3,
+                    [9, later.token_ids[0]],
+                    [later.token_ids[0], 8],
+                )
+            ],
+            k=0,
+        )
+    )
+    assert proposer.recorder.samples[0].scheduled == 1
+    proposer.propose(
+        _context(decode=[("r", state, len(state.token_ids) - 1, [8], [7])], k=0)
+    )
+    assert len(proposer.recorder.samples) == 1
+
+
+def test_stochastic_outcomes_record_the_sampling_mode():
+    proposer = _proposer()
+    proposer._runner.model_config.seed = 0
+    proposer.recorder = ConfidenceRecorder()
+    state = _stochastic_state([1, 2, 3], seed=4)
+    drafts = _seed(proposer, state, k=2)
+    drafted = list(drafts.draft_token_ids[0])
+    state.token_ids.extend([drafted[0], 9])
+    proposer.propose(
+        _context(decode=[("r", state, 2, [3, *drafted], [drafted[0], 9])], k=2)
+    )
+    (sample,) = proposer.recorder.samples
+    assert sample.mode == "stochastic" and sample.temperature == 0.8
+    assert sample.accepted == 1 and sample.scheduled == 2
