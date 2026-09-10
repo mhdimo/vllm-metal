@@ -85,7 +85,7 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
-from vllm_metal.v1.dspark.adaptive import MODES, load_adaptive
+from vllm_metal.v1.dspark.adaptive import DRAFT_PRECISIONS, MODES, load_adaptive
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.contracts import is_dspark_config
 from vllm_metal.v1.dspark.loader import load_drafter
@@ -696,9 +696,16 @@ class MetalModelRunner:
         mx.eval(self.model.parameters())
         mx.clear_cache()
         draft = spec.draft_model_config
+        precision = envs.VLLM_METAL_DSPARK_DRAFT_PRECISION
+        if precision not in DRAFT_PRECISIONS:
+            raise ValueError(
+                f"VLLM_METAL_DSPARK_DRAFT_PRECISION={precision!r} is not one of "
+                f"{DRAFT_PRECISIONS}"
+            )
         model, config = load_drafter(
             draft.model,
             revision=draft.revision,
+            quantize=precision == "quantized",
             memory_budget_bytes=budget - mx.get_active_memory(),
             expected_config=DSparkConfig.from_dict(draft.hf_config.to_dict()),
         )
@@ -760,7 +767,7 @@ class MetalModelRunner:
             "DSpark drafter loaded for speculative decoding: %s "
             "(block_size=%d, target_layer_ids=%s); reserved context=%.2f MB, "
             "capture=%.2f MB, workspace=%.2f MB, context_slots=%d, "
-            "drafts_per_step=%d, mode=%s",
+            "drafts_per_step=%d, mode=%s, draft_precision=%s",
             draft.model,
             config.block_size,
             config.target_layer_ids,
@@ -770,6 +777,7 @@ class MetalModelRunner:
             plan.max_contexts,
             proposer._max_drafts_per_step,
             mode,
+            precision,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

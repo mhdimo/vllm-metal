@@ -34,6 +34,8 @@ from vllm_metal.v1.dspark.planner import (
 )
 
 MODES = ("fixed", "adaptive", "bypass")
+# Drafter weight precision at load (VLLM_METAL_DSPARK_DRAFT_PRECISION).
+DRAFT_PRECISIONS = ("quantized", "source")
 
 
 @dataclass

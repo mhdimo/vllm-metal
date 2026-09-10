@@ -113,6 +113,7 @@ def test_canonical_and_alias_install_resolved_draft(
     load.assert_called_once_with(
         "resolved-draft",
         revision="a" * 40,
+        quantize=True,
         memory_budget_bytes=4_999_999_000,
         expected_config=cfg,
     )
@@ -257,6 +258,22 @@ def _loadable_runner(dspark_config, monkeypatch):
     monkeypatch.setattr(mx, "get_active_memory", lambda: 1000)
     monkeypatch.setattr("vllm_metal.v1.model_runner.load_drafter", load)
     return runner
+
+
+def test_draft_precision_environment_reaches_the_loader(dspark_config, monkeypatch):
+    import vllm_metal.v1.model_runner as model_runner
+
+    runner = _loadable_runner(dspark_config, monkeypatch)
+    runner._load_dspark_drafter()
+    assert model_runner.load_drafter.call_args.kwargs["quantize"] is True
+    monkeypatch.setenv("VLLM_METAL_DSPARK_DRAFT_PRECISION", "source")
+    runner = _loadable_runner(dspark_config, monkeypatch)
+    runner._load_dspark_drafter()
+    assert model_runner.load_drafter.call_args.kwargs["quantize"] is False
+    monkeypatch.setenv("VLLM_METAL_DSPARK_DRAFT_PRECISION", "fp8")
+    runner = _loadable_runner(dspark_config, monkeypatch)
+    with pytest.raises(ValueError, match="DRAFT_PRECISION"):
+        runner._load_dspark_drafter()
 
 
 def test_admission_environment_reaches_plan_and_proposer(dspark_config, monkeypatch):

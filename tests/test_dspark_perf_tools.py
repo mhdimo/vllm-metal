@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from tools.dspark_acceptance_eval import PAPER_ACCEPTED_LENGTH, load_prompts
 from tools.dspark_perf_bench import (
     bootstrap_median_interval,
     build_prompts,
@@ -91,3 +93,23 @@ def test_summarize_reports_percentiles_in_seconds() -> None:
     assert stats["p95"] == 0.100
     assert stats["max"] == 0.100
     assert summarize([]) == {"count": 0}
+
+
+def test_acceptance_eval_prompts_are_first_turns_and_a_stable_subset(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "set.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps({"turns": [f"prompt {i}", "second turn"]}) for i in range(10)
+        )
+        + "\n"
+    )
+    prompts = load_prompts(path, 4, seed=1)
+    assert len(prompts) == 4 and len(set(prompts)) == 4
+    assert all(prompt.startswith("prompt ") for prompt in prompts)
+    assert prompts == load_prompts(path, 4, seed=1)
+    assert prompts != load_prompts(path, 4, seed=2)
+    assert len(load_prompts(path, 0, seed=1)) == 10
+    # Table 1 rows carried for the record's comparison column.
+    assert PAPER_ACCEPTED_LENGTH["Qwen3-4B"]["gsm8k"] == 6.11

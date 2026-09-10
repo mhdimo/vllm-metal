@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     VLLM_METAL_DSPARK_MAX_CONTEXTS: int = 32
     VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP: int = 0
     VLLM_METAL_DSPARK_MODE: str = "fixed"
+    VLLM_METAL_DSPARK_DRAFT_PRECISION: str = "quantized"
     VLLM_METAL_DSPARK_CALIBRATION: str = ""
     VLLM_METAL_DSPARK_COST_MODEL: str = ""
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -145,6 +146,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and A/B serving).
     "VLLM_METAL_DSPARK_MODE": lambda: os.getenv(
         "VLLM_METAL_DSPARK_MODE", "fixed"
+    ).lower(),
+    # DSpark drafter weights: "quantized" converts the drafter to the target's
+    # affine 4-bit recipe at load (the qualified default); "source" keeps the
+    # checkpoint's own precision (bfloat16 for the released drafters), more
+    # memory and a different cost profile, for acceptance and speed A/Bs.
+    "VLLM_METAL_DSPARK_DRAFT_PRECISION": lambda: os.getenv(
+        "VLLM_METAL_DSPARK_DRAFT_PRECISION", "quantized"
     ).lower(),
     "VLLM_METAL_DSPARK_CALIBRATION": lambda: os.getenv(
         "VLLM_METAL_DSPARK_CALIBRATION", ""
