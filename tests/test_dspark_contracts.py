@@ -79,7 +79,10 @@ def dspark_config(monkeypatch) -> VllmConfig:
 
 
 @pytest.mark.parametrize("method", ["dspark", "draft_model"])
-def test_canonical_and_alias_install_resolved_draft(dspark_config, monkeypatch, method):
+@pytest.mark.parametrize("memory_limit", [10_000_000, 10_000_000_000])
+def test_canonical_and_alias_install_resolved_draft(
+    dspark_config, monkeypatch, method, memory_limit
+):
     dspark_config.speculative_config.method = method
     validate_dspark_config(dspark_config, use_paged_attention=True)
     runner = make_stub_runner(tokenizer=object())
@@ -96,16 +99,21 @@ def test_canonical_and_alias_install_resolved_draft(dspark_config, monkeypatch, 
         memory_fraction=0.5, mlx_device="gpu", use_paged_attention=True
     )
     monkeypatch.setattr(
-        mx, "device_info", lambda: {"max_recommended_working_set_size": 10_000_000}
+        mx, "device_info", lambda: {"max_recommended_working_set_size": memory_limit}
     )
     monkeypatch.setattr(mx, "get_active_memory", lambda: 1000)
     monkeypatch.setattr("vllm_metal.v1.model_runner.load_drafter", load)
+    if memory_limit == 10_000_000:
+        with pytest.raises(ValueError, match="context/workspace and target profiling"):
+            runner._load_dspark_drafter()
+        assert runner._drafter is None and runner._dspark_memory_plan is None
+        return
     runner._load_dspark_drafter()
     runner.install_drafter(num_blocks=1, block_size=16)
     load.assert_called_once_with(
         "resolved-draft",
         revision="a" * 40,
-        memory_budget_bytes=4_999_000,
+        memory_budget_bytes=4_999_999_000,
         expected_config=cfg,
     )
     assert isinstance(runner._drafter, DSparkProposer)

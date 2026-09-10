@@ -10,7 +10,7 @@ and serving qualification gates pass.
 | M0: Baseline and contract | [Complete: #1](https://github.com/mhdimo/vllm-metal/pull/1) | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions tracked the defects fixed in M1/M2. |
 | M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
-| M3: Loading and memory | In progress | Deterministic checkpoint selection and incremental conversion; complete memory planning and pressure/precision qualification follow. |
+| M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
 | M4-M8 | Planned | Serving, stochastic verification, confidence scheduling and additional model pairs. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
 
@@ -31,8 +31,8 @@ layer/cache iteration now rejects unequal lengths.
 At M0, three strict expected failures preserved the reproduced F1/F3 contracts.
 They were release blockers, not successful correctness tests; M1 and M2 convert
 them into passing regressions. Existing runner lifecycle ownership is retained.
-F5 revision/support guards and F9 provenance/lint are addressed; full F5 loading
-and precision qualification remains M3 work. No speedup is claimed.
+F5 revision/support guards and F9 provenance/lint were addressed in M0; full F5
+loading and precision qualification followed in M3. No speedup is claimed.
 
 Validation on the M4 32 GB machine:
 
@@ -134,7 +134,7 @@ the strict documentation build passed.
 
 The same pinned 4B target/draft pair was tested on M4 32 GB with a 256-token model
 limit, 32-token prefill budget, at most four concurrent requests, greedy output
-of 24 tokens, and `VLLM_METAL_MEMORY_FRACTION=0.12`. The current loader's default
+of 24 tokens, and `VLLM_METAL_MEMORY_FRACTION=0.12`. The loader's default
 draft recipe is MLX 4-bit, group size 64. Each case runs baseline and DSpark in
 separate processes and repeats four prompts twice. All 40 compared request
 outputs matched exactly. Positive proposals, verification and acceptance are
@@ -158,14 +158,15 @@ Physical cache invariants were checked during actual engine execution.
 The [machine-readable results](dspark-lifecycle-results.json) preserve runtime
 versions, token-stream hashes, counters, wall times and peak allocation. Peak
 MLX allocation, including loading, was at most 6.18 GB in these probes. This
-exceeds the target planner's 2.75 GB allowance because full DSpark loading and
-memory accounting are still M3 work. The probes fit the available machine;
-the current fraction must not be interpreted as a complete DSpark memory cap.
+exceeded the target planner's 2.75 GB allowance before M3 implemented complete
+DSpark loading and memory accounting. These historical M2 probes fit the machine;
+that fraction was not a complete DSpark memory cap and is now rejected at startup.
 
 These short, instrumented runs are correctness probes, not controlled throughput
 benchmarks. Several speculative runs were slower than baseline. No speedup or
-production serving envelope is claimed. M3/M4 must qualify allocation/reuse,
-batch admission and fixed-K performance before confidence scheduling is tuned.
+production serving envelope is claimed. M3 subsequently qualified allocation
+and reuse; M4 must qualify batch admission and fixed-K performance before
+confidence scheduling is tuned.
 
 ```bash
 python -m tools.dspark_lifecycle_check \
@@ -177,10 +178,10 @@ python -m tools.dspark_lifecycle_check \
 
 ### Remaining experiments and handoff
 
-M0-M2 complete the contract, capture and context foundations. M3 remains the
-next gate: account for draft weights and load-time conversion before allocating
-target KV, bound per-request context/workspace, qualify precision, and test
-pressure/recovery and long-running memory reuse. M4 must measure fixed K=0/1/2/7
+M0-M3 complete the contract, capture, context and resource foundations for their
+declared validation envelopes. The M3 record below includes the bounded memory
+and precision results and the extended parity failures still open for M4.
+M4 must measure fixed K=0/1/2/7
 with warmup, repeated trials, context/output-length buckets, TTFT, inter-token
 latency and throughput, including prefix-hit and mixed-prefill workloads. The
 fixed cap of 32 draft requests still needs fair, measured admission in M4.
@@ -223,7 +224,7 @@ The next step must load the drafter before target KV sizing and reserve its
 persistent context, staging and execution workspace. Loader correctness alone
 does not resolve the M2 resource-accounting gap.
 
-### Step 2: Complete resource planning and bounded storage
+### Step 2: Complete resource planning and bounded storage ([PR #5](https://github.com/mhdimo/vllm-metal/pull/5))
 
 DSpark now loads during the runner's model lifecycle, before profiling or any
 target KV allocation. A header-derived startup estimate includes final draft
@@ -258,5 +259,30 @@ allocation was 4,729,488,612 bytes within the 5.04 GB configured allowance. The
 plan included 20.97 MB context, 3.28 MB capture and 194.49 MB workspace. These
 remain correctness/resource probes, not serving-speed qualification.
 
-Step 3 must attach real checkpoint precision evidence, sustained memory reuse
-and pressure/recovery results before M3 is marked complete.
+### Step 3: Qualification and failure evidence
+
+The final loader checks source tensors for NaN/Inf before conversion and restores
+the scoped allocator limit on failure. A preflight check rejects impossible
+context/workspace and target-logit reservations before target profiling.
+
+The [M3 validation record](dspark-m3-validation.md) and its committed artifacts
+cover the full official BF16 checkpoint, the serving affine-4 recipe, sustained
+memory reuse, actual scheduler preemption, exhausted admission and injected
+allocation failure. The 528-request run retained no active-memory growth after
+drain. All four 1,024-token contexts fit simultaneously with the target KV pool
+resident; measured allocation stayed within the configured 5.04 GB allowance.
+Seven actual preemptions in the short-context case preserved exact token output
+and clean context lifecycle.
+
+Extended 900-token generation and a larger preemption case failed exact-token
+parity. Native target-only replays reproduce sensitivity to execution chunk size;
+the larger target-only preemption baseline itself generates different streams
+for identical prompts. These remain explicit M4 qualification failures, with
+reproducible prefixes and logits. They are not passed tests or a production
+support claim. Quantized confidence also needs separate M6 calibration.
+
+Final local validation: 2,315 non-slow tests passed (15 skipped, 53 deselected),
+with no expected failures; Ruff check/format, mypy (145 source files), shellcheck
+and the strict MkDocs build passed. The final-source engine run repeated all
+controlled faults and full-capacity allocation with 80 matching batch completions,
+two cancellations and two ID reuses, and zero retained active-memory drift.

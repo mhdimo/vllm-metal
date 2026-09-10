@@ -707,6 +707,18 @@ class MetalModelRunner:
             max_model_len=self.model_config.max_model_len,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
         )
+        # Reject an impossible reservation before the target profiling forward
+        # allocates activations. Allow FP32 storage for its full-logits output;
+        # the measured profile supplies the remaining target workspace reserve.
+        profile_logits = (
+            self.scheduler_config.max_num_batched_tokens * config.vocab_size * 4
+        )
+        if mx.get_active_memory() + plan.reserve_bytes + profile_logits >= budget:
+            raise ValueError(
+                "DSpark context/workspace and target profiling output do not fit "
+                "the Metal memory allowance. Lower --max-model-len, --max-num-seqs "
+                "or --max-num-batched-tokens, or increase VLLM_METAL_MEMORY_FRACTION."
+            )
         self._dspark_memory_plan = plan
         self._drafter = DSparkProposer(
             drafter=model,

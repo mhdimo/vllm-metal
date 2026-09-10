@@ -98,7 +98,7 @@ VLLM_METAL_MEMORY_FRACTION=0.55 \
 ## DSpark
 
 The `Dspark` branch contains an experimental implementation with validated
-Qwen3 target capture and context lifecycle foundations. See the
+Qwen3 target capture, context lifecycle and bounded resource foundations. See the
 [implementation specification and roadmap](design/dspark.md) and
 [validation/experiment handoff](design/dspark-validation.md) before treating this
 path as production-ready, and the [milestone results](design/dspark-progress.md)
@@ -189,6 +189,10 @@ Draft acceptance rate` reflects the live acceptance.
   is insufficient for the complete 4B load and is now rejected.
 - **Output parity requires validation.** Investigate every divergence, including
   target logits layout and cache state, before attributing it to numerical ties.
+  M3's longer-generation and larger-preemption probes failed exact-token parity;
+  native target-only replays also change token choices with execution chunk size.
+  These [documented failures](design/dspark-m3-validation.md#failed-extended-parity-checks-m4-remains-open)
+  remain an M4 gate before broader serving claims.
 
 ---
 

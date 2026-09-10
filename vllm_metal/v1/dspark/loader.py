@@ -195,6 +195,12 @@ def load_drafter(
             assert isinstance(weights, dict)
             for name in sorted(weights):
                 value = weights.pop(name)
+                # Check payloads as they stream in; shape/dtype headers cannot
+                # detect NaNs or infinities. Never quantize invalid source data.
+                if not mx.all(mx.isfinite(value)).item():
+                    raise ValueError(
+                        f"DSpark tensor {name!r} contains non-finite weights"
+                    )
                 # The full header set was checked strictly above. Partial
                 # updates here are intentional, not a permissive load mode.
                 drafter.load_weights([(name, value)], strict=False)

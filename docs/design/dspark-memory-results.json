@@ -1,0 +1,415 @@
+{
+  "scope": "M3 resource and bounded precision qualification; longer exact-token parity is an open M4 gate; no serving-speed claim",
+  "hardware": {
+    "chip": "Apple M4",
+    "unified_memory_bytes": 34359738368,
+    "macos": "15.6",
+    "recommended_metal_working_set_bytes": 22906503168,
+    "other_available_machine": "M5 Max 48 GB RAM / 2 TB storage; not accessed"
+  },
+  "model_pair": {
+    "target": {
+      "repo": "mlx-community/Qwen3-4B-4bit",
+      "revision": "4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25",
+      "files": [
+        {
+          "name": "added_tokens.json",
+          "bytes": 707,
+          "sha256": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680"
+        },
+        {
+          "name": "config.json",
+          "bytes": 937,
+          "sha256": "b5efdcf3b0035a3638e7228dad4d85f5c4a23f156eb7cdb0b44c8366a5d34d9b"
+        },
+        {
+          "name": "model.safetensors",
+          "bytes": 2263022529,
+          "sha256": "e240c0bdc0ebb0681bf0da0f98d9719fd6ebe269a3633f81542c13e81345651d"
+        },
+        {
+          "name": "model.safetensors.index.json",
+          "bytes": 63924,
+          "sha256": "f7825defe5865d179c3b593173d37056be5f202dcb7153985cf74e75ecf1628b"
+        },
+        {
+          "name": "special_tokens_map.json",
+          "bytes": 613,
+          "sha256": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd"
+        },
+        {
+          "name": "tokenizer.json",
+          "bytes": 11422654,
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+        },
+        {
+          "name": "tokenizer_config.json",
+          "bytes": 9706,
+          "sha256": "253153d0738ceb4c668d2eff957714dd2bea0b56de772a9fdccd96cbf517e6a0"
+        },
+        {
+          "name": "vocab.json",
+          "bytes": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+        }
+      ],
+      "compute_dtype": "bfloat16",
+      "quantization": {
+        "mode": "affine",
+        "bits": 4,
+        "group_size": 64
+      }
+    },
+    "draft": {
+      "repo": "deepseek-ai/dspark_qwen3_4b_block7",
+      "revision": "3457dff1417cb84927f6098a5fcb7cee85c934b7",
+      "files": [
+        {
+          "name": "config.json",
+          "bytes": 1200,
+          "sha256": "494e5665481ff8216c4e857a531c401f72b7fb795434a8201f45252c0ad7568a"
+        },
+        {
+          "name": "model.safetensors",
+          "bytes": 2786273970,
+          "sha256": "f9e31587608441f235d46410e7201f8cb1647be5cd077065c89cc02c37ae86a7"
+        }
+      ],
+      "source_dtype": "bfloat16",
+      "serving_quantization": {
+        "mode": "affine",
+        "bits": 4,
+        "group_size": 64,
+        "includes_embedding_and_prediction_heads": true
+      }
+    }
+  },
+  "runtime": {
+    "mlx": "0.32.1",
+    "mlx-lm": "0.32.0",
+    "vllm": "0.28.0+cpu",
+    "torch": "2.13.0",
+    "transformers": "5.16.1",
+    "safetensors": "0.8.0"
+  },
+  "final_implementation_sha256": {
+    "vllm_metal/v1/dspark/loader.py": "f126ac2e08640cefddbac80b9143845620642f6432544a8e85034e792a5b7634",
+    "vllm_metal/v1/dspark/memory.py": "1e8c48db2ba51244f21bcf13ff3f0bfe804e577cf5ed3bcced243f9800c5a430",
+    "vllm_metal/v1/dspark/model.py": "53341c7b9858277f2cfc28559e767486596971313ea71a59d9fef95b44b644e3",
+    "vllm_metal/v1/dspark_proposer.py": "97ed831d5baf05c0e300e76dfba8d48cb49035ea314671e165e7433fa61452ff",
+    "vllm_metal/v1/model_runner.py": "5c15d9f4fd1811553b4ecaf8c2b91b93206c09566f130dcb31d08b4ed8724d88",
+    "vllm_metal/v1/cache_policy.py": "237a06dd36f1c6a19f8d740d193a077bd0d1e3e0f49ce35bfa48450171bc7be1",
+    "tools/dspark_memory_check.py": "a39c9da4954fd1f8aeef8720778a38b02ebe300e45db781a3f4af4363b296688",
+    "tools/dspark_precision_check.py": "82fadd9669ec9251b65f64da66c36bd582ec628dda284995da3a5ae33ab67606",
+    "tools/dspark_target_replay.py": "32116ab8e614b542d09a5ee0128a099914dab7a1f3cea99a79e023e17e436284"
+  },
+  "cases": {
+    "initial_sustained_run": {
+      "settings": {
+        "width": 7,
+        "rounds": 128,
+        "max_model_len": 1024,
+        "output_length": 64,
+        "memory_fraction": 0.22,
+        "num_gpu_blocks": null,
+        "require_preemption": false,
+        "faults": true,
+        "warmup_rounds": 4,
+        "method": "dspark",
+        "prompt_set": "ragged"
+      },
+      "prompt_lengths": [5, 106, 219, 481],
+      "baseline_token_stream_sha256": "d00e64fe727105573b57da64ead329d50f3852d372dab8962a524f4b81546889",
+      "greedy_tokens_equal": true,
+      "resource_checks_passed": true,
+      "counts": {
+        "preemptions": 0,
+        "max_context_bytes": 20971520,
+        "proposed": 35927,
+        "max_active_plus_cache_bytes": 4655569162,
+        "verified": 35927,
+        "accepted": 28274,
+        "completed": 528,
+        "normal_rounds_with_drafts": 129,
+        "cancelled": 16,
+        "reused": 16,
+        "injected_allocation_failures": 1
+      },
+      "fallback_span_observations": {
+        "context memory budget exhausted": 276,
+        "context capacity exhausted": 213,
+        "missing target feature prefix": 128
+      },
+      "active_after_drain_bytes": {
+        "minimum": 4336877694,
+        "maximum": 4336877694,
+        "measured_rounds": 128,
+        "range": 0
+      },
+      "peak_mlx_active_bytes": 4483220458,
+      "max_observed_active_plus_cache_bytes": 4655569162,
+      "budget_bytes": 5039430696,
+      "memory_plan": {
+        "max_contexts": 4,
+        "max_context_tokens": 1024,
+        "max_step_tokens": 64,
+        "kv_bytes_per_token": 20480,
+        "capture_bytes": 6553600,
+        "workspace_bytes": 389921280
+      },
+      "full_capacity_probe": null,
+      "instrumented_wall_time_s": 876.4426755420864,
+      "note": "Run before the final source-payload validation was added; unchanged serving context code. Final sources repeated all controlled faults in the final run."
+    },
+    "final_faults_and_capacity": {
+      "settings": {
+        "width": 7,
+        "method": "dspark",
+        "prompt_set": "ragged",
+        "rounds": 16,
+        "warmup_rounds": 4,
+        "max_model_len": 1024,
+        "output_length": 64,
+        "memory_fraction": 0.22,
+        "num_gpu_blocks": null,
+        "require_preemption": false,
+        "faults": true,
+        "capacity_probe": true,
+        "diagnose_mismatch": false
+      },
+      "prompt_lengths": [5, 106, 219, 481],
+      "baseline_token_stream_sha256": "d00e64fe727105573b57da64ead329d50f3852d372dab8962a524f4b81546889",
+      "greedy_tokens_equal": true,
+      "resource_checks_passed": true,
+      "counts": {
+        "preemptions": 0,
+        "max_context_bytes": 20971520,
+        "proposed": 4903,
+        "max_active_plus_cache_bytes": 4599524142,
+        "verified": 4903,
+        "accepted": 3858,
+        "completed": 80,
+        "normal_rounds_with_drafts": 17,
+        "cancelled": 2,
+        "reused": 2,
+        "injected_allocation_failures": 1
+      },
+      "fallback_span_observations": {
+        "context memory budget exhausted": 276,
+        "context capacity exhausted": 213,
+        "missing target feature prefix": 128
+      },
+      "active_after_drain_bytes": {
+        "minimum": 4339236990,
+        "maximum": 4339236990,
+        "measured_rounds": 16,
+        "range": 0
+      },
+      "peak_mlx_active_bytes": 4730879170,
+      "max_observed_active_plus_cache_bytes": 4642671752,
+      "budget_bytes": 5039430696,
+      "memory_plan": {
+        "max_contexts": 4,
+        "max_context_tokens": 1024,
+        "max_step_tokens": 64,
+        "kv_bytes_per_token": 20480,
+        "capture_bytes": 6553600,
+        "workspace_bytes": 389921280
+      },
+      "full_capacity_probe": {
+        "fixture": "synthetic sinusoidal features; all slots at full capacity",
+        "context_bytes": 83886080,
+        "peak_mlx_bytes": 4730879170,
+        "active_plus_cache_bytes": 4642671752
+      },
+      "instrumented_wall_time_s": 121.39593291608617
+    },
+    "full_capacity": {
+      "settings": {
+        "width": 7,
+        "method": "dspark",
+        "prompt_set": "ragged",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "max_model_len": 1024,
+        "output_length": 64,
+        "memory_fraction": 0.22,
+        "num_gpu_blocks": null,
+        "require_preemption": false,
+        "faults": false,
+        "capacity_probe": true,
+        "diagnose_mismatch": false
+      },
+      "prompt_lengths": [5, 106, 219, 481],
+      "baseline_token_stream_sha256": "d00e64fe727105573b57da64ead329d50f3852d372dab8962a524f4b81546889",
+      "greedy_tokens_equal": true,
+      "resource_checks_passed": true,
+      "counts": {
+        "preemptions": 0,
+        "max_context_bytes": 20971520,
+        "proposed": 265,
+        "max_active_plus_cache_bytes": 4587124990,
+        "verified": 265,
+        "accepted": 212,
+        "completed": 4,
+        "normal_rounds_with_drafts": 1
+      },
+      "fallback_span_observations": {},
+      "active_after_drain_bytes": {
+        "minimum": 4334518398,
+        "maximum": 4334518398,
+        "measured_rounds": 1,
+        "range": 0
+      },
+      "peak_mlx_active_bytes": 4730879166,
+      "max_observed_active_plus_cache_bytes": 4641104660,
+      "budget_bytes": 5039430696,
+      "memory_plan": {
+        "max_contexts": 4,
+        "max_context_tokens": 1024,
+        "max_step_tokens": 64,
+        "kv_bytes_per_token": 20480,
+        "capture_bytes": 6553600,
+        "workspace_bytes": 389921280
+      },
+      "full_capacity_probe": {
+        "fixture": "synthetic sinusoidal features; all slots at full capacity",
+        "context_bytes": 83886080,
+        "peak_mlx_bytes": 4730879166,
+        "active_plus_cache_bytes": 4641104660
+      },
+      "instrumented_wall_time_s": 5.5617783749476075
+    },
+    "short_preemption": {
+      "settings": {
+        "width": 2,
+        "method": "draft_model",
+        "prompt_set": "shared-short",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "max_model_len": 80,
+        "output_length": 64,
+        "memory_fraction": 0.22,
+        "num_gpu_blocks": 6,
+        "require_preemption": true,
+        "faults": false,
+        "capacity_probe": false,
+        "diagnose_mismatch": false
+      },
+      "prompt_lengths": [5, 5, 5, 5],
+      "baseline_token_stream_sha256": "34fc91118a00686af29c49749b07daed1931bf7cf639bd40c05594edc8b2198e",
+      "greedy_tokens_equal": true,
+      "resource_checks_passed": true,
+      "counts": {
+        "preemptions": 7,
+        "max_context_bytes": 20971520,
+        "proposed": 220,
+        "max_active_plus_cache_bytes": 4838459904,
+        "verified": 206,
+        "accepted": 142,
+        "completed": 4,
+        "normal_rounds_with_drafts": 1
+      },
+      "fallback_span_observations": {},
+      "active_after_drain_bytes": {
+        "minimum": 4589322366,
+        "maximum": 4589322366,
+        "measured_rounds": 1,
+        "range": 0
+      },
+      "peak_mlx_active_bytes": 4730879166,
+      "max_observed_active_plus_cache_bytes": 4838459904,
+      "budget_bytes": 5039430696,
+      "memory_plan": {
+        "max_contexts": 4,
+        "max_context_tokens": 256,
+        "max_step_tokens": 64,
+        "kv_bytes_per_token": 20480,
+        "capture_bytes": 6553600,
+        "workspace_bytes": 198425088
+      },
+      "full_capacity_probe": null,
+      "instrumented_wall_time_s": 4.976434665964916
+    },
+    "extended_preemption": {
+      "settings": {
+        "width": 2,
+        "method": "draft_model",
+        "prompt_set": "shared",
+        "rounds": 1,
+        "warmup_rounds": 0,
+        "max_model_len": 384,
+        "output_length": 256,
+        "memory_fraction": 0.22,
+        "num_gpu_blocks": 25,
+        "require_preemption": true,
+        "faults": false,
+        "capacity_probe": false,
+        "diagnose_mismatch": false
+      },
+      "prompt_lengths": [106, 106, 106, 106],
+      "baseline_token_stream_sha256": "cf932765ec89e1c85de69db5c69c51e76e462d7513a62acda4fade0941780395",
+      "greedy_tokens_equal": false,
+      "resource_checks_passed": true,
+      "counts": {
+        "preemptions": 6,
+        "max_context_bytes": 15728640,
+        "max_active_plus_cache_bytes": 4748051463,
+        "proposed": 721,
+        "verified": 711,
+        "accepted": 659,
+        "completed": 4,
+        "normal_rounds_with_drafts": 1
+      },
+      "fallback_span_observations": {},
+      "active_after_drain_bytes": {
+        "minimum": 4504387710,
+        "maximum": 4504387710,
+        "measured_rounds": 1,
+        "range": 0
+      },
+      "peak_mlx_active_bytes": 4730879166,
+      "max_observed_active_plus_cache_bytes": 4748051463,
+      "budget_bytes": 5039430696,
+      "memory_plan": {
+        "max_contexts": 4,
+        "max_context_tokens": 512,
+        "max_step_tokens": 64,
+        "kv_bytes_per_token": 20480,
+        "capture_bytes": 6553600,
+        "workspace_bytes": 262257152
+      },
+      "full_capacity_probe": null,
+      "instrumented_wall_time_s": 20.433386791031808,
+      "gate_status": "FAILED exact-token parity; PASSED resource/cleanup checks",
+      "identical_prompts": true,
+      "distinct_target_only_streams": 3
+    }
+  },
+  "expected_startup_rejection": {
+    "memory_fraction": 0.12,
+    "diagnostic": "DSpark startup memory budget is too small",
+    "rejected_before_drafter_installation": true,
+    "rejected_before_target_kv": true
+  },
+  "extended_generation": {
+    "gate_status": "FAILED exact-token parity; checker exited nonzero",
+    "max_model_len": 1024,
+    "output_length": 900,
+    "width": 7,
+    "concurrency": 4,
+    "prompt_lengths": [5, 106, 116, 116],
+    "mismatched_request_indices": [0, 2, 3],
+    "baseline_token_stream_sha256": "403968f366b7085ab3c56708193f8f53b06d2d03ba9a4fd9e24cc94ea8007a78",
+    "actual_token_stream_sha256": "994b5fe9aad91f8d17f5fde516a27d7e51d9db443048c34bd4d5e310d545e970",
+    "counts_before_failure": {
+      "preemptions": 0,
+      "max_context_bytes": 52428800,
+      "proposed": 6309,
+      "max_active_plus_cache_bytes": 4640447870,
+      "verified": 6309,
+      "accepted": 2690
+    },
+    "replay": "dspark-target-replay-results.json"
+  }
+}
