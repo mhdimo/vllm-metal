@@ -180,7 +180,11 @@ width for every eligible request, and `bypass` keeps the drafter loaded but
 never drafts. The artifacts come from
 `tools/dspark_confidence_calibrate.py` and `tools/dspark_cost_profile.py`;
 startup fails with the reason when either is missing or belongs to another
-pair.
+pair. `VLLM_METAL_DSPARK_DRAFT_PRECISION=source` keeps the drafter in the
+checkpoint's own precision instead of the qualified affine 4-bit conversion
+(more memory, a different cost profile; re-profile the cost model for it);
+`tools/dspark_acceptance_eval.py` measures the accepted length per drafting
+round on the DeepSpec evaluation prompt sets for either setting.
 
 Fixed-K performance on M5 Max with the 4B pair (see the progress record for
 the protocol and every cell): at one request, `num_speculative_tokens` 2-4
