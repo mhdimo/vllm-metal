@@ -138,12 +138,21 @@ vllm serve mlx-community/Qwen3-4B-4bit \
   --max-model-len 2048 \
   --max-num-seqs 1 \
   --no-async-scheduling \
-  --speculative-config '{"method":"draft_model","model":"deepseek-ai/dspark_qwen3_4b_block7","num_speculative_tokens":2}'
+  --speculative-config '{"method":"dspark","model":"deepseek-ai/dspark_qwen3_4b_block7","num_speculative_tokens":2}'
 ```
 
 The drafter can be an HF repo id or a local path. K=2 is an example, not a
-hardware-wide optimum. Use immutable local snapshots for reproducible prototype
-experiments: the current loader does not forward the requested draft revision.
+hardware-wide optimum. Pin `revision` in the speculative config or use immutable
+local snapshots for reproducible experiments. Both `dspark` and upstream's
+`draft_model` auto-detection use the resolved draft model and revision.
+
+Startup currently permits matched standalone Qwen3 targets and vanilla Markov
+drafters. It rejects unimplemented adaptive/probabilistic/synthetic drafting,
+top-k Markov shortcuts, draft quantization/backend/cache overrides, non-paged
+attention and LoRA. The prototype's drafter still uses the existing MLX 4-bit
+recipe; broader precision/resource qualification is tracked in the roadmap.
+Set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly. Request sampling eligibility remains
+greedy-only, with unsupported requests following the existing target-only path.
 
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,

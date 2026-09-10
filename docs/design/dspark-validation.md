@@ -6,6 +6,9 @@ This is the evidence record and execution checklist for the
 refer to that revision; a later documentation commit does not imply the runtime
 findings are fixed.
 
+See the [implementation progress record](dspark-progress.md) for resolutions
+after this audit and the validation attached to each milestone.
+
 ## Checkpoint manifest
 
 These are inspected official checkpoint configurations, not a list of models
@@ -57,8 +60,9 @@ the F7 reference evidence. Runtime findings and model qualification remain open.
 The MLX port is attributed to [ARahim3/mlx-dspark][port]; its inspected
 [MIT notice][port-license] names copyright holder `erahim3`. That independent
 implementation is distinct from DeepSeek's official model/evaluation code.
-The exact revision used to vendor the branch has not been established and must
-be recorded before redistribution is considered complete.
+M0 subsequently established that baseline `config.py` and `model.py` match
+upstream commit `9e39ea2fdc6d99d855af2cb7ef9933391c4391db` byte-for-byte. Their
+source notice and license are now included alongside the maintained files.
 
 ### Minimal F1 reproduction
 
@@ -204,8 +208,8 @@ revision above. Their weight files are 2,263,022,529 and 2,786,273,970 bytes.
 Downloads were attempted, but the weight transfer did not complete during this
 audit. No model weights or partial downloads are part of this change.
 
-The following uses local immutable snapshots to avoid the prototype's draft
-revision omission. Run the smoke after F1-F3 are fixed for qualification; running
+The following uses local immutable snapshots for reproducibility. M0 also forwards
+the resolved draft revision when using a repository ID. Run the smoke after F1-F3 are fixed for qualification; running
 the audited baseline is useful only to capture failures and limited diagnostics.
 
 ```bash

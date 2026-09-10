@@ -118,7 +118,7 @@ def _context(
         cu_seqlens=[],
         num_decode_segments=len(decode_segments),
         num_speculative_tokens=num_speculative_tokens,
-        finished_req_ids=set(),
+        finished_req_ids=finished_req_ids or set(),
     )
     elig = eligible if eligible is not None else list(decode_reqs)
     ctx_ctrl = SpeculativeDecodeController()

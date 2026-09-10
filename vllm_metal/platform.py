@@ -478,6 +478,12 @@ class MetalPlatform(Platform):
                 "draft model that shares the target vocabulary."
             )
 
+        from vllm_metal.v1.dspark.contracts import validate_dspark_config
+
+        validate_dspark_config(
+            vllm_config, use_paged_attention=config.use_paged_attention
+        )
+
         # Upstream's scheduler pads a newly admitted decode request to the uniform
         # speculative width, then still clips it to long_prefill_token_threshold,
         # leaving num_speculative_tokens placeholder drafts against fewer scheduled

@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 erahim3
 """DSpark drafter checkpoint loader.
 
 Adapted from ARahim3/mlx-dspark ``load.py`` (MIT) — vendored here so vllm-metal
@@ -16,14 +17,19 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
+from vllm_metal.utils import get_model_download_path
+
 from .config import DSparkConfig
 from .model import DSparkDrafter
 
 
-def _resolve(repo_or_path: str) -> str:
+def _resolve(repo_or_path: str, *, revision: str | None = None) -> str:
+    repo_or_path = get_model_download_path(repo_or_path, revision=revision)
     if os.path.isdir(repo_or_path):
         return repo_or_path
-    return snapshot_download(repo_or_path)
+    return snapshot_download(
+        repo_or_path, revision=revision, allow_patterns=["*.json", "*.safetensors"]
+    )
 
 
 def _flatten_params(module) -> list[tuple[str, Any]]:
@@ -37,6 +43,7 @@ def _flatten_params(module) -> list[tuple[str, Any]]:
 def load_drafter(
     repo_or_path: str,
     *,
+    revision: str | None = None,
     quantize: bool = True,
     bits: int = 4,
     group_size: int = 64,
@@ -46,11 +53,10 @@ def load_drafter(
 
     Weights load 1:1 by tensor name (``strict=True``); a name mismatch raises
     instead of silently loading a partial drafter (which would draft with
-    near-zero acceptance). 4-bit quantized by default — the drafter runs every
-    round, so quantizing it is what makes speculation a net win on Apple Silicon.
-    Output correctness is unaffected (the target verifies every token).
+    near-zero acceptance). The prototype uses MLX 4-bit quantization by default;
+    correctness and performance of each model pair require separate validation.
     """
-    path = _resolve(repo_or_path)
+    path = _resolve(repo_or_path, revision=revision)
     config = DSparkConfig.from_json(os.path.join(path, "config.json"))
     drafter = DSparkDrafter(config)
 
@@ -67,7 +73,9 @@ def load_drafter(
         if missing:
             detail += f"\n  missing in checkpoint ({len(missing)}): {missing[:8]}"
         if unexpected:
-            detail += f"\n  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}"
+            detail += (
+                f"\n  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}"
+            )
         if strict:
             raise ValueError(
                 f"{repo_or_path}: drafter tensor names don't match a DeepSpec-format "
@@ -83,18 +91,3 @@ def load_drafter(
 
     mx.eval(drafter.parameters())
     return drafter, config
-
-
-def is_dspark_drafter(draft_model_config: object) -> bool:
-    """True if a draft-model config points at a DeepSpec DSpark drafter checkpoint.
-
-    Distinguishing fields vs an ordinary Qwen3/Gemma-4 target: the drafter's
-    ``config.json`` carries ``block_size`` and ``target_layer_ids``.
-    """
-    hf_config = getattr(draft_model_config, "hf_config", None)
-    if hf_config is None:
-        return False
-    return (
-        getattr(hf_config, "block_size", None) is not None
-        and getattr(hf_config, "target_layer_ids", None) is not None
-    )

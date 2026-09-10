@@ -85,7 +85,8 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
-from vllm_metal.v1.dspark.loader import is_dspark_drafter, load_drafter
+from vllm_metal.v1.dspark.contracts import is_dspark_config
+from vllm_metal.v1.dspark.loader import load_drafter
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
@@ -1004,16 +1005,14 @@ class MetalModelRunner:
 
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
-        elif spec.method == "dspark" or (
-            spec.uses_draft_model() and is_dspark_drafter(spec.draft_model_config)
-        ):
-            # vLLM resolves a Qwen3DSparkModel draft to method="dspark" and puts
-            # the drafter repo on `spec.model`; the draft_model path carries it on
-            # draft_model_config. Cover both.
-            drafter_repo = (
-                spec.model if spec.method == "dspark" else spec.draft_model_config.model
+        elif is_dspark_config(spec):
+            # Both canonical and auto-detected DSpark use upstream's resolved
+            # ModelConfig, including the revision used to inspect the checkpoint.
+            draft_config = spec.draft_model_config
+            drafter_repo = draft_config.model
+            drafter_model, drafter_cfg = load_drafter(
+                drafter_repo, revision=draft_config.revision
             )
-            drafter_model, drafter_cfg = load_drafter(drafter_repo)
             self._drafter = DSparkProposer(
                 drafter=drafter_model,
                 config=drafter_cfg,

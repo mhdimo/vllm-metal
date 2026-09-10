@@ -1,13 +1,12 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 erahim3
 """DSpark drafter config — loaded from the HF checkpoint's config.json.
 
 Supports two drafter families with a shared inference path:
   - gemma4  (gemma4_text): k_eq_v attention, v_norm, partial/proportional rope,
             sandwich norms + layer_scalar, gelu-tanh MLP, logit softcap.
   - qwen3   (qwen3):       standard GQA (separate v_proj, no v_norm), default rope,
-            Llama-style 2-norm layer, silu MLP, no softcap. Also covers qwen3_5-flavored
-            backbones (model_type qwen3_5, e.g. Ornith drafters) via two config-driven
-            knobs: gated_q_proj (q_proj emits [q ‖ gate], attn out × sigmoid(gate)) and
-            rope_dims (partial rotary).
+            Llama-style 2-norm layer, silu MLP, no softcap.
 Only the fields the MLX inference path needs are pulled out.
 """
 
@@ -20,7 +19,7 @@ from pathlib import Path
 
 @dataclass
 class DSparkConfig:
-    family: str = "gemma4"             # "gemma4" | "qwen3"
+    family: str = "gemma4"  # "gemma4" | "qwen3"
 
     # core dims
     hidden_size: int = 3840
@@ -53,8 +52,8 @@ class DSparkConfig:
     # qwen3_5 stores every RMSNorm weight as an additive offset from one (Gemma-style
     # (1+w)·x̂ — the reference vLLM patches call this offset_rms_norm). load_drafter adds
     # 1.0 to all RMSNorm weights at load so plain nn.RMSNorm modules compute the right
-    # thing. Applying them un-offset multiplies the context fusion by ~0 and silently
-    # collapses acceptance to ~1.25 (measured; d0 15% → 90% with the offset).
+    # thing. These inherited fields are not a qualified Qwen3.5 serving path;
+    # from_dict rejects that checkpoint family.
     offset_rms_norm: bool = False
 
     # dspark specifics
@@ -82,9 +81,9 @@ class DSparkConfig:
     pad_token_id: int = 0
 
     # ---- family-derived knobs (set in from_json) ----
-    mlp_activation: str = "gelu_tanh"   # "gelu_tanh" | "silu"
-    norm_style: str = "gemma"           # "gemma" (sandwich+scalar) | "qwen" (llama 2-norm)
-    use_v_norm: bool = True             # gemma: RMSNormNoScale v_norm; qwen: none
+    mlp_activation: str = "gelu_tanh"  # "gelu_tanh" | "silu"
+    norm_style: str = "gemma"  # "gemma" (sandwich+scalar) | "qwen" (llama 2-norm)
+    use_v_norm: bool = True  # gemma: RMSNormNoScale v_norm; qwen: none
     attention_scaling: float | None = None  # None -> 1/sqrt(attn_head_dim)
 
     @property
@@ -102,16 +101,24 @@ class DSparkConfig:
     def scaling(self) -> float:
         if self.attention_scaling is not None:
             return self.attention_scaling
-        return self.attn_head_dim ** -0.5 if self.family == "qwen3" else 1.0
+        return self.attn_head_dim**-0.5 if self.family == "qwen3" else 1.0
 
     @property
     def rope_parameters(self) -> dict:
-        return {"rope_type": self.rope_type, "partial_rotary_factor": self.partial_rotary_factor}
+        return {
+            "rope_type": self.rope_type,
+            "partial_rotary_factor": self.partial_rotary_factor,
+        }
 
     @classmethod
-    def from_json(cls, path: str | Path) -> "DSparkConfig":
+    def from_json(cls, path: str | Path) -> DSparkConfig:
         with open(path) as f:
             c = json.load(f)
+        return cls.from_dict(c, source=str(path))
+
+    @classmethod
+    def from_dict(cls, c: dict, *, source: str = "DSpark config") -> DSparkConfig:
+        path = source
         mt = c.get("model_type", "")
 
         # Reject the known-incompatible checkpoint packagings with a specific message before
@@ -120,40 +127,98 @@ class DSparkConfig:
         if "speculators_config" in c or "speculators_model_type" in c:
             raise ValueError(
                 f"{path}: this checkpoint is in the vLLM 'speculators' format "
-                f"(speculators_config present), which mlx-dspark cannot load yet — it uses a "
+                f"(speculators_config present), which vllm-metal cannot load yet — it uses a "
                 f"different config schema (aux_hidden_state_layer_ids, transformer_layer_config, "
                 f"draft_vocab_size). Use a DeepSpec-native standalone drafter "
-                f"(e.g. deepseek-ai/dspark_*_block7), or open an issue: "
-                f"https://github.com/ARahim3/mlx-dspark/issues"
+                f"(e.g. deepseek-ai/dspark_*_block7)."
             )
         if "block_size" not in c and any(k.startswith("dspark_") for k in c):
             raise ValueError(
                 f"{path}: this looks like a full target model with an embedded DSpark drafter "
                 f"(dspark_* fields in the target config, e.g. DeepSeek-V4-*-DSpark), not a "
-                f"standalone drafter checkpoint. mlx-dspark loads standalone DeepSpec drafters "
+                f"standalone drafter checkpoint. Metal currently loads standalone DeepSpec drafters "
                 f"(e.g. deepseek-ai/dspark_*_block7)."
             )
 
-        if "qwen3" in mt:
+        if mt == "qwen3":
             family = "qwen3"
-        elif "gemma4" in mt:
+        elif mt == "gemma4_text":
             family = "gemma4"
         else:
             raise ValueError(
                 f"{path}: unsupported drafter family (model_type={mt!r}). Supported drafter "
-                f"backbones: qwen3, gemma4 (gemma4_text). Drafter-free speculation works with "
-                f"any target via --mode lookup / --mode auto; for a new drafter family, open an "
-                f"issue: https://github.com/ARahim3/mlx-dspark/issues"
+                f"backbones: qwen3 and gemma4_text. Serving support additionally requires "
+                f"a qualified target adapter; see docs/design/dspark.md."
             )
 
-        required = ("hidden_size", "vocab_size", "num_hidden_layers", "intermediate_size",
-                    "num_attention_heads", "block_size", "mask_token_id", "target_layer_ids")
+        required = (
+            "hidden_size",
+            "vocab_size",
+            "num_hidden_layers",
+            "intermediate_size",
+            "num_attention_heads",
+            "block_size",
+            "mask_token_id",
+            "target_layer_ids",
+        )
         missing = [k for k in required if k not in c]
         if missing:
             raise ValueError(
                 f"{path}: config is missing required DeepSpec drafter fields {missing} — this "
                 f"does not look like a DeepSpec-format DSpark drafter checkpoint."
             )
+
+        for name in (*required[:6], "num_target_layers", "markov_rank"):
+            value = c.get(name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{path}: {name} must be a positive integer")
+        taps = c["target_layer_ids"]
+        if (
+            not isinstance(taps, list)
+            or not taps
+            or any(
+                type(i) is not int or not 0 <= i < c["num_target_layers"] - 1
+                for i in taps
+            )
+            or any(a >= b for a, b in zip(taps, taps[1:], strict=False))
+        ):
+            raise ValueError(
+                f"{path}: target_layer_ids must be strictly increasing intermediate "
+                "decoder layer indices; embedding and final-layer taps are unsupported"
+            )
+        if (
+            type(c["mask_token_id"]) is not int
+            or not 0 <= c["mask_token_id"] < c["vocab_size"]
+        ):
+            raise ValueError(f"{path}: mask_token_id must be in the target vocabulary")
+        if c.get("markov_head_type", "vanilla") != "vanilla":
+            raise NotImplementedError(
+                f"{path}: only the vanilla DSpark Markov head is implemented"
+            )
+        if c.get("log_snr_conditioning") or c.get("enable_qwen35_gated_q_proj"):
+            raise NotImplementedError(
+                f"{path}: GIDD and Qwen3.5 draft variants are unsupported"
+            )
+        if c.get("layer_types") not in (
+            None,
+            ["full_attention"] * c["num_hidden_layers"],
+        ):
+            raise NotImplementedError(
+                f"{path}: standalone DSpark drafts require full attention"
+            )
+        if c.get("use_sliding_window") or c.get("dflash_query_causal"):
+            raise NotImplementedError(
+                f"{path}: sliding or causal draft blocks are unsupported"
+            )
+        if family == "qwen3":
+            rope = c.get("rope_parameters") or {}
+            if (
+                rope.get("rope_type", "default") != "default"
+                or rope.get("partial_rotary_factor", 1.0) != 1.0
+            ):
+                raise NotImplementedError(
+                    f"{path}: Qwen3 DSpark requires full default RoPE"
+                )
 
         if family == "qwen3":
             rp = c.get("rope_parameters") or {}
@@ -178,20 +243,23 @@ class DSparkConfig:
                     )
             return cls(
                 family="qwen3",
-                hidden_size=c["hidden_size"], vocab_size=c["vocab_size"],
+                hidden_size=c["hidden_size"],
+                vocab_size=c["vocab_size"],
                 num_hidden_layers=c["num_hidden_layers"],
                 intermediate_size=c["intermediate_size"],
                 rms_norm_eps=c.get("rms_norm_eps", 1e-6),
                 num_attention_heads=c["num_attention_heads"],
                 num_key_value_heads=c.get("num_key_value_heads", 8),
                 head_dim=head_dim,
-                attention_k_eq_v=False, attention_bias=c.get("attention_bias", False),
+                attention_k_eq_v=False,
+                attention_bias=c.get("attention_bias", False),
                 rope_theta=rp.get("rope_theta", c.get("rope_theta", 1_000_000.0)),
                 rope_type="default",
                 rope_dims=(rope_dims if rope_dims != head_dim else None),
                 gated_q_proj=gated_q,
                 offset_rms_norm=offset_norms,
-                block_size=c["block_size"], mask_token_id=c["mask_token_id"],
+                block_size=c["block_size"],
+                mask_token_id=c["mask_token_id"],
                 target_layer_ids=list(c["target_layer_ids"]),
                 num_target_layers=c.get("num_target_layers", 36),
                 markov_rank=c.get("markov_rank", 256),
@@ -200,7 +268,9 @@ class DSparkConfig:
                 confidence_head_with_markov=c.get("confidence_head_with_markov", True),
                 final_logit_softcapping=c.get("final_logit_softcapping", None),
                 pad_token_id=c.get("pad_token_id") or 0,
-                mlp_activation="silu", norm_style="qwen", use_v_norm=False,
+                mlp_activation="silu",
+                norm_style="qwen",
+                use_v_norm=False,
                 log_snr_conditioning=bool(c.get("log_snr_conditioning", False)),
                 min_log_snr=float(c.get("min_log_snr", -9.0)),
                 max_log_snr=float(c.get("max_log_snr", 9.0)),
@@ -209,20 +279,23 @@ class DSparkConfig:
         rope = (c.get("rope_parameters") or {}).get("full_attention", {}) or {}
         return cls(
             family="gemma4",
-            hidden_size=c["hidden_size"], vocab_size=c["vocab_size"],
+            hidden_size=c["hidden_size"],
+            vocab_size=c["vocab_size"],
             num_hidden_layers=c["num_hidden_layers"],
             intermediate_size=c["intermediate_size"],
             rms_norm_eps=c.get("rms_norm_eps", 1e-6),
             num_attention_heads=c["num_attention_heads"],
             num_key_value_heads=c.get("num_key_value_heads", 8),
             num_global_key_value_heads=c.get("num_global_key_value_heads", 1),
-            head_dim=c.get("head_dim", 256), global_head_dim=c.get("global_head_dim", 512),
+            head_dim=c.get("head_dim", 256),
+            global_head_dim=c.get("global_head_dim", 512),
             attention_k_eq_v=c.get("attention_k_eq_v", True),
             attention_bias=c.get("attention_bias", False),
             rope_theta=rope.get("rope_theta", 1_000_000.0),
             partial_rotary_factor=rope.get("partial_rotary_factor", 0.25),
             rope_type=rope.get("rope_type", "proportional"),
-            block_size=c["block_size"], mask_token_id=c["mask_token_id"],
+            block_size=c["block_size"],
+            mask_token_id=c["mask_token_id"],
             target_layer_ids=list(c["target_layer_ids"]),
             num_target_layers=c.get("num_target_layers", 48),
             markov_rank=c.get("markov_rank", 256),
@@ -231,5 +304,7 @@ class DSparkConfig:
             confidence_head_with_markov=c.get("confidence_head_with_markov", True),
             final_logit_softcapping=c.get("final_logit_softcapping", 30.0),
             pad_token_id=c.get("pad_token_id", 0),
-            mlp_activation="gelu_tanh", norm_style="gemma", use_v_norm=True,
+            mlp_activation="gelu_tanh",
+            norm_style="gemma",
+            use_v_norm=True,
         )
