@@ -168,7 +168,10 @@ See [vLLM runner selection][vllm-config] and [speculative configuration][vllm-op
 
 Keep FP32/unquantized draft computation available as the numerical oracle. Expose
 quantization as an explicit recipe rather than an unconditional speed claim.
-Qualify BF16/FP16 and 8-/4-bit drafters separately. Preserve sensitive confidence
+Qualify BF16/FP16 and 8-/4-bit drafters separately. M3 qualifies the official BF16
+Qwen3-4B source and one affine-4/group-64 greedy recipe; FP16/FP32 loading has tiny
+checkpoint tests, and serving 8-bit/prepacked formats remain unsupported.
+Preserve sensitive confidence
 and normalization computations at validated precision. Quantization can change
 acceptance and calibration even when correct verification preserves target
 sampling. Sharing a target embedding/head is optional: it requires identical
@@ -297,6 +300,14 @@ subtracts its entire capacity and enforces admission. Longer term, paged draft
 context should share exact prefix blocks with reference counts and copy-on-write.
 This requires feature-compatible prefix keys and reclamation tied to request
 epochs, rather than relying solely on target token hashes.
+
+M3 implements the bounded reservation in `DSparkMemoryPlan`: the configured
+request slots/model length/step-token limit determine context, capture and
+workspace bytes using the actual draft dtype. Chunks of 256 tokens reuse storage
+within a hard context capacity. Startup and request admission fail explicitly or
+use target-only output as appropriate; recognized draft allocation failures
+release private context. The [M3 evidence](dspark-m3-validation.md) includes
+full-capacity storage, sustained drain/reuse, pressure and precision checks.
 
 Optimize in measured order: remove duplicate prefill work; avoid full-context
 copies and concatenation each step; reuse allocated buffers; group ragged work
@@ -502,11 +513,13 @@ tests, reproducible model-pair parity and useful serving measurements. Performan
 claims need before/after artifacts under the project's
 [contribution requirements](../CONTRIBUTING.md).
 
-M0-M2 implement the contract, native capture and exact context lifecycle; their
+M0-M3 implement the contract, native capture, exact context lifecycle and bounded
+resource planning; their
 [progress and validation record](dspark-progress.md) identifies the tested
-envelope. M3 memory/precision qualification and M4 fixed greedy serving remain
-the next gates. These foundation milestones do not establish production
-performance or complete the later stochastic/confidence work.
+envelopes. M4 fixed greedy serving is the next gate, including the
+[extended parity failures found in M3](dspark-m3-validation.md#failed-extended-parity-checks-m4-remains-open).
+These foundation milestones do not establish production performance or complete
+the later stochastic/confidence work.
 
 ## Primary sources
 

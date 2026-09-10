@@ -57,10 +57,12 @@ probability/workspace/history state must join the same cleanup path.
 The initial documentation change corrected stale F8 descriptions and added part
 of the F7 reference evidence. M0-M2 subsequently resolved F1-F3 and the guarded
 support/provenance portions of F5/F8/F9. See the [progress record](dspark-progress.md)
-for passing regressions and real 4B results. F4 resource planning, full F5
-precision/loading qualification, F6 completion and the broader F7 serving matrix
-remain open; the baseline witnesses below intentionally preserve the original
-failure evidence.
+for passing regressions and real 4B results. M3 subsequently addressed F4 resource
+planning and F5 loading/precision for its named 4B recipe and memory envelope;
+its [qualification record](dspark-m3-validation.md) preserves both passing results
+and extended parity failures. F6 completion, broader model-pair qualification and
+the F7/M4-M7 serving matrix remain open. The baseline witnesses below intentionally
+preserve the original failure evidence.
 
 The MLX port is attributed to [ARahim3/mlx-dspark][port]; its inspected
 [MIT notice][port-license] names copyright holder `erahim3`. That independent

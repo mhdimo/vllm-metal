@@ -141,6 +141,25 @@ def test_invalid_checkpoint_fails_before_materialization(
         load_drafter(str(tmp_path))
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("quantize", [False, True])
+def test_nonfinite_payload_is_rejected_and_allocator_limit_restored(
+    tmp_path, dtype, invalid, quantize
+):
+    _, weights = checkpoint(tmp_path, dtype)
+    name = "embed_tokens.weight"
+    weights[name][0, 0] = invalid
+    mx.save_safetensors(tmp_path / "model.safetensors", weights)
+    previous = mx.set_cache_limit(123456)
+    try:
+        with pytest.raises(ValueError, match="embed_tokens.weight.*non-finite"):
+            load_drafter(str(tmp_path), quantize=quantize)
+        assert mx.set_cache_limit(123456) == 123456
+    finally:
+        mx.set_cache_limit(previous)
+
+
 def test_conversion_failure_restores_allocator_limit(tmp_path, monkeypatch):
     checkpoint(tmp_path)
     previous = mx.set_cache_limit(123456)
