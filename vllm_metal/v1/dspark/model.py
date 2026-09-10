@@ -322,17 +322,18 @@ class ArenaCache(CtxCache):
 class ArenaBatch:
     """The rows of one drafting batch inside a :class:`ContextArena` (one layer)."""
 
-    __slots__ = ("arena", "slots", "lengths", "max_len", "_slot_index", "_offsets")
+    __slots__ = ("arena", "slots", "lengths", "_slot_index", "_offsets")
 
     def __init__(
         self, arena: ContextArena, slots: list[int], lengths: list[int]
     ) -> None:
         if len(slots) != len(lengths) or not slots:
             raise ValueError("an arena batch needs one length per slot")
+        if any(length + arena.block_size > arena.keys.shape[2] for length in lengths):
+            raise ValueError("an arena batch row exceeds its slot")
         self.arena = arena
         self.slots = slots
         self.lengths = lengths
-        self.max_len = max(lengths)
         self._slot_index = mx.array(slots, dtype=mx.int32)
         self._offsets = mx.array(lengths, dtype=mx.int32)
 
