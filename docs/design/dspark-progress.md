@@ -10,7 +10,8 @@ and serving qualification gates pass.
 | M0: Baseline and contract | [Complete: #1](https://github.com/mhdimo/vllm-metal/pull/1) | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions tracked the defects fixed in M1/M2. |
 | M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
-| M3-M8 | Planned | Loading/resource qualification, serving, stochastic verification, confidence scheduling and additional model pairs. |
+| M3: Loading and memory | In progress | Deterministic checkpoint selection and incremental conversion; complete memory planning and pressure/precision qualification follow. |
+| M4-M8 | Planned | Serving, stochastic verification, confidence scheduling and additional model pairs. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
 
 ## M0: Baseline and supported contract
@@ -190,3 +191,34 @@ for this milestone. Use the [existing experiment matrix](dspark-validation.md#re
 for larger standalone pairs and model-specific gates. The current results do
 not qualify Qwen3-8B/14B, Gemma4, stochastic decoding, calibrated confidence or
 integrated V4. V4 remains outside both available machines' memory scale.
+
+## M3: Loading and memory
+
+### Step 1: Deterministic checkpoint loading
+
+The loader follows `model.safetensors.index.json` when present, checking every
+shard against its declared tensor ownership. Without an index, exactly one
+safetensors file is required. Missing shards, duplicate JSON keys, mismatched
+tensor names/shapes, mixed or non-floating dtypes, and prepacked checkpoints
+fail before weight materialization. Requested revisions continue through the
+existing Hugging Face/ModelScope resolution path.
+
+The serving conversion remains MLX affine 4-bit/group-64 for linear layers and
+embeddings, including prediction heads. Conversion now evaluates one tensor at
+a time and scopes allocator retention to the load. Real safetensors tests cover
+FP32/FP16/BF16 and sharded files, requiring identical converted parameters and
+actual draft logits against the previous whole-model MLX recipe. Unquantized
+loads preserve source precision for reference checks. This does not by itself
+qualify quantization error against official full-precision checkpoint execution.
+
+The pinned Qwen3-4B lifecycle checker passed again at concurrency four/K=2 with
+prefix caching: eight baseline/speculative outputs matched, 123 proposed tokens
+were verified, 94 were accepted, and normal completion plus cancellation/ID
+reuse drained all request context. Peak MLX allocation including startup was
+4,115,459,242 bytes. This is a bounded correctness probe, not a speed benchmark
+or a complete memory budget; the target planner still omits drafter resources
+until step 2.
+
+The next step must load the drafter before target KV sizing and reserve its
+persistent context, staging and execution workspace. Loader correctness alone
+does not resolve the M2 resource-accounting gap.
