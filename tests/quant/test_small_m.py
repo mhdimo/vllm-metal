@@ -91,9 +91,9 @@ def test_eligibility_rules() -> None:
     assert small_m.eligible(host.embed)
     assert small_m.shape_key(host.layers[0]) == SHAPE_KEY
     assert not small_m.eligible(nn.Linear(K, N))
-    narrow = nn.Linear(256, N, bias=False)
+    narrow = nn.Linear(320, N, bias=False)
     nn.quantize(narrow, group_size=64, bits=4)
-    assert not small_m.eligible(narrow)  # K % 512 != 0
+    assert not small_m.eligible(narrow)  # K % 256 != 0
     eight = nn.Linear(K, N, bias=False)
     nn.quantize(eight, group_size=64, bits=8)
     assert not small_m.eligible(eight)

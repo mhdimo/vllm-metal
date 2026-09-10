@@ -13,10 +13,18 @@ for.
 
 The kernel here dequantizes each weight group once per threadgroup and applies
 it to every row through 8x8 ``simdgroup_matrix`` tiles (``ceil(M / 8)`` tiles,
-up to four for M <= 32), K split across the eight simdgroups of a threadgroup so
-the serial loop per simdgroup is short. Its structure follows avlp12's
-``qmm_mma4`` (MIT, via mlx-dspark's ``small_m_qmm.py``; see NOTICE); the
-multi-tile form and the dispatch are this repository's. Accumulation is fp32 in
+up to four for M <= 32): a threadgroup owns 32 output columns, one per lane,
+each lane loads one 64-wide quantization group of its column per chunk (two
+16-byte loads, one scale and one bias) into a per-simdgroup stage, and K is
+split across the four simdgroups so the serial loop per simdgroup is short.
+The structure follows avlp12's ``qmm_mma4`` (MIT, via mlx-dspark's
+``small_m_qmm.py``; see NOTICE), which stages eight columns per threadgroup
+over eight simdgroups; the 32-column layout (a quarter of the activation
+re-reads, 16-byte weight loads), the multi-tile form and the dispatch are this
+repository's. On the M5 Max the stock kernel's GEMV path still streams weights
+faster than any MMA layout measured (this one reaches about 60-70% of its rate
+at one row), so the gain at eight rows is bounded by that ratio times the stock
+GEMM penalty; the race below decides per shape. Accumulation is fp32 in
 a different order than the stock kernel, so outputs differ from it at the bf16
 ULP level, the same class as the stock kernel's own difference between its GEMV
 and GEMM paths; the parity contract classifies those as ties.
@@ -49,7 +57,7 @@ from vllm_metal import envs as metal_envs
 
 logger = init_logger(__name__)
 
-KERNEL_VERSION = 1
+KERNEL_VERSION = 2
 BITS = 4
 GROUP_SIZE = 64
 TILE_ROWS = 8
@@ -59,8 +67,9 @@ MAX_ROWS = TILE_ROWS * MAX_TILES
 # re-verifies each tile count, this bound only keeps the one-row decode path
 # free of dispatch work.
 MIN_ROWS = 6
-K_ALIGN = 512
-THREADGROUP = 256
+K_ALIGN = 256  # four simdgroups x one 64-wide quantization group per chunk
+THREADGROUP = 128
+COLUMNS = 32
 MIN_GAIN = 1.10
 NUMERICS_TOLERANCE = 0.02
 MODES = ("auto", "off", "on")
@@ -69,60 +78,67 @@ _EVALS = 4
 
 _SRC = r"""
     const int K = KD, N = ND, M = MD;
-    const int KPS = KD / 8;
+    const int SG = 4;
+    const int KPS = KD / SG;
     uint tid  = thread_position_in_threadgroup.x;
     uint tgid = threadgroup_position_in_grid.x;
     uint sg   = tid >> 5;
     uint lane = tid & 31;
-    int n0 = (int)tgid * 8;
-    threadgroup bfloat16_t bs[8 * 512];
-    threadgroup float red[8 * 64 * TILES];
-    simdgroup_matrix<float, 8, 8> C[TILES];
-    for (int t = 0; t < TILES; ++t) C[t] = simdgroup_matrix<float, 8, 8>(0);
-    threadgroup bfloat16_t* bt = bs + sg * 512;
+    int n0 = (int)tgid * 32;
+    // per simdgroup: a 64 k x 32 n bfloat16 stage (4 KB); the split-K reduction reuses it
+    threadgroup bfloat16_t bs[4 * 64 * 32];
+    threadgroup bfloat16_t* bt = bs + sg * 2048;
+    simdgroup_matrix<float, 8, 8> C[TILES][4];
+    for (int t = 0; t < TILES; ++t)
+        for (int c = 0; c < 4; ++c) C[t][c] = simdgroup_matrix<float, 8, 8>(0);
+    int n = n0 + (int)lane;                 // one output column per lane
     int kbeg = (int)sg * KPS;
-    for (int kk = 0; kk < KPS; kk += 64) {
+    for (int kk = 0; kk < KPS; kk += 64) {  // one chunk = one quantization group
         int ka = kbeg + kk;
-        int j  = (int)(lane & 7);
-        int kq = (int)(lane >> 3);
-        int n  = n0 + j;
         if (n < N) {
             int g = ka >> 6;
             float s  = (float)sc[(size_t)n * (K / 64) + g];
             float bb = (float)bi[(size_t)n * (K / 64) + g];
-            const device uint* wr = w + (size_t)n * (K / 8) + (ka >> 3) + kq * 2;
-            uint p0 = wr[0], p1 = wr[1];
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + t) * 8 + j] =
-                    (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + 8 + t) * 8 + j] =
-                    (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
+            const device uint4* wr = (const device uint4*)(w + (size_t)n * (K / 8) + (ka >> 3));
+            uint4 p0 = wr[0], p1 = wr[1];
+            uint words[8] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w};
+            for (int q = 0; q < 8; ++q) {
+                uint p = words[q];
+                for (int t = 0; t < 8; ++t)
+                    bt[(q * 8 + t) * 32 + lane] =
+                        (bfloat16_t)((float)((p >> (4 * t)) & 15u) * s + bb);
+            }
         } else {
-            for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
+            for (int kq = 0; kq < 64; ++kq) bt[kq * 32 + lane] = (bfloat16_t)0;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_matrix<bfloat16_t, 8, 8> A, B;
         for (int kt = 0; kt < 8; ++kt) {
-            simdgroup_load(B, bt + kt * 64, 8);
             for (int t = 0; t < TILES; ++t) {
                 simdgroup_load(A, x + (size_t)t * 8 * K + ka + kt * 8, K);
-                simdgroup_multiply_accumulate(C[t], A, B, C[t]);
+                for (int c = 0; c < 4; ++c) {
+                    simdgroup_load(B, bt + kt * 8 * 32 + c * 8, 32);
+                    simdgroup_multiply_accumulate(C[t][c], A, B, C[t][c]);
+                }
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (int t = 0; t < TILES; ++t)
-        simdgroup_store(C[t], red + (sg * TILES + t) * 64, 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int i = (int)tid; i < 64 * TILES; i += 256) {
-        int t = i >> 6, r = i & 63;
-        int m = t * 8 + (r >> 3), jj = r & 7;
-        int n = n0 + jj;
-        if (m < M && n < N) {
+    threadgroup float* red = (threadgroup float*)bs;   // SG x TILES x 4 x 64 floats <= 16 KB
+    for (int t = 0; t < TILES; ++t)
+        for (int c = 0; c < 4; ++c)
+            simdgroup_store(C[t][c], red + ((sg * TILES + t) * 4 + c) * 64, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int i = (int)tid; i < TILES * 4 * 64; i += 128) {
+        int t = i / 256, rem = i % 256;
+        int c = rem >> 6, r = rem & 63;
+        int m = t * 8 + (r >> 3), jj = c * 8 + (r & 7);
+        int nn = n0 + jj;
+        if (m < M && nn < N) {
             float v = 0.0f;
-            for (int q = 0; q < 8; ++q) v += red[(q * TILES + t) * 64 + r];
-            out[(size_t)m * N + n] = (bfloat16_t)v;
+            for (int q = 0; q < SG; ++q) v += red[((q * TILES + t) * 4 + c) * 64 + r];
+            out[(size_t)m * N + nn] = (bfloat16_t)v;
         }
     }
 """
@@ -180,7 +196,7 @@ def small_m_matmul(
         ],
         output_shapes=[(rows, out_features)],
         output_dtypes=[mx.bfloat16],
-        grid=(((out_features + 7) // 8) * THREADGROUP, 1, 1),
+        grid=(((out_features + COLUMNS - 1) // COLUMNS) * THREADGROUP, 1, 1),
         threadgroup=(THREADGROUP, 1, 1),
     )
     return out
