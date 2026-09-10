@@ -24,6 +24,29 @@ from pathlib import Path
 
 from tools.dspark_lifecycle_check import PROMPTS
 
+# Non-degenerate workload: varied natural prompts that ask for long answers, so
+# a greedy stream is not a repeated sentence with logits near 40. The repeated
+# fixtures above drive the target into a bistable regime; this set measures
+# parity where the target's greedy decisions are stable.
+NATURAL_PROMPTS = [
+    "Explain how a hash table handles collisions, and compare chaining with open "
+    "addressing in terms of memory use and cache behavior.",
+    "Write a short story about a lighthouse keeper who discovers that the light "
+    "has started to attract something other than ships.",
+    "Describe the steps a compiler takes to turn source code into an executable, "
+    "and say what can go wrong at each step.",
+    "A recipe for bread calls for 500 grams of flour and 350 grams of water. "
+    "Explain what hydration percentage means and how changing it affects the loaf.",
+    "Summarize the causes of the 1929 stock market crash for a high school "
+    "student, then explain what changed in banking regulation afterwards.",
+    "Write a Python class that implements an LRU cache with get and put methods, "
+    "then explain the time complexity of each operation.",
+    "Why does the sky appear blue during the day but red near the horizon at "
+    "sunset? Include the physics of scattering in your answer.",
+    "Compare the strengths and weaknesses of trains, buses and bicycles for a "
+    "city planner deciding how to reduce traffic in a mid-sized city.",
+]
+
 
 def top_logit_rows(
     paged_state, round_index: int | None, forward_index: int, top_k: int = 8
@@ -239,6 +262,8 @@ def worker(config: dict, output: Path) -> None:
         # Balanced arrivals keep several sequences alive while their shared
         # physical KV allowance fills, forcing genuine scheduler preemption.
         texts = [PROMPTS[0 if config["prompt_set"] == "shared-short" else 1]] * 4
+    elif config.get("prompt_set") == "natural":
+        texts = list(NATURAL_PROMPTS)
     tokenized = [
         llm.get_tokenizer().encode(text, add_special_tokens=False)[
             : config["max_model_len"] - config["output_length"] - 8
@@ -504,7 +529,9 @@ def main() -> None:
     parser.add_argument("--width", type=int, choices=range(1, 8), default=7)
     parser.add_argument("--method", choices=("dspark", "draft_model"), default="dspark")
     parser.add_argument(
-        "--prompt-set", choices=("ragged", "shared", "shared-short"), default="ragged"
+        "--prompt-set",
+        choices=("ragged", "shared", "shared-short", "natural"),
+        default="ragged",
     )
     parser.add_argument("--max-model-len", type=int, default=1024)
     parser.add_argument("--output-length", type=int, default=64)
