@@ -194,7 +194,7 @@ integrated V4. V4 remains outside both available machines' memory scale.
 
 ## M3: Loading and memory
 
-### Step 1: Deterministic checkpoint loading
+### Step 1: Deterministic checkpoint loading ([PR #4](https://github.com/mhdimo/vllm-metal/pull/4))
 
 The loader follows `model.safetensors.index.json` when present, checking every
 shard against its declared tensor ownership. Without an index, exactly one
@@ -222,3 +222,41 @@ until step 2.
 The next step must load the drafter before target KV sizing and reserve its
 persistent context, staging and execution workspace. Loader correctness alone
 does not resolve the M2 resource-accounting gap.
+
+### Step 2: Complete resource planning and bounded storage
+
+DSpark now loads during the runner's model lifecycle, before profiling or any
+target KV allocation. A header-derived startup estimate includes final draft
+weights, two largest source-tensor buffers for conversion overlap, and 64 MiB
+of kernel reserve. It must fit the configured allowance after target weights.
+The on-disk config must also agree with the already resolved draft `ModelConfig`.
+
+The normal cache planner measures both loaded models and subtracts a separate
+DSpark reservation. This covers up to `min(max_num_seqs, 32)` complete contexts,
+feature capture/casts, context growth/copy/padding overlap, attention and head
+workspace, and kernel reserve. It uses the actual draft compute dtype and the
+configured model/step token limits. DSpark does not register a synthetic
+autoregressive cache group. Startup errors include the reservation and practical
+ways to reduce it; model-pair qualification must still check observed peaks.
+
+Request context grows in chunks of 256 within a hard capacity. Appends update
+existing storage; rollback exposes only the committed prefix and reuses capacity
+without admitting stale suffix tokens. Target features are explicitly cast to
+draft precision before projection. Capacity and remaining process-budget checks
+precede context allocation; an unavailable complete context produces target-only
+generation. Recognized MLX allocation failures discard all private context and
+preserve the already sampled target output. Other execution errors still fail.
+Recovery requires a new request or a complete recomputation from position zero.
+
+Real-buffer regressions cover geometry/precision accounting, allocation bounds,
+rollback/reuse, exhausted request slots, insufficient memory, partial-write
+allocation failures and recovery. With the pinned 4B pair at concurrency four,
+K=7, max length 256, batch-token limit 32 and memory fraction 0.22, all eight
+paired outputs matched and cleanup passed. There were 262 proposed tokens,
+256 verified and 118 accepted, including the cancellation/reuse probe. Peak MLX
+allocation was 4,729,488,612 bytes within the 5.04 GB configured allowance. The
+plan included 20.97 MB context, 3.28 MB capture and 194.49 MB workspace. These
+remain correctness/resource probes, not serving-speed qualification.
+
+Step 3 must attach real checkpoint precision evidence, sustained memory reuse
+and pressure/recovery results before M3 is marked complete.

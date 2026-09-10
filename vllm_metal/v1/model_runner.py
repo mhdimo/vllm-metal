@@ -85,8 +85,10 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
+from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.contracts import is_dspark_config
 from vllm_metal.v1.dspark.loader import load_drafter
+from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 from vllm_metal.v1.gemma4_mtp import (
     Gemma4MTPAssistantRuntime,
@@ -408,6 +410,7 @@ class MetalModelRunner:
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._drafter: MetalProposer | None = None
+        self._dspark_memory_plan: DSparkMemoryPlan | None = None
         # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
         # can size a scheduler-visible KV-cache group for the draft model
         # before `determine_available_memory()`/`get_kv_cache_spec()` run.
@@ -669,6 +672,62 @@ class MetalModelRunner:
         )
         if self._is_pooling:
             self._model_lifecycle.install_pooling_backend()
+        self._load_dspark_drafter()
+
+    def _load_dspark_drafter(self) -> None:
+        """Materialize DSpark before profiling and target KV capacity planning."""
+        spec = self.vllm_config.speculative_config
+        if not is_dspark_config(spec):
+            return
+        assert spec is not None and spec.draft_model_config is not None
+        if self._drafter is not None:
+            raise RuntimeError("DSpark drafter has already been loaded")
+        limit = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        if limit <= 0:
+            raise RuntimeError("DSpark requires the Metal recommended working-set size")
+        budget = int(
+            limit
+            * self.metal_config.effective_memory_fraction(
+                self.cache_config.gpu_memory_utilization
+            )
+        )
+        mx.eval(self.model.parameters())
+        mx.clear_cache()
+        draft = spec.draft_model_config
+        model, config = load_drafter(
+            draft.model,
+            revision=draft.revision,
+            memory_budget_bytes=budget - mx.get_active_memory(),
+            expected_config=DSparkConfig.from_dict(draft.hf_config.to_dict()),
+        )
+        plan = DSparkMemoryPlan.build(
+            config,
+            itemsize=model.hidden_norm.weight.itemsize,
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
+        self._dspark_memory_plan = plan
+        self._drafter = DSparkProposer(
+            drafter=model,
+            config=config,
+            runner=self,
+            controller=self._spec_decode_controller,
+            memory_plan=plan,
+            memory_budget_bytes=budget,
+        )
+        logger.info(
+            "DSpark drafter loaded for speculative decoding: %s "
+            "(block_size=%d, target_layer_ids=%s); reserved context=%.2f MB, "
+            "capture=%.2f MB, workspace=%.2f MB, context_slots=%d",
+            draft.model,
+            config.block_size,
+            config.target_layer_ids,
+            plan.context_bytes / 1e6,
+            plan.capture_bytes / 1e6,
+            plan.workspace_bytes / 1e6,
+            plan.max_contexts,
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self._lora.add_adapter(lora_request)
@@ -1006,26 +1065,10 @@ class MetalModelRunner:
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
         elif is_dspark_config(spec):
-            # Both canonical and auto-detected DSpark use upstream's resolved
-            # ModelConfig, including the revision used to inspect the checkpoint.
-            draft_config = spec.draft_model_config
-            drafter_repo = draft_config.model
-            drafter_model, drafter_cfg = load_drafter(
-                drafter_repo, revision=draft_config.revision
-            )
-            self._drafter = DSparkProposer(
-                drafter=drafter_model,
-                config=drafter_cfg,
-                runner=self,
-                controller=self._spec_decode_controller,
-            )
-            logger.info(
-                "DSpark drafter loaded for speculative decoding: %s "
-                "(block_size=%d, target_layer_ids=%s)",
-                drafter_repo,
-                drafter_cfg.block_size,
-                drafter_cfg.target_layer_ids,
-            )
+            # DSpark has no autoregressive KV group. Its weights and bounded
+            # context/workspace reservation must exist BEFORE target KV sizing.
+            if not isinstance(self._drafter, DSparkProposer):
+                raise RuntimeError("DSpark must be loaded before target KV allocation")
         elif spec.uses_draft_model():
             # `num_blocks` is the scheduler-visible committed-KV capacity for
             # the draft group (see cache_policy._draft_layer_specs); the

@@ -42,6 +42,7 @@ from vllm_metal.config import (
 )
 from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
+from vllm_metal.v1.dspark.contracts import is_dspark_config
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
@@ -228,6 +229,7 @@ class _PagedAttentionPlan:
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+    dspark_reservation_bytes: int = 0
 
     def format_breakdown(self) -> str:
         parts = [
@@ -241,6 +243,10 @@ class _PagedAttentionPlan:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
         if self.hybrid_gdn_reservation.is_hybrid:
             parts.append(self._hybrid_gdn_detail())
+        if self.dspark_reservation_bytes:
+            parts.append(
+                f"dspark_context_and_workspace={self.dspark_reservation_bytes / 1e9:.2f}GB"
+            )
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
 
@@ -250,6 +256,10 @@ class _PagedAttentionPlan:
             "use a smaller or more quantized model",
         ]
         reservation = self.hybrid_gdn_reservation
+        if self.dspark_reservation_bytes:
+            mitigations.insert(
+                0, "lower --max-num-seqs, --max-model-len or --max-num-batched-tokens"
+            )
         if reservation.enabled and reservation.max_num_seqs > 1:
             seq_mitigation = (
                 "lower --max-num-seqs (for single-user serving, try --max-num-seqs 1)"
@@ -1306,7 +1316,20 @@ class WorkerCachePlanner:
         )
         reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
-        kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+        dspark_bytes = 0
+        if is_dspark_config(self._worker.vllm_config.speculative_config):
+            dspark = self._worker.model_runner._dspark_memory_plan
+            if dspark is None:
+                raise RuntimeError(
+                    "DSpark must be loaded and budgeted before target KV allocation"
+                )
+            dspark_bytes = dspark.reserve_bytes
+        kv_budget = (
+            base_kv_budget
+            - reservation.total_bytes
+            - draft_scratch_bytes
+            - dspark_bytes
+        )
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -1319,6 +1342,7 @@ class WorkerCachePlanner:
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
+            dspark_reservation_bytes=dspark_bytes,
         )
         self._validate_paged_attention_plan(
             plan,

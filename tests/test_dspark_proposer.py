@@ -12,6 +12,7 @@ from vllm.sampling_params import SamplingParams
 from tests.stub_runner import make_stub_runner
 from tests.test_dspark_contracts import draft_hf_config
 from vllm_metal.v1.dspark.config import DSparkConfig
+from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
 from vllm_metal.v1.dspark_proposer import DSparkProposer, _DraftPlan, _RequestContext
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
@@ -26,6 +27,13 @@ def _proposer():
         config=config,
         runner=make_stub_runner(),
         controller=SpeculativeDecodeController(),
+        memory_plan=DSparkMemoryPlan.build(
+            config,
+            itemsize=4,
+            max_num_seqs=32,
+            max_model_len=2048,
+            max_num_batched_tokens=8192,
+        ),
     )
 
 
@@ -330,12 +338,15 @@ def test_ragged_and_empty_context_drafts_match_independent_rows(order):
         plan = _DraftPlan(str(length), 2, _RequestContext(owner, caches, length), cap)
         plans.append(plan)
         expected.append(proposer._batch_draft([plan])[1][0])
-    before = [[(cache.k, cache.v) for cache in plan.context.caches] for plan in plans]
+    before = [
+        [(cache._keys, cache._values) for cache in plan.context.caches]
+        for plan in plans
+    ]
     assert proposer._batch_draft(plans)[1] == expected
     # Draft block/scratch positions must never enter persistent context.
     for plan, original in zip(plans, before, strict=True):
         for cache, (key, value) in zip(plan.context.caches, original, strict=True):
-            assert cache.k is key and cache.v is value
+            assert cache._keys is key and cache._values is value
 
 
 @pytest.mark.parametrize("remaining,expected", [(1, 0), (2, 1), (4, 3)])
@@ -390,6 +401,6 @@ def test_context_checks_both_keys_and_values():
     with pytest.raises(ValueError, match="matching batch, head and token axes"):
         cache.append(mx.zeros((1, 2, 3, 8)), mx.zeros((1, 2, 2, 8)))
     cache.append(mx.zeros((1, 2, 3, 8)), mx.zeros((1, 2, 3, 8)))
-    cache.v = cache.v[:, :, :2]
+    cache._values = cache._values[:, :, :2]
     with pytest.raises(RuntimeError, match="K/V coverage disagrees"):
         cache.trim_to(1)

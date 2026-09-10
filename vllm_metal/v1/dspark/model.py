@@ -53,45 +53,97 @@ class MLP(nn.Module):
 class CtxCache:
     """Per-layer cache of the target context's projected K/V (roped K, normed/raw V).
 
-    Stores committed context. Physical trimming is available for rollback.
-    Concatenation currently copies existing context; bounded storage and buffer
-    reuse require separate memory-planning and performance qualification.
+    Only the committed prefix is exposed to attention. Storage grows in chunks
+    within the optional hard capacity and is reused across appends/rollback.
     """
 
-    __slots__ = ("k", "v")
+    __slots__ = ("_keys", "_values", "_length", "capacity")
 
-    def __init__(self):
-        self.k = None
-        self.v = None
+    def __init__(self, capacity: int | None = None):
+        if capacity is not None and capacity <= 0:
+            raise ValueError("DSpark context capacity must be positive")
+        self._keys = None
+        self._values = None
+        self._length = 0
+        self.capacity = capacity
+
+    @property
+    def k(self):
+        return None if self._keys is None else self._keys[:, :, : self.length]
+
+    @property
+    def v(self):
+        return None if self._values is None else self._values[:, :, : self.length]
+
+    @property
+    def allocated_bytes(self) -> int:
+        if self._keys is None:
+            return 0
+        return self._keys.nbytes + self._values.nbytes
 
     def append(self, k: mx.array, v: mx.array) -> None:
         if k.ndim != 4 or v.ndim != 4 or k.shape[:3] != v.shape[:3]:
             raise ValueError(
                 "context K/V must cover matching batch, head and token axes"
             )
-        if self.k is None:
-            self.k, self.v = k, v
-        else:
-            self.k = mx.concatenate([self.k, k], axis=2)
-            self.v = mx.concatenate([self.v, v], axis=2)
+        start = self.length
+        end = start + k.shape[2]
+        if self.capacity is not None and end > self.capacity:
+            raise ValueError("DSpark context append exceeds reserved capacity")
+        if self._keys is not None:
+            for old, new in ((self._keys, k), (self._values, v)):
+                if (
+                    old.shape[:2] != new.shape[:2]
+                    or old.shape[-1] != new.shape[-1]
+                    or old.dtype != new.dtype
+                ):
+                    raise ValueError("DSpark context append changes geometry or dtype")
+        allocated = 0 if self._keys is None else self._keys.shape[2]
+        if end > allocated:
+            from .memory import CONTEXT_ALIGNMENT
+
+            length = (
+                (end + CONTEXT_ALIGNMENT - 1) // CONTEXT_ALIGNMENT * CONTEXT_ALIGNMENT
+            )
+            if self.capacity is not None:
+                length = min(length, self.capacity)
+            shape = (*k.shape[:2], length - allocated)
+            keys = mx.zeros((*shape, k.shape[-1]), dtype=k.dtype)
+            values = mx.zeros((*shape, v.shape[-1]), dtype=v.dtype)
+            self._keys = (
+                keys
+                if self._keys is None
+                else mx.concatenate([self._keys, keys], axis=2)
+            )
+            self._values = (
+                values
+                if self._values is None
+                else mx.concatenate([self._values, values], axis=2)
+            )
+        if end > start:
+            self._keys[:, :, start:end] = k
+            self._values[:, :, start:end] = v
+        self._length = end
 
     def trim_to(self, length: int) -> None:
         """Retain a physical prefix; its keys keep their absolute RoPE positions."""
         if not 0 <= length <= self.length:
             raise ValueError("context trim must retain an existing prefix")
-        if self.k is not None and length < self.k.shape[2]:
-            self.k = self.k[:, :, :length, :]
-            self.v = self.v[:, :, :length, :]
+        self._length = length
 
     @property
     def length(self) -> int:
-        if self.k is None:
-            if self.v is not None:
+        if self._keys is None:
+            if self._values is not None or self._length:
                 raise RuntimeError("DSpark context has values without keys")
             return 0
-        if self.v is None or self.k.shape[:3] != self.v.shape[:3]:
+        if (
+            self._values is None
+            or self._keys.shape[:3] != self._values.shape[:3]
+            or not 0 <= self._length <= self._keys.shape[2]
+        ):
             raise RuntimeError("DSpark context K/V coverage disagrees")
-        return self.k.shape[2]
+        return self._length
 
 
 class DSparkAttention(nn.Module):
@@ -336,11 +388,16 @@ class DSparkDrafter(nn.Module):
     def fuse_target(self, target_hidden_cat: mx.array) -> mx.array:
         return self.hidden_norm(self.fc(target_hidden_cat))
 
-    def make_ctx_cache(self) -> list[CtxCache]:
-        return [CtxCache() for _ in self.layers]
+    def make_ctx_cache(self, capacity: int | None = None) -> list[CtxCache]:
+        return [CtxCache(capacity) for _ in self.layers]
 
     def update_context(self, target_hidden_cat, ctx_offset, ctx_caches) -> None:
-        fused = self.fuse_target(target_hidden_cat)
+        # Use the drafter's qualified compute precision. Mixing BF16 draft
+        # weights with FP16 target features can otherwise promote persistent
+        # context to FP32 and invalidate the memory plan.
+        fused = self.fuse_target(
+            target_hidden_cat.astype(self.hidden_norm.weight.dtype)
+        )
         for layer, cache in zip(self.layers, ctx_caches, strict=True):
             layer.self_attn.update_ctx(fused, ctx_offset, cache)
 
