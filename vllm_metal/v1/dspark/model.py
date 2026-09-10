@@ -65,6 +65,10 @@ class CtxCache:
         self.v = None
 
     def append(self, k: mx.array, v: mx.array) -> None:
+        if k.ndim != 4 or v.ndim != 4 or k.shape[:3] != v.shape[:3]:
+            raise ValueError(
+                "context K/V must cover matching batch, head and token axes"
+            )
         if self.k is None:
             self.k, self.v = k, v
         else:
@@ -72,16 +76,22 @@ class CtxCache:
             self.v = mx.concatenate([self.v, v], axis=2)
 
     def trim_to(self, length: int) -> None:
-        """Keep only the first ``length`` context positions (seq axis) — used by prefix
-        caching to roll the drafter context back to a shared prefix. The retained K was
-        roped at its absolute position, so it stays valid after the trim."""
+        """Retain a physical prefix; its keys keep their absolute RoPE positions."""
+        if not 0 <= length <= self.length:
+            raise ValueError("context trim must retain an existing prefix")
         if self.k is not None and length < self.k.shape[2]:
             self.k = self.k[:, :, :length, :]
             self.v = self.v[:, :, :length, :]
 
     @property
     def length(self) -> int:
-        return 0 if self.k is None else self.k.shape[2]
+        if self.k is None:
+            if self.v is not None:
+                raise RuntimeError("DSpark context has values without keys")
+            return 0
+        if self.v is None or self.k.shape[:3] != self.v.shape[:3]:
+            raise RuntimeError("DSpark context K/V coverage disagrees")
+        return self.k.shape[2]
 
 
 class DSparkAttention(nn.Module):

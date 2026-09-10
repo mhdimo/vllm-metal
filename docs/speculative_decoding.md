@@ -97,18 +97,19 @@ VLLM_METAL_MEMORY_FRACTION=0.55 \
 
 ## DSpark
 
-The `Dspark` branch currently contains an experimental implementation with open
-correctness and serving-integration findings. See the
+The `Dspark` branch contains an experimental implementation with validated
+Qwen3 target capture and context lifecycle foundations. See the
 [implementation specification and roadmap](design/dspark.md) and
 [validation/experiment handoff](design/dspark-validation.md) before treating this
-path as production-ready. The example below describes the prototype.
+path as production-ready, and the [milestone results](design/dspark-progress.md)
+for the bounded 4B checks already completed.
 
 DSpark uses a parallel backbone with a sequential prediction head. A small
 backbone cross-attends over the *target's* fused intermediate-layer hidden
 states (selected by the drafter's `target_layer_ids`), proposes a 7-token
 block, and applies a rank-256 Markov head for previous-token correction in the
 standalone checkpoints listed below. Correct target verification is required
-to preserve output; the current integration has open correctness findings.
+to preserve output; model, memory and performance qualification remain necessary.
 
 A DSpark drafter is **trained per target** — it consumes that target's
 hidden states and predicts that target's continuations, so it only works for
@@ -133,12 +134,14 @@ For targets without a matched DSpark drafter, use [N-gram](#n-gram)
 # Prototype diagnostic example; not a production-qualified configuration.
 # vLLM 0.28 selects its GPU V2 path for DSpark unless explicitly overridden.
 VLLM_USE_V2_MODEL_RUNNER=0 \
-VLLM_METAL_MEMORY_FRACTION=0.35 \
+VLLM_METAL_MEMORY_FRACTION=0.12 \
 vllm serve mlx-community/Qwen3-4B-4bit \
-  --max-model-len 2048 \
-  --max-num-seqs 1 \
+  --revision 4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25 \
+  --max-model-len 256 \
+  --max-num-batched-tokens 32 \
+  --max-num-seqs 4 \
   --no-async-scheduling \
-  --speculative-config '{"method":"dspark","model":"deepseek-ai/dspark_qwen3_4b_block7","num_speculative_tokens":2}'
+  --speculative-config '{"method":"dspark","model":"deepseek-ai/dspark_qwen3_4b_block7","revision":"3457dff1417cb84927f6098a5fcb7cee85c934b7","num_speculative_tokens":2}'
 ```
 
 The drafter can be an HF repo id or a local path. K=2 is an example, not a
@@ -164,8 +167,9 @@ Draft acceptance rate` reflects the live acceptance.
 - **Greedy only**, like every Metal spec-decode method.
 - **Batched drafting.** The backbone runs across selected requests with padded
   per-request contexts; the current fixed admission cap is 32 requests.
-- **Prefix/chunk handling needs qualification.** Prompt replay and partial
-  prefill capture have open position-coverage and performance findings.
+- **Contiguous context.** Every prefill chunk contributes features, including
+  no-sample steps. Missing features on a target prefix-cache hit use target-only
+  generation; the proposer does not replay full prompts or share private KV.
 
 ### Limitations
 

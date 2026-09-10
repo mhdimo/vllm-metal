@@ -233,8 +233,11 @@ and has no target hidden state yet. Rejected or unverified suffix rows must neve
 enter persistent draft context. The official [evaluator update][evaluator]
 implements this row relationship.
 
-Maintain one request state record with generation/epoch, physical context length,
-covered absolute position range, pending feature chunks, and proposal provenance.
+Maintain one request state record with generation identity, physical context
+length and covered absolute position range. M2 uses the runner's `RequestState`
+object as that identity and ingests chunks immediately, so no pending feature
+stash is needed. Future stochastic modes additionally require proposal
+distribution/provenance ownership (M5).
 At each ingest, the incoming start position must equal the coverage end. On a
 gap, duplicate span, rollback or changed identity, discard/rebuild or skip
 speculation; do not repair just the length counter. If retaining a prefix, trim
@@ -499,9 +502,11 @@ tests, reproducible model-pair parity and useful serving measurements. Performan
 claims need before/after artifacts under the project's
 [contribution requirements](../CONTRIBUTING.md).
 
-The next implementation should start with M0/M1 and the reproduced mixed-batch
-logits defect. Passing small draft-model parity checks supports continuing this
-work; it does not justify skipping the serving integration fixes.
+M0-M2 implement the contract, native capture and exact context lifecycle; their
+[progress and validation record](dspark-progress.md) identifies the tested
+envelope. M3 memory/precision qualification and M4 fixed greedy serving remain
+the next gates. These foundation milestones do not establish production
+performance or complete the later stochastic/confidence work.
 
 ## Primary sources
 
