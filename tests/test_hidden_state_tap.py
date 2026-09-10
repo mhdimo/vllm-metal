@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx_lm.models.qwen3 import Qwen3Model
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
@@ -40,12 +40,14 @@ class _AddLayer:
         return h + self.i
 
 
-def _toy_backbone(num_layers: int) -> SimpleNamespace:
-    return SimpleNamespace(
-        embed_tokens=_Embed(),
-        layers=[_AddLayer(i) for i in range(num_layers)],
-        norm=_Id(),
-    )
+def _toy_backbone(num_layers: int) -> Qwen3Model:
+    # Drive the real native Qwen3 body with easily checked layer arithmetic.
+    body = Qwen3Model.__new__(Qwen3Model)
+    nn.Module.__init__(body)
+    body.embed_tokens = _Embed()
+    body.layers = [_AddLayer(i) for i in range(num_layers)]
+    body.norm = _Id()
+    return body
 
 
 # --- capture_layer_hidden_states (fused-only view) ---
@@ -186,3 +188,87 @@ def test_target_forward_none_path_does_not_capture(monkeypatch) -> None:
 
     assert capture_calls["n"] == 0
     assert fwd_calls["n"] == 1
+
+
+@pytest.mark.parametrize("layer_ids", [[2, 0], [1, 1]])
+def test_capture_rejects_reordered_or_duplicate_features(layer_ids):
+    with pytest.raises(ValueError, match="strictly increasing"):
+        run_backbone_with_capture(
+            _toy_backbone(3), mx.array([[1]]), cache=None, layer_ids=layer_ids
+        )
+
+
+def test_capture_rejects_unqualified_body_and_incomplete_cache():
+    with pytest.raises(NotImplementedError, match="Qwen3Model"):
+        run_backbone_with_capture(object(), mx.array([[1]]), cache=None, layer_ids=[0])
+    with pytest.raises(ValueError, match="one entry per decoder layer"):
+        run_backbone_with_capture(
+            _toy_backbone(3), mx.array([[1]]), cache=[None], layer_ids=[0]
+        )
+
+
+def test_capture_keeps_native_body_and_live_layers_on_success_and_failure():
+    body = _toy_backbone(3)
+    layers = body.layers
+    # Native final normalization must still run, independently of fused taps.
+    body.norm = lambda h: h * 2
+    ids = mx.array([[2.0, 4.0]])
+    final, fused = run_backbone_with_capture(body, ids, cache=None, layer_ids=[0, 2])
+    assert mx.array_equal(final, body(ids))
+    assert mx.array_equal(fused[..., 1:], final / 2)
+    assert body.layers is layers
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("layer failed")
+
+    layers[1] = fail
+    with pytest.raises(RuntimeError, match="layer failed"):
+        run_backbone_with_capture(body, ids, cache=None, layer_ids=[0, 2])
+    assert body.layers is layers
+    assert isinstance(body.layers[0], _AddLayer)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("select", [False, True])
+@pytest.mark.parametrize("collect_final", [False, True])
+def test_all_capture_hidden_and_logits_layout_combinations(
+    capture, select, collect_final
+):
+    from types import SimpleNamespace
+
+    from vllm_metal.v1.model_adapter import DefaultModelAdapter
+
+    body = _toy_backbone(3)
+    body.norm = lambda h: h * 2
+    model = SimpleNamespace(model=body, lm_head=lambda h: h + 1)
+
+    # The no-capture/no-hidden/full-logits route calls the model directly.
+    class Target:
+        def __init__(self):
+            self.model = model.model
+            self.lm_head = model.lm_head
+
+        def __call__(self, ids, cache=None):
+            return self.lm_head(self.model(ids, cache=cache))
+
+    target = Target()
+    ids = mx.arange(12, dtype=mx.float32)[None]
+    selection = mx.array([0, 1, 2, 6, 11]) if select else None
+    output = DefaultModelAdapter().target_forward(
+        target,
+        ids,
+        collect_hidden_states=collect_final,
+        logits_indices=selection,
+        capture_layer_ids=[0, 2] if capture else None,
+    )
+    expected_logits = target(ids)
+    if select:
+        expected_logits = expected_logits[:, selection]
+    assert mx.array_equal(output.logits, expected_logits)
+    if capture:
+        expected_features = mx.stack([ids[0], ids[0] + 3], axis=-1)
+        assert mx.array_equal(output.hidden_states, expected_features)
+    elif collect_final:
+        assert mx.array_equal(output.hidden_states, body(ids)[0])
+    else:
+        assert output.hidden_states is None

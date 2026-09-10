@@ -137,7 +137,7 @@ class TestDSparkProtocol:
     @pytest.mark.parametrize(
         "segments, expected",
         [
-            ([], False),
+            ([], True),
             ([_segment("r0")], True),
             ([_segment("r0"), _segment("r1")], True),
         ],

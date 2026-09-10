@@ -7,8 +7,8 @@ and serving qualification gates pass.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
-| M0: Baseline and contract | Implemented and locally validated | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions track the remaining M1/M2 failures. |
-| M1: Target capture | Planned | Native Qwen3 capture, selected logits and complete prefill feature spans. |
+| M0: Baseline and contract | [Merged: #1](https://github.com/mhdimo/vllm-metal/pull/1) | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions track the remaining M1/M2 failures. |
+| M1: Target capture | Implemented and locally validated | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | Planned | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3-M8 | Planned | Loading/resource qualification, serving, stochastic verification, confidence scheduling and additional model pairs. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
@@ -48,3 +48,47 @@ Each milestone PR records the exact tested head and local check results. Runtime
 and reference environments remain separate, and real-model tests must record
 immutable target/draft revisions. The available execution machines remain the
 M4 32 GB and M5 Max 48 GB RAM / 2 TB storage.
+
+## M1: Native target capture
+
+Capture executes the loaded Qwen3 body's native forward through a shallow body
+copy with local layer observers. Weights and attention modules are shared; the
+live target's layer list and parameter tree are unchanged. Native embedding,
+masking, RoPE, cache writes and final normalization remain intact. Unsupported
+body families, unordered/duplicate feature IDs and incomplete cache lists fail
+explicitly. Other target families still require a separately qualified adapter.
+
+Feature capture and logits selection are independent. Every packed feature row
+is retained, while the head projects exactly the requested logits rows. Pure
+intermediate prefill steps can collect features without projecting logits or
+sampling. Their proposer handoff uses the existing absolute positions in
+`PrefillRequest.start_pos`, `PagedDecodeSegment.cache_start_pos`, and the packed
+row boundaries in `ProposeContext.cu_seqlens`. No duplicate position DTO is needed.
+Prompt-logprobs requests retain their full-head path and still receive features.
+M2 is responsible for ingesting these spans into persistent context.
+
+The F1 strict expected failure is now a passing regression. Tests cover all
+capture/hidden/logits-selection combinations, native final normalization,
+exception cleanup, multiple no-sample prefill spans and actual paged KV writes.
+The full non-slow suite passed 2,233 tests (15 skipped, 53 deselected), with only
+the two M2 strict expected failures remaining. Ruff check/format, mypy and the
+strict documentation build passed.
+
+The real Qwen3-4B-4bit target at revision
+`4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25` passed 12 bit-exact capture-on/off
+comparisons on M4 32 GB with MLX 0.32.1 and mlx-lm 0.32.0. These covered native
+incremental chunks of 1/7/5/3 tokens and a packed three-token verification
+window with two prefill chunks, full/selected logits and both paged window
+layouts. Every physical target KV buffer matched. Peak MLX allocation was
+2,562,400,880 bytes; this is a capture test, not a serving memory budget or a
+speedup result. The official draft configuration was pinned at
+`3457dff1417cb84927f6098a5fcb7cee85c934b7`; no drafter weights were loaded.
+
+Repeat with already downloaded snapshots:
+
+```bash
+VLLM_METAL_BUILD_FROM_SOURCE=1 python -m tools.dspark_target_check \
+  --target /path/to/pinned/Qwen3-4B-4bit \
+  --draft-config /path/to/pinned/dspark_qwen3_4b_block7/config.json \
+  --output target-capture-results.json
+```

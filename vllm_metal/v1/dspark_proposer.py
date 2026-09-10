@@ -117,11 +117,9 @@ class DSparkProposer:
         *,
         has_final_prefill: bool,
     ) -> bool:
-        # Decode-only: capture fused hidden each step for context growth.
-        # Prefill uses the fast backbone() path (no capture overhead).
-        # New-request prompt seeding is done via _seed_prompts_batched —
-        # one batched forward instead of 100 serial _seed_prompt calls.
-        return bool(decode_segments)
+        # Every scheduled span contributes context, including intermediate
+        # prefill chunks and steps where drafting is temporarily disabled.
+        return True
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens
