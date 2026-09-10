@@ -9,6 +9,13 @@ import numpy as np
 import pytest
 import torch
 
+# MLX 0.32 runs multi-row FP32 matmuls on M5-class tensor units at TF32
+# precision unless told otherwise (8e-4 relative error measured on an M5 Max
+# against 4e-7 for one row). The FP32 oracles in this suite assume true FP32,
+# so pin the switch before any test module imports mlx.core. Serving keeps
+# MLX's default; tests/test_metal_numerics.py guards this contract.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
 
 def _get_test_seed() -> int:
     """Return the deterministic seed used across tests.

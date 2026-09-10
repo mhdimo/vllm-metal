@@ -11,15 +11,20 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-import mlx.core as mx
-import numpy as np
-import torch
+# The 1e-5 FP32 gate below needs true FP32 GEMM; MLX 0.32 defaults to TF32 for
+# multi-row FP32 matmuls on M5-class GPUs. Pin before mlx.core loads.
+os.environ.setdefault("MLX_ENABLE_TF32", "0")
+
+import mlx.core as mx  # noqa: E402
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 REFERENCE_COMMIT = "005e03b81cec38b7da6399833d609ee89a2587f2"
 

@@ -174,6 +174,38 @@ serving stack while claiming to reproduce M3. Record any necessary change and
 repeat the appropriate correctness gates. Recreate environments and build caches
 on M5 Max; do not transfer the M4 virtual environment or native binaries.
 
+### M5 Max numerics: TF32 is the FP32 GEMM default
+
+Measured on the M5 Max (applegpu_g17s, MLX 0.32.1, checkout `4af9a92`) with a
+2,560-square random matmul against a float64 reference:
+
+| Operation | Rows | Relative error / difference |
+| --- | --- | --- |
+| FP32 matmul, MLX default | 1 | 4e-7 |
+| FP32 matmul, MLX default | 8 | 8e-4 |
+| FP32 matmul, `MLX_ENABLE_TF32=0` | 8 | 9e-7 |
+| BF16 matmul, 8 rows vs 1 row | 8 | 9.5e-4 (unchanged by the switch) |
+| Affine 4-bit/group-64 matmul, 8 rows vs 1 row | 8 | 7.8e-3 (unchanged by the switch) |
+
+Multi-row FP32 matmuls run on the tensor units at TF32-class precision unless
+`MLX_ENABLE_TF32=0` is set before MLX loads; `MLX_METAL_GPU_ARCH` overrides the
+same dispatch. The BF16 and quantized row-count differences are intrinsic to
+the M=1 and M>1 kernels and exist on every Apple GPU; they are the mechanism
+behind near-tie token flips between single-row decode and multi-row verify.
+Consequences:
+
+- `tests/conftest.py` and `tools/dspark_reference_check.py` pin
+  `MLX_ENABLE_TF32=0`, because their FP32 oracles gate at 1e-5 or 2e-5.
+  `tests/test_metal_numerics.py` fails if the pin stops holding.
+- Serving keeps MLX's default. The serving path is BF16 and affine 4-bit, so
+  the switch is not a serving-parity tool; record which setting an experiment
+  used whenever an FP32 array is compared.
+- Do not loosen an FP32 oracle tolerance to absorb TF32; fix the environment.
+
+The first M5 Max environment used CPython 3.12.12: uv 0.9.18, which
+`scripts/lib.sh` installs, has no download for 3.12.13. Record the interpreter
+in every `environment.json`; no numerical result here depends on the patch level.
+
 ```bash
 export DSPARK_DATA="$HOME/DSpark-data"
 export DSPARK_RUN="$DSPARK_DATA/results/m5max-baseline-01"
@@ -320,6 +352,10 @@ The final M3 source passed **2,315 tests, 15 skipped, 53 deselected**, with no
 expected failures; Ruff, mypy (145 source files), shellcheck and strict docs also
 passed on the source machine. Investigate changed results, especially device
 specific kernel tests; do not simply copy the old count into new evidence.
+On the M5 Max at `4af9a92` the same suite gave 2,310 passed and 5 failed at
+MLX defaults (four `test_dspark_proposer.py` context-parity cases and one
+Whisper feature case, all FP32 oracles); with `MLX_ENABLE_TF32=0` every one
+passes. Ruff, mypy, shellcheck and the strict docs build passed unchanged.
 The repository's complete `scripts/test.sh` additionally builds/verifies the
 wheel and runs two ordinary target-serving smokes, which download their own
 pinned small targets. Preserve that flow for packaging/runtime changes:
