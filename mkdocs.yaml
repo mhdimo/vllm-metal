@@ -75,4 +75,7 @@ nav:
     - Turboquant: turboquant.md
     - GPU Profiling: profiling.md
     - Distributed (Ray): distributed.md
-  - Contributing: CONTRIBUTING.md
+  - Contributing:
+    - Contribution Guide: CONTRIBUTING.md
+    - DSpark Implementation Plan: design/dspark.md
+    - DSpark Validation: design/dspark-validation.md

@@ -8,10 +8,10 @@ for method behavior and configuration details.
 |---|---|---|---|---|
 | `--speculative-config` method | `mtp` | `dspark` | `draft_model` | `ngram` |
 | Target models | Gemma4 | Qwen3 4B/8B/14B (needs a matched drafter) | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
-| Draft source | Matching Gemma4 assistant checkpoint | DeepSeek EAGLE3+Markov drafter (consumes target hidden states) | Separate smaller model | Prompt and output token history |
-| `num_speculative_tokens` | Configurable (2–3 typical) | 2 (recommended) | Configurable (3–5 typical) | Configurable (3–5 typical) |
+| Draft source | Matching Gemma4 assistant checkpoint | Parallel backbone and sequential Markov head (consumes target hidden states) | Separate smaller model | Prompt and output token history |
+| `num_speculative_tokens` | Configurable (2–3 typical) | Up to checkpoint block size; qualification pending | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | Drafter checkpoint | Draft model | None |
-| Additional KV cache | None; reads target KV | None; reads target hidden states, plus a small proposer-owned context KV | Second scheduler-managed cache | None |
+| Additional KV cache | None; reads target KV | Proposer-owned context KV; currently unbudgeted | Second scheduler-managed cache | None |
 
 All four methods currently have these Metal-specific constraints:
 
@@ -97,22 +97,32 @@ VLLM_METAL_MEMORY_FRACTION=0.55 \
 
 ## DSpark
 
-DSpark is DeepSeek's EAGLE-family speculative-decoding drafter. A small
+The `Dspark` branch currently contains an experimental implementation with open
+correctness and serving-integration findings. See the
+[implementation specification and roadmap](design/dspark.md) and
+[validation/experiment handoff](design/dspark-validation.md) before treating this
+path as production-ready. The example below describes the prototype.
+
+DSpark uses a parallel backbone with a sequential prediction head. A small
 backbone cross-attends over the *target's* fused intermediate-layer hidden
 states (selected by the drafter's `target_layer_ids`), proposes a 7-token
-block, and applies a rank-256 Markov head for previous-token correction. The
-target verifies every token, so output is greedy-identical up to
-floating-point tie-breaking.
+block, and applies a rank-256 Markov head for previous-token correction in the
+standalone checkpoints listed below. Correct target verification is required
+to preserve output; the current integration has open correctness findings.
 
 A DSpark drafter is **trained per target** — it consumes that target's
 hidden states and predicts that target's continuations, so it only works for
 models with a published matched drafter:
 
-| Target | DSpark drafter |
+| Trained target | DSpark drafter |
 | --- | --- |
-| `mlx-community/Qwen3-4B-4bit` (or any quant) | `deepseek-ai/dspark_qwen3_4b_block7` |
-| `mlx-community/Qwen3-8B-8bit` (or any quant) | `deepseek-ai/dspark_qwen3_8b_block7` |
-| `mlx-community/Qwen3-14B-8bit` (or any quant) | `deepseek-ai/dspark_qwen3_14b_block7` |
+| `Qwen/Qwen3-4B` | `deepseek-ai/dspark_qwen3_4b_block7` |
+| `Qwen/Qwen3-8B` | `deepseek-ai/dspark_qwen3_8b_block7` |
+| `Qwen/Qwen3-14B` | `deepseek-ai/dspark_qwen3_14b_block7` |
+
+These pairings are from the [official DeepSpec release](https://github.com/deepseek-ai/DeepSpec/blob/005e03b81cec38b7da6399833d609ee89a2587f2/README.md).
+Quantized target/draft combinations need their own correctness and performance
+qualification. Gemma4 and integrated DeepSeek-V4 are separate roadmap milestones.
 
 For targets without a matched DSpark drafter, use [N-gram](#n-gram)
 (model-agnostic) instead.
@@ -120,10 +130,10 @@ For targets without a matched DSpark drafter, use [N-gram](#n-gram)
 ### Serve
 
 ```bash
-# DSpark requires the V1 model runner — Metal has no Triton, and vLLM 0.25.1's
-# native DSpark path forces Model Runner V2, which errors without it.
+# Prototype diagnostic example; not a production-qualified configuration.
+# vLLM 0.28 selects its GPU V2 path for DSpark unless explicitly overridden.
 VLLM_USE_V2_MODEL_RUNNER=0 \
-VLLM_METAL_MEMORY_FRACTION=0.8 \
+VLLM_METAL_MEMORY_FRACTION=0.35 \
 vllm serve mlx-community/Qwen3-4B-4bit \
   --max-model-len 2048 \
   --max-num-seqs 1 \
@@ -131,9 +141,9 @@ vllm serve mlx-community/Qwen3-4B-4bit \
   --speculative-config '{"method":"draft_model","model":"deepseek-ai/dspark_qwen3_4b_block7","num_speculative_tokens":2}'
 ```
 
-The drafter can be an HF repo id or a local path. `num_speculative_tokens=2`
-is the measured optimum on Apple Silicon (the verify cost grows with each
-accepted token, so longer blocks rarely pay).
+The drafter can be an HF repo id or a local path. K=2 is an example, not a
+hardware-wide optimum. Use immutable local snapshots for reproducible prototype
+experiments: the current loader does not forward the requested draft revision.
 
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,
@@ -143,20 +153,21 @@ Draft acceptance rate` reflects the live acceptance.
 ### Characteristics
 
 - **Greedy only**, like every Metal spec-decode method.
-- **Prefix-caching compatible.** DSpark re-runs a tapped target forward to
-  seed the drafter context at first draft, so it does not require
-  `--no-enable-prefix-caching`.
-- **Per-request drafting in v1.** Each request's drafter context is drafted
-  independently; a batched drafter forward is a follow-up.
+- **Batched drafting.** The backbone runs across selected requests with padded
+  per-request contexts; the current fixed admission cap is 32 requests.
+- **Prefix/chunk handling needs qualification.** Prompt replay and partial
+  prefill capture have open position-coverage and performance findings.
 
 ### Limitations
 
-- **Per-target drafters.** No drafter is published for Llama, Mistral, Phi, or
-  other families — DSpark cannot accelerate them. Use N-gram for those.
-- **Floating-point tie-breaking.** On near-ties the multi-token verify
-  forward may flip an argmax the single-token baseline would not, so output
-  is greedy-*identical up to fp ties*, not bit-identical on every prompt.
-- **Drafter context grows with generation length** in v1 (no eviction yet).
+- **Matched models required.** Do not infer support for another target from a
+  similar model name or tensor shape.
+- **Incomplete DSpark features.** Stochastic verification, calibrated confidence
+  scheduling and bounded draft memory remain roadmap work.
+- **Context grows with generation length.** Padded batch copies add to peak
+  memory; a lower memory fraction is not a complete resource budget.
+- **Output parity requires validation.** Investigate every divergence, including
+  target logits layout and cache state, before attributing it to numerical ties.
 
 ---
 

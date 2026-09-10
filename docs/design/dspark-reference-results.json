@@ -1,0 +1,234 @@
+{
+  "reference_commit": "005e03b81cec38b7da6399833d609ee89a2587f2",
+  "dtype": "float32",
+  "numpy_seed": 11,
+  "torch_seed": 7,
+  "tolerance": {
+    "atol": 1e-05,
+    "rtol": 1e-05
+  },
+  "versions": {
+    "torch": "2.13.0",
+    "transformers": "5.10.2",
+    "tokenizers": "0.22.2",
+    "mlx": "0.32.1",
+    "mlx-lm": "0.32.0",
+    "vllm": "0.28.0+cpu"
+  },
+  "results": [
+    {
+      "family": "qwen3",
+      "config": {
+        "transformers_version": "5.10.2",
+        "architectures": null,
+        "output_hidden_states": false,
+        "return_dict": true,
+        "dtype": null,
+        "chunk_size_feed_forward": 0,
+        "is_encoder_decoder": false,
+        "id2label": {
+          "0": "LABEL_0",
+          "1": "LABEL_1"
+        },
+        "label2id": {
+          "LABEL_0": 0,
+          "LABEL_1": 1
+        },
+        "problem_type": null,
+        "vocab_size": 64,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "hidden_act": "silu",
+        "max_position_embeddings": 128,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-06,
+        "use_cache": true,
+        "tie_word_embeddings": false,
+        "rope_parameters": {
+          "rope_theta": 1000000.0,
+          "rope_type": "default"
+        },
+        "attention_bias": false,
+        "use_sliding_window": false,
+        "sliding_window": null,
+        "max_window_layers": 28,
+        "layer_types": [
+          "full_attention",
+          "full_attention"
+        ],
+        "attention_dropout": 0.0,
+        "pad_token_id": null,
+        "bos_token_id": null,
+        "eos_token_id": null,
+        "_name_or_path": "",
+        "target_layer_ids": [
+          0,
+          2
+        ],
+        "num_target_layers": 4,
+        "block_size": 7,
+        "mask_token_id": 63,
+        "num_anchors": 2,
+        "enable_confidence_head": true,
+        "confidence_head_with_markov": true,
+        "markov_rank": 8,
+        "markov_head_type": "vanilla",
+        "model_type": "qwen3",
+        "output_attentions": false
+      },
+      "cases": [
+        {
+          "context_length": 1,
+          "hidden_max_abs": 5.960464477539062e-07,
+          "logits_max_abs": 8.940696716308594e-08,
+          "confidence_max_abs": 2.2351741790771484e-08,
+          "draft_tokens_equal": true
+        },
+        {
+          "context_length": 5,
+          "hidden_max_abs": 4.76837158203125e-07,
+          "logits_max_abs": 8.940696716308594e-08,
+          "confidence_max_abs": 5.960464477539063e-08,
+          "draft_tokens_equal": true
+        },
+        {
+          "incremental_hidden_max_abs": 4.76837158203125e-07
+        },
+        {
+          "context_length": 9,
+          "hidden_max_abs": 3.5762786865234375e-07,
+          "logits_max_abs": 8.940696716308594e-08,
+          "confidence_max_abs": 5.960464477539063e-08,
+          "draft_tokens_equal": true
+        }
+      ],
+      "ragged_tokens_equal": true
+    },
+    {
+      "family": "gemma4",
+      "config": {
+        "transformers_version": "5.10.2",
+        "architectures": null,
+        "output_hidden_states": false,
+        "return_dict": true,
+        "dtype": null,
+        "chunk_size_feed_forward": 0,
+        "is_encoder_decoder": false,
+        "id2label": {
+          "0": "LABEL_0",
+          "1": "LABEL_1"
+        },
+        "label2id": {
+          "LABEL_0": 0,
+          "LABEL_1": 1
+        },
+        "problem_type": null,
+        "vocab_size": 64,
+        "hidden_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "max_position_embeddings": 128,
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-06,
+        "use_cache": true,
+        "pad_token_id": 0,
+        "eos_token_id": 1,
+        "bos_token_id": 2,
+        "tie_word_embeddings": false,
+        "rope_parameters": {
+          "full_attention": {
+            "rope_type": "proportional",
+            "rope_theta": 1000000.0,
+            "partial_rotary_factor": 0.25
+          },
+          "sliding_attention": {
+            "rope_type": "default",
+            "rope_theta": 10000.0
+          },
+          "rope_type": "default",
+          "rope_theta": null
+        },
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "sliding_window": 512,
+        "layer_types": [
+          "full_attention",
+          "full_attention"
+        ],
+        "final_logit_softcapping": 30.0,
+        "use_bidirectional_attention": null,
+        "vocab_size_per_layer_input": 262144,
+        "hidden_size_per_layer_input": 0,
+        "num_global_key_value_heads": 1,
+        "global_head_dim": 8,
+        "attention_k_eq_v": true,
+        "num_kv_shared_layers": 0,
+        "enable_moe_block": false,
+        "use_double_wide_mlp": false,
+        "num_experts": null,
+        "top_k_experts": null,
+        "moe_intermediate_size": null,
+        "_name_or_path": "",
+        "target_layer_ids": [
+          0,
+          2
+        ],
+        "num_target_layers": 4,
+        "block_size": 7,
+        "mask_token_id": 63,
+        "num_anchors": 2,
+        "enable_confidence_head": true,
+        "confidence_head_with_markov": true,
+        "markov_rank": 8,
+        "markov_head_type": "vanilla",
+        "model_type": "gemma4_text",
+        "output_attentions": false
+      },
+      "cases": [
+        {
+          "context_length": 1,
+          "hidden_max_abs": 3.635883331298828e-06,
+          "logits_max_abs": 3.427267074584961e-07,
+          "confidence_max_abs": 1.7136335372924805e-07,
+          "draft_tokens_equal": true
+        },
+        {
+          "context_length": 5,
+          "hidden_max_abs": 2.0265579223632812e-06,
+          "logits_max_abs": 3.5762786865234375e-07,
+          "confidence_max_abs": 5.21540641784668e-08,
+          "draft_tokens_equal": true
+        },
+        {
+          "incremental_hidden_max_abs": 4.410743713378906e-06
+        },
+        {
+          "context_length": 9,
+          "hidden_max_abs": 2.3692846298217773e-06,
+          "logits_max_abs": 3.129243850708008e-07,
+          "confidence_max_abs": 1.1920928955078125e-07,
+          "draft_tokens_equal": true
+        }
+      ],
+      "ragged_tokens_equal": true
+    }
+  ],
+  "implementation_commit": "eea6f8194828dda88186277312527a36c131367a",
+  "hardware": {
+    "device": "Apple M4",
+    "unified_memory_gib": 32,
+    "macos": "15.6",
+    "reference_device": "cpu"
+  },
+  "mlx_lm_revision": "9e6acca691e64d6d8bb808c328fcdea459099cca",
+  "scope": "Tiny randomly initialized FP32 standalone drafters with copied reference weights; no target checkpoint, quantization or serving validation.",
+  "test_harness_sha256": "aa99027f5e5bf47029522edee7e09a6c1655d9fb948d9e5aa31f70c7c2667d3b"
+}
