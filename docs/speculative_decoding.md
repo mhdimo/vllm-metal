@@ -168,6 +168,15 @@ repeats) and applies the M4a tie rule to every divergence; see the
 [progress record](design/dspark-progress.md). The Metal platform rejects
 `min_tokens` on every server, speculative or not.
 
+Fixed-K performance on M5 Max with the 4B pair (see the progress record for
+the protocol and every cell): at one request, `num_speculative_tokens` 2-4
+raises output tokens per second by 36-49% on 128-token prompts and by 10-14%
+on 1,024-token prompts against a target-only server; at four concurrent
+requests every width is 4-28% slower than target-only because the multi-row
+verification forward is expensive on this path, and the streamed
+inter-arrival gap widens because a verified block arrives as one chunk. Use
+DSpark for low-concurrency serving with K=2-4 until adaptive planning lands.
+
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,
 target_layer_ids=[...])`, and the periodic `SpecDecoding metrics ... Avg
