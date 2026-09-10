@@ -38,6 +38,12 @@ class ProposeContext:
     Carries everything computed during target sampling that a drafter needs.
     Long-lived collaborators (models, caches, the assistant runtime) are held
     by the proposer implementation itself, not here.
+
+    Hidden rows use ``cu_seqlens`` in decode-then-prefill order. Absolute token
+    positions come from ``PagedDecodeSegment.cache_start_pos`` and
+    ``PrefillRequest.start_pos``; they must not be inferred from a sampled
+    token count. Pure intermediate steps supply an empty ``prefill_token_ids``
+    sequence and still deliver every scheduled feature span for ingestion.
     """
 
     target_hidden_states: mx.array | None

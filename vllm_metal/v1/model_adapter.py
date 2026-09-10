@@ -34,6 +34,7 @@ class IntermediateForwardOutput:
     """Projection-free forward output for a no-sample intermediate step."""
 
     hidden_states: mx.array
+    captured_hidden_states: mx.array | None = None
 
 
 class MultimodalEncodeResult(Protocol):
@@ -148,6 +149,7 @@ class ModelAdapter(Protocol):
         input_ids: mx.array,
         *,
         cache: Any | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> IntermediateForwardOutput:
         """Run *model* without the output projection (cache writes only)."""
 
@@ -405,6 +407,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         input_ids: mx.array,
         *,
         cache: Any | None = None,
+        capture_layer_ids: list[int] | None = None,
     ) -> IntermediateForwardOutput:
         """Run *model*'s transformer body without the output projection.
 
@@ -417,6 +420,14 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             raise ValueError(
                 f"{type(model).__name__} has no resolvable transformer body; "
                 "callers must gate on supports_intermediate_forward()."
+            )
+        if capture_layer_ids:
+            final, fused = run_backbone_with_capture(
+                body, input_ids, cache=cache, layer_ids=capture_layer_ids
+            )
+            return IntermediateForwardOutput(
+                hidden_states=final,
+                captured_hidden_states=self._flatten_target_hidden_states(fused),
             )
         return IntermediateForwardOutput(hidden_states=body(input_ids, cache=cache))
 
@@ -445,8 +456,8 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         them into ``hidden_states``; the target's own logits are still computed
         from the same forward's final hidden, so the integrated path needs only
         one forward. ``None`` preserves the existing execution path with no
-        additional operations. When both are set, the capture path wins and
-        ``logits_indices`` is ignored.
+        additional operations. Logits selection is independent of capture:
+        fused features always retain every packed input row.
         """
         if capture_layer_ids:
             backbone = self._target_backbone(model)
@@ -458,6 +469,10 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
             final, fused = run_backbone_with_capture(
                 backbone, input_ids, cache=cache, layer_ids=capture_layer_ids
             )
+            if logits_indices is not None:
+                final = mx.take(
+                    self._flatten_target_hidden_states(final), logits_indices, axis=0
+                )[None]
             logits = self._compute_target_logits(model, final)
             return TargetModelForwardOutput(
                 logits=logits,

@@ -201,6 +201,12 @@ do not retain every layer's full prompt activations until generation ends. Tests
 must cover no capture, capture alone, selective logits alone, and both together,
 with multiple prefills and decode requests in the same packed batch.
 
+M1 implements this contract for native MLX Qwen3 through local observers on a
+shallow body copy. The original model and attention wrappers are shared without
+replacing the live layer list. Existing runner segment/prefill DTOs carry the
+absolute spans; the adapter need not infer request identity from tensor shapes.
+See the [progress record](dspark-progress.md) for real checkpoint parity evidence.
+
 ### Request state and context K/V
 
 For an active request with committed token list length n, the final token is the

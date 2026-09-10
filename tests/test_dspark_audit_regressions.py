@@ -13,11 +13,6 @@ from vllm_metal.v1.model_adapter import DefaultModelAdapter
 from vllm_metal.v1.model_runner import MetalModelRunner
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="M1/F1: captured logits ignore selected rows",
-)
 def test_capture_preserves_packed_logits_selection():
     adapter = DefaultModelAdapter()
     adapter._target_backbone = lambda model: _toy_backbone(1)

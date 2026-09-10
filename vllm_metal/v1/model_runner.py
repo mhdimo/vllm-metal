@@ -1296,10 +1296,9 @@ class MetalModelRunner:
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
         has_pooling_work = self._has_paged_pooling_work(prefill_reqs, decode_reqs)
 
-        # prompt_len=None marks an intermediate prefill chunk; only final
-        # prefill rows can seed the next Gemma4 MTP draft step. Pooling batches
-        # do not sample or draft tokens, so they never request target hidden
-        # states here.
+        # Each proposer owns its capture policy: MTP needs sampling rows,
+        # while DSpark needs every prefill chunk to build contiguous context.
+        # Pooling batches never draft tokens.
         collect_target_hidden_states = (
             not has_pooling_work
             and self._drafter is not None
@@ -1488,18 +1487,7 @@ class MetalModelRunner:
             else:
                 # Intermediate-only prefill steps sample nothing: no chunk of
                 # theirs contributes a token, so the lm_head projection over
-                # the whole chunk (and the sampling sync) is pure waste. The
-                # adapter runs the model without the projection — the KV and
-                # GDN cache writes are the step's real output. Any installed
-                # drafter is excluded outright: propose() runs unconditional
-                # per-step bookkeeping (finished-id pruning, pending-draft
-                # resolution) that the no-logits short-circuit would skip.
-                intermediate_only = (
-                    not decode_reqs
-                    and bool(prefill_reqs)
-                    and all(pr.prompt_len is None for pr in prefill_reqs)
-                    and self._drafter is None
-                )
+                # the whole chunk (and the sampling sync) is pure waste.
                 # A drafter may request specific layers' residuals; forward its
                 # selection alongside the hidden-state request. Drafters without
                 # a capture selection (e.g. Gemma4 MTP) contribute None.
@@ -1507,6 +1495,14 @@ class MetalModelRunner:
                     getattr(self._drafter, "capture_layer_ids", None)
                     if collect_target_hidden_states and self._drafter is not None
                     else None
+                )
+                # Feature-capturing drafters receive a no-sample ProposeContext
+                # below, so context ingestion is not lost on body-only steps.
+                intermediate_only = (
+                    not decode_reqs
+                    and bool(prefill_reqs)
+                    and all(pr.prompt_len is None for pr in prefill_reqs)
+                    and (self._drafter is None or capture_layer_ids is not None)
                 )
                 # Prompt-logprobs requests need a logits row for every prompt
                 # position, so their steps skip both head-pruning paths: the
@@ -1520,11 +1516,15 @@ class MetalModelRunner:
                     and self._intermediate_forward_supported
                     and not needs_prompt_logprob_rows
                 ):
-                    intermediate_hidden = self._model_adapter.intermediate_forward(
-                        self._forward_model, input_ids, cache=offset_caches
-                    ).hidden_states
+                    intermediate_output = self._model_adapter.intermediate_forward(
+                        self._forward_model,
+                        input_ids,
+                        cache=offset_caches,
+                        capture_layer_ids=capture_layer_ids,
+                    )
+                    intermediate_hidden = intermediate_output.hidden_states
                     logits = None
-                    target_hidden_states = None
+                    target_hidden_states = intermediate_output.captured_hidden_states
                 else:
                     if not needs_prompt_logprob_rows:
                         logits_layout = self._paged_logits_layout(
@@ -1551,7 +1551,10 @@ class MetalModelRunner:
         elif intermediate_hidden is not None:
             # Intermediate-only prefill: the KV/GDN cache writes are the real
             # output; the hidden states force them through the lazy graph.
-            self._submit_paged_forward_outputs(intermediate_hidden)
+            intermediate_outputs = [intermediate_hidden]
+            if target_hidden_states is not None:
+                intermediate_outputs.append(target_hidden_states)
+            self._submit_paged_forward_outputs(*intermediate_outputs)
         elif pp_send_handle is not None:
             # Non-last pipeline stage: no logits, just push the hidden state to
             # the next stage, plus any runtime-owned forward side effects.
@@ -1747,6 +1750,23 @@ class MetalModelRunner:
             for pr in prefill_reqs:
                 self._paged_request_seq_lens[pr.req_id] = pr.start_pos + len(
                     pr.token_ids
+                )
+            if self._drafter is not None:
+                self._draft_token_ids = self._drafter.propose(
+                    ProposeContext(
+                        target_hidden_states=target_hidden_states,
+                        decode_reqs=[],
+                        decode_segments=(),
+                        decode_token_ids=[],
+                        prefill_reqs=prefill_reqs,
+                        prefill_token_ids=[],
+                        prefill_result_modes=["intermediate"] * len(prefill_reqs),
+                        request_states=self._request_states,
+                        cu_seqlens=cu_seqlens,
+                        num_decode_segments=0,
+                        num_speculative_tokens=scheduler_output.num_spec_tokens_to_schedule,
+                        finished_req_ids=scheduler_output.finished_req_ids,
+                    )
                 )
             return batch, scheduler_output
 
