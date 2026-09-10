@@ -9,13 +9,15 @@ ported: the target model is loaded by vllm-metal's own model lifecycle.
 
 from __future__ import annotations
 
-import glob
+import json
 import os
-from typing import Any
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
+from mlx.utils import tree_flatten, tree_unflatten
+from safetensors import safe_open
 
 from vllm_metal.utils import get_model_download_path
 
@@ -32,12 +34,83 @@ def _resolve(repo_or_path: str, *, revision: str | None = None) -> str:
     )
 
 
-def _flatten_params(module) -> list[tuple[str, Any]]:
-    from mlx.utils import tree_flatten
+def _unique_object(pairs: list[tuple[str, object]]) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"DSpark checkpoint JSON repeats key {key!r}")
+        result[key] = value
+    return result
 
-    params = tree_flatten(module.parameters())
-    assert isinstance(params, list)  # Module.parameters() is a dict -> list of pairs
-    return params
+
+def _checkpoint_files(path: Path) -> dict[Path, set[str] | None]:
+    """Follow an authoritative HF index; never combine unrelated weight files."""
+    index = path / "model.safetensors.index.json"
+    if not index.exists():
+        files = sorted(path.glob("*.safetensors"))
+        if len(files) != 1:
+            raise ValueError(
+                f"{path}: DSpark requires one safetensors file or an explicit "
+                "model.safetensors.index.json"
+            )
+        return {files[0]: None}
+    with index.open() as stream:
+        mapping = json.load(stream, object_pairs_hook=_unique_object).get("weight_map")
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError(f"{index}: weight_map must be a nonempty object")
+    shards: dict[Path, set[str] | None] = {}
+    for name, filename in mapping.items():
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".safetensors")
+        ):
+            raise ValueError(f"{index}: invalid shard filename {filename!r}")
+        shard = path / filename
+        if not shard.is_file():
+            raise ValueError(f"{index}: missing shard {filename!r}")
+        names = shards.setdefault(shard, set())
+        assert names is not None
+        names.add(name)
+    return dict(sorted(shards.items()))
+
+
+def _validate_weights(
+    files: dict[Path, set[str] | None], drafter: DSparkDrafter
+) -> None:
+    # Header-only checks precede any weight materialization or conversion.
+    parameters = tree_flatten(drafter.parameters())
+    assert isinstance(parameters, list)
+    expected = {name: value.shape for name, value in parameters}
+    actual: dict[str, tuple[int, ...]] = {}
+    dtypes = set()
+    for path, indexed_names in files.items():
+        with safe_open(path, framework="numpy") as stream:
+            names = set(stream.keys())
+            if indexed_names is not None and names != indexed_names:
+                raise ValueError(f"{path}: shard tensors disagree with weight_map")
+            for name in sorted(names):
+                if name in actual:
+                    raise ValueError(f"{path}: duplicate tensor {name!r}")
+                tensor = stream.get_slice(name)
+                actual[name] = tuple(tensor.get_shape())
+                dtypes.add(tensor.get_dtype())
+    if actual.keys() != expected.keys():
+        raise ValueError(
+            "DSpark drafter tensor names do not match the DeepSpec checkpoint: "
+            f"missing={sorted(expected.keys() - actual.keys())[:8]}, "
+            f"unexpected={sorted(actual.keys() - expected.keys())[:8]}"
+        )
+    for name, shape in actual.items():
+        if shape != expected[name]:
+            raise ValueError(
+                f"DSpark tensor {name!r}: expected shape {expected[name]}, got {shape}"
+            )
+    if len(dtypes) != 1 or not dtypes <= {"F16", "BF16", "F32"}:
+        raise ValueError(
+            "DSpark requires a uniform float16, bfloat16 or float32 checkpoint; "
+            f"got tensor dtypes {sorted(dtypes)}"
+        )
 
 
 def load_drafter(
@@ -47,47 +120,67 @@ def load_drafter(
     quantize: bool = True,
     bits: int = 4,
     group_size: int = 64,
-    strict: bool = True,
 ) -> tuple[DSparkDrafter, DSparkConfig]:
     """Load a DeepSpec-native standalone DSpark drafter. Returns ``(drafter, config)``.
 
-    Weights load 1:1 by tensor name (``strict=True``); a name mismatch raises
-    instead of silently loading a partial drafter (which would draft with
-    near-zero acceptance). The prototype uses MLX 4-bit quantization by default;
-    correctness and performance of each model pair require separate validation.
+    Tensor names, shapes and source precision must match before loading starts.
+    The serving recipe is MLX affine 4-bit/group-64, including embeddings and
+    heads. ``quantize=False`` preserves source precision for numerical reference
+    checks. Prepacked and mixed-precision checkpoints are not supported.
     """
-    path = _resolve(repo_or_path, revision=revision)
-    config = DSparkConfig.from_json(os.path.join(path, "config.json"))
+    if bits != 4 or group_size != 64:
+        raise ValueError("DSpark only implements affine 4-bit/group-64 conversion")
+    path = Path(_resolve(repo_or_path, revision=revision))
+    with (path / "config.json").open() as stream:
+        raw = json.load(stream, object_pairs_hook=_unique_object)
+    if (
+        raw.get("quantization") is not None
+        or raw.get("quantization_config") is not None
+    ):
+        raise ValueError("DSpark requires an unpacked floating-point checkpoint")
+    config = DSparkConfig.from_dict(raw, source=str(path / "config.json"))
     drafter = DSparkDrafter(config)
-
-    weights: dict[str, mx.array] = {}
-    for st in glob.glob(os.path.join(path, "*.safetensors")):
-        weights.update(mx.load(st))
-
-    model_keys = {k for k, _ in _flatten_params(drafter)}
-    ckpt_keys = set(weights.keys())
-    missing = sorted(model_keys - ckpt_keys)
-    unexpected = sorted(ckpt_keys - model_keys)
-    if missing or unexpected:
-        detail = ""
-        if missing:
-            detail += f"\n  missing in checkpoint ({len(missing)}): {missing[:8]}"
-        if unexpected:
-            detail += (
-                f"\n  unexpected in checkpoint ({len(unexpected)}): {unexpected[:8]}"
-            )
-        if strict:
-            raise ValueError(
-                f"{repo_or_path}: drafter tensor names don't match a DeepSpec-format "
-                f"DSpark drafter — the checkpoint may be a different packaging or "
-                f"variant (e.g. vLLM 'speculators' format).{detail}"
-            )
-        print(f"[load_drafter] WARNING key mismatch:{detail}")
-
-    drafter.load_weights(list(weights.items()), strict=not (missing or unexpected))
-
+    files = _checkpoint_files(path)
+    _validate_weights(files, drafter)
+    modules = dict(drafter.named_modules())
     if quantize:
-        nn.quantize(drafter, group_size=group_size, bits=bits)
+        for name, module in modules.items():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                if module.weight.shape[-1] % group_size:
+                    raise ValueError(
+                        f"DSpark {name}: input dimension must be divisible by group_size={group_size}"
+                    )
 
-    mx.eval(drafter.parameters())
+    # Materialize/convert one tensor at a time. Keeping an evaluated dictionary
+    # of all original weights alongside a quantized model doubles startup RAM.
+    # Disable allocator retention only for this scoped load, restoring it even
+    # when a read or conversion fails.
+    cache_limit = mx.set_cache_limit(0)
+    try:
+        for shard in files:
+            weights = mx.load(shard)
+            assert isinstance(weights, dict)
+            for name in sorted(weights):
+                value = weights.pop(name)
+                # The full header set was checked strictly above. Partial
+                # updates here are intentional, not a permissive load mode.
+                drafter.load_weights([(name, value)], strict=False)
+                module_name, parameter = name.rsplit(".", 1)
+                module = modules.get(module_name)
+                if (
+                    quantize
+                    and parameter == "weight"
+                    and isinstance(module, (nn.Linear, nn.Embedding))
+                ):
+                    converted = module.to_quantized(group_size=group_size, bits=bits)
+                    mx.eval(converted.parameters())
+                    drafter.update_modules(tree_unflatten([(module_name, converted)]))
+                    modules.pop(module_name)
+                    del converted
+                else:
+                    mx.eval(value)
+                del value, module
+        mx.eval(drafter.parameters())
+    finally:
+        mx.set_cache_limit(cache_limit)
     return drafter, config
