@@ -306,6 +306,11 @@ class DSparkProposer:
         """
         self.counters.steps += 1
         self.counters.bypass_reasons["deferred-step"] += 1
+        if self.counters.bypass_reasons["deferred-step"] == 1:
+            logger.info(
+                "DSpark: first deferred step ingested; the decode pipeline is "
+                "running on non-drafting steps"
+            )
         scheduled = self._scheduled(ctx)
         self._observe_outcomes(ctx)
         for req_id in scheduled:

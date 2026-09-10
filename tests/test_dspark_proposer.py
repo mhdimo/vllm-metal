@@ -347,7 +347,7 @@ def test_deferred_step_allowed_follows_the_mode_and_the_planner():
     assert proposer.deferred_step_allowed([("c", capped)], 2) is True
 
 
-def test_ingest_deferred_step_advances_context_without_drafting(monkeypatch):
+def test_ingest_deferred_step_advances_context_without_drafting(monkeypatch, caplog):
     proposer = _proposer()
     state = _state([1, 2, 3])
     _seed(proposer, state, k=0)
@@ -362,8 +362,10 @@ def test_ingest_deferred_step_advances_context_without_drafting(monkeypatch):
         lambda *a, **k: (backbone_calls.append(1), real_backbone(*a, **k))[1],
     )
     ctx = replace(_context(decode=[("r", state, 2, [3], [])]), decode_token_ids=[()])
-    proposer.ingest_deferred_step(ctx)
+    with caplog.at_level("INFO", logger="vllm_metal.v1.dspark_proposer"):
+        proposer.ingest_deferred_step(ctx)
     assert backbone_calls == []
+    assert any("first deferred step" in record.message for record in caplog.records)
     _assert_context(proposer, "r", list(range(3)))
     assert proposer._contexts["r"].covered_end == 3
     assert proposer.counters.steps == 2
