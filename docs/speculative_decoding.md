@@ -228,11 +228,14 @@ trajectory and the spec-decode counters.
 - **Contiguous context.** Every prefill chunk contributes features, including
   no-sample steps. Missing features on a target prefix-cache hit use target-only
   generation; the proposer does not replay full prompts or share private KV.
-- **Decode pipeline on non-drafting steps.** A pure-decode step that DSpark
-  will not draft at (the `bypass` mode, or the `adaptive` planner's bypass
-  decision for the batch) keeps the runner's one-step-ahead sampling
-  pipeline; the proposer ingests that step's target features without the
-  sampled token values. Drafting and verification steps stay synchronous.
+- **Decode pipeline on non-drafting steps.** The proposer can consume a
+  pure-decode step whose sampling sync the runner's one-step-ahead pipeline
+  defers (the `bypass` mode, or the `adaptive` planner's bypass decision for
+  the batch), ingesting that step's target features without the sampled
+  token values; drafting and verification steps stay synchronous. The
+  pipeline itself requires asynchronous scheduling, which the Metal platform
+  turns off whenever speculative decoding is configured, so a served DSpark
+  server does not reach this path yet (see the M9 progress record).
 
 ### Limitations
 
