@@ -31,7 +31,7 @@ record the actual checkout SHA when starting new experiments.
 | M3a: deterministic streamed loading | Complete, [PR #4](https://github.com/mhdimo/vllm-metal/pull/4), feature `19c010ff10f61aafc8abf4d45eb499e08ee45728` |
 | M3b: full resource planning and bounded storage | Complete, [PR #5](https://github.com/mhdimo/vllm-metal/pull/5), feature `b4aa6958bcf5208901b755552d98f7e2d25383fc` |
 | M3c: resource, recovery and precision qualification | Complete for its named 4B envelope, [PR #6](https://github.com/mhdimo/vllm-metal/pull/6), feature `bae84f915d4d30c9bb30382bd9445c7f12f12fc7` |
-| M4: complete fixed-greedy serving and performance | **Open. Extended exact-token parity fails.** Admission fairness, HTTP semantics and fixed-K performance are also unqualified. |
+| M4: complete fixed-greedy serving and performance | **Open.** M4a: the extended exact-token failures are ties or target-unstable prefixes under the [parity contract](dspark-m4-parity.md) (M5 Max). Admission fairness, HTTP semantics and fixed-K performance remain unqualified. |
 | M5: exact stochastic verification | Open; current drafter/proposer does not implement this supported serving path. |
 | M6: confidence calibration and adaptive planning | Open; confidence is not used by the current proposer. |
 | M7: production performance and reliability | Open; no qualifying HTTP soak or production speedup result. |
@@ -498,6 +498,15 @@ Not every stored witness reproduced a changed native token across chunk sizes.
 On M5 Max, different dispatch may change or hide a witness. A pass on the new
 machine does not retroactively fix the M4 machine's failing envelope.
 
+M5 Max outcome (2026-09-10): both cases reproduce with deterministic
+divergence sets. Traced logits and the target-stability probe attribute every
+divergence to a tie or to a prefix where the target-only engine itself returns
+different greedy tokens under different execution shapes; see the
+[M4a parity record](dspark-m4-parity.md) for the evidence, the contract and
+the gate commands (`--trace-logits`, `dspark_target_stability`,
+`dspark_divergence_classify --stability --gate`). The strict checkers still
+exit nonzero on these cases; run the gate as the recorded second step.
+
 Without `--diagnose-mismatch`, a token mismatch allows remaining resource/drain
 checks to finish, writes `kN.result.failure.json` with expected and actual streams,
 and still returns failure. The ordinary result's `tokens` / `token_sha256` refer
@@ -567,7 +576,7 @@ not counted as a completed M4 serving feature by inspection alone.
 
 | Next part | Concrete implementation and completion evidence |
 | --- | --- |
-| M4a: target/verification parity | Diagnose both extended witnesses; repair the responsible cache/layout/numerical path with minimal regressions; rerun the full failed cases and short/capture/reference controls. Retain any device-specific limitation explicitly. |
+| M4a: target/verification parity | Done on M5 Max under the recorded contract: both witnesses are ties or target-unstable prefixes, no cache/layout defect found, DSpark behaved correctly in every trace. Remaining: repeat the natural-workload gate on the M4 machine when available; the paged path's higher junk-basin frequency at absolute 207 is an open numerics observation, not a gate. |
 | M4b: fixed-K admission | Fair selection within slots/bytes and each request's output/context/scheduler caps; no starvation or use of another row's cap; compare batched/ragged/request-order results against independent rows. |
 | M4c: serving semantics | Add a real HTTP and mixed-arrival qualification harness. Cover K=1/2/4/7 and K=0 baseline, C=1/4, output limits 1/2/31/128, EOS/min tokens/stops, streaming/non-streaming, prefix hits/misses, intermediate prefill, cancel/disconnect and logprob/unsupported-feature behavior. Keep positive-work and cleanup assertions. |
 | M4d: fixed-K performance | Measure at least K=0/1/2/7 before adapting K. Record draft, verify, context/host costs, TTFT, TPOT, p95/p99 token gaps and SLO goodput. Separate warmup/instrumented correctness from timed serving. |

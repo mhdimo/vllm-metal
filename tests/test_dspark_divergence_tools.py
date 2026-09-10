@@ -11,13 +11,16 @@ from vllm.sampling_params import SamplingParams
 
 from tools.dspark_divergence_classify import (
     MAX_TIE_ULPS,
+    apply_stability,
     assign_requests,
     classify_pair,
     emitted_tokens,
     first_divergence,
+    gate_verdict,
     ulp,
 )
 from tools.dspark_memory_check import top_logit_rows
+from tools.dspark_target_stability import divergent_prefixes
 from vllm_metal.v1.model_runner import PrefillRequest, RequestState
 from vllm_metal.v1.spec_decode import PagedDecodeSegment
 
@@ -191,3 +194,50 @@ def test_ulp_and_tie_classification() -> None:
     assert real["top1_logit_difference"] == pytest.approx(41.25 - 14.75)
     assert first_divergence([1, 2, 3], [1, 2, 4]) == 2
     assert first_divergence([1, 2], [1, 2]) is None
+
+
+def test_gate_admits_only_ties_and_target_unstable_prefixes() -> None:
+    divergences = [
+        {"request": 0, "output_position": 5, "label": "tie"},
+        {"request": 1, "output_position": 9, "label": "engine-disagreement"},
+        {"request": 2, "output_position": 3, "label": "engine-disagreement"},
+        {"request": 3, "output_position": 7, "label": "untraced"},
+    ]
+    stability = {
+        "cases": [
+            {
+                "request": 1,
+                "output_position": 9,
+                "stable": False,
+                "engine_outcomes": {"a": {"greedy_token": 5}, "b": {"greedy_token": 6}},
+            },
+            {"request": 2, "output_position": 3, "stable": True, "engine_outcomes": {}},
+        ]
+    }
+    apply_stability(divergences, stability)
+    assert divergences[1]["label"] == "target-unstable"
+    assert divergences[1]["target_greedy_tokens_by_shape"] == {"a": 5, "b": 6}
+    assert divergences[2]["label"] == "engine-disagreement"  # stable prefix: a defect
+    admissible, offenders = gate_verdict(divergences)
+    assert not admissible
+    assert [o["request"] for o in offenders] == [2, 3]
+    assert gate_verdict(divergences[:2]) == (True, [])
+
+
+def test_divergent_prefixes_from_failure_artifact() -> None:
+    failure = {
+        "prompt_token_ids": [[1, 2], [3]],
+        "expected_tokens": [[10, 11, 12], [20, 21]],
+        "actual_tokens": [[10, 11, 99], [20, 21]],
+    }
+    cases = divergent_prefixes(failure)
+    assert cases == [
+        {
+            "request": 0,
+            "output_position": 2,
+            "prefix": [1, 2, 10, 11],
+            "prompt_length": 2,
+            "baseline_token": 12,
+            "speculative_token": 99,
+        }
+    ]

@@ -189,12 +189,15 @@ Draft acceptance rate` reflects the live acceptance.
   failures fall back to the target. Lower context, sequence and batch-token
   limits to reduce the reservation. The earlier `0.12` memory-fraction example
   is insufficient for the complete 4B load and is now rejected.
-- **Output parity requires validation.** Investigate every divergence, including
-  target logits layout and cache state, before attributing it to numerical ties.
-  M3's longer-generation and larger-preemption probes failed exact-token parity;
-  native target-only replays also change token choices with execution chunk size.
-  These [documented failures](design/dspark-m3-validation.md#failed-extended-parity-checks-m4-remains-open)
-  remain an M4 gate before broader serving claims.
+- **Output parity is exact up to the target's own numerical stability.** The
+  M3 longer-generation and larger-preemption probes fail strict exact-token
+  comparison; with both engines' logits traced, every divergence is either a
+  tie within two bfloat16 ULPs or a prefix where the target-only engine itself
+  returns different greedy tokens under different prefill chunkings. The
+  [M4a record](design/dspark-m4-parity.md) defines that contract and the gate
+  that enforces it; the [M3 records](design/dspark-m3-validation.md#failed-extended-parity-checks-m4-remains-open)
+  keep the strict failures. Degenerate repetitive prompts can flip between
+  basins on any execution path, speculative or not.
 
 ---
 

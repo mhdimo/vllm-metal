@@ -16,7 +16,7 @@ documentation only; M4-M8 remain open and the destination machine is untested.
 | M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
-| M4: Fixed-greedy serving | Open; parity blocked | Resolve both extended parity failures, qualify fair admission and HTTP semantics, then measure fixed-K performance. |
+| M4: Fixed-greedy serving | M4a parity contract established on M5 Max ([record](dspark-m4-parity.md)); admission, HTTP semantics and fixed-K performance still open | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; fair admission, HTTP harness and fixed-K measurements follow. |
 | M5: Stochastic verification | Planned | Exact proposal-distribution ownership, rejection/bonus sampling and distribution tests. |
 | M6: Calibrated adaptive planning | Planned | Recipe-specific confidence calibration, measured cost curves and causal admission/planning. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
@@ -337,5 +337,38 @@ within two bfloat16 ULPs, upstream #524's criterion) or an
 is invalid state). Identical prompts are compared within one engine the same
 way. Unit tests cover row identity, window replay, stream-based assignment and
 both labels. The M5 Max reproduction of the two M3 failures with this tooling
-is recorded in the following section once complete.
+is recorded in the next section.
 \n
+
+## M4a: target parity contract (M5 Max, `02f3b2d`)
+
+Both M3 failures reproduce on the M5 Max with deterministic divergence sets.
+With the engines' own logits, the 900-token K=7 run has three ties (0 to 1
+bfloat16 ULP between one-row decode and eight-row verification) and one
+engine-disagreement; the extended preemption run has three engine-disagreements.
+`tools/dspark_target_stability.py` shows that the target-only engine, with no
+drafter, returns more than one greedy token at every one of those seven
+prefixes when only the prefill chunk budget changes; native mlx-lm shows the
+same bistability at absolute position 252 under five of nine chunkings. Four
+identical prompts diverge from each other in the target-only engine even
+without preemption. The repeated-sentence fixtures drive the target into a
+bistable regime (argmax logit near 41 versus a junk basin near 12), and the
+speculative and target-only engines are two execution shapes of it.
+
+The [M4a record](dspark-m4-parity.md) defines the contract: a divergence is
+admissible only as a tie or at a target-unstable prefix; anything else fails.
+`tools/dspark_divergence_classify.py --stability ... --gate` enforces it, and
+`--prompt-set natural` adds a non-degenerate workload. Under the contract both
+M3 failures are admissible (zero inadmissible divergences); the strict
+exact-token checkers keep failing on them by design and their M3 records are
+unchanged. DSpark behaved correctly in every trace: the drafter proposed the
+content-basin token and the target's verification row rejected it.
+
+On the natural prompt set (eight prompts, 256 tokens, C=4) strict exact
+parity fails for 8 of 8 requests at K=7 and 5 of 8 at K=2 with four forced
+preemptions, and every divergence is a 0 or 1 ULP tie; the gate passes both.
+Acceptance there is 1,352 of 4,732 drafted tokens at K=7 (28.6%) and 1,100 of
+1,861 at K=2 (59.1%), against 78.7% at K=7 on the repeated fixtures. Both
+M3 failures pass the gate (long output: 3 ties, 1 target-unstable; preemption:
+3 target-unstable). Validation on M5 Max at `02f3b2d`: 2,324 non-slow tests
+passed, ruff, mypy and the strict docs build clean.

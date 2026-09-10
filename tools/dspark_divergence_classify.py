@@ -16,8 +16,20 @@ same failure. Every first divergence is labelled from the engines' own logits:
   chunking) in at least one engine, never a benign tie. The native replay, when
   supplied, names which engine agrees with mlx-lm at that prefix.
 
+- ``target-unstable``: an engine-disagreement at a prefix where the
+  target-only engine itself does not have one greedy answer (a
+  ``dspark_target_stability`` probe found more than one greedy token across
+  execution shapes). The target executed two ways disagrees with itself there;
+  no exact-token comparison between any two execution paths can hold. Requires
+  ``--stability``.
+
 Identical prompts are also compared within one engine: two requests with the
 same committed prefix that receive different logits are reported the same way.
+
+With ``--gate`` the process exits nonzero unless every first divergence is a
+``tie`` or ``target-unstable``. That is the M4a parity contract: speculative
+decoding must reproduce the target-only greedy stream except where the target's
+own greedy decision is not numerically stable.
 """
 
 from __future__ import annotations
@@ -181,6 +193,32 @@ def classify_pair(
     return verdict
 
 
+ADMISSIBLE_LABELS = frozenset({"tie", "target-unstable"})
+
+
+def apply_stability(divergences: list[dict], stability: dict) -> None:
+    """Relabel engine-disagreements at prefixes the target itself cannot decide."""
+    unstable = {
+        (case["request"], case["output_position"]): case
+        for case in stability.get("cases", [])
+        if not case.get("stable", True)
+    }
+    for entry in divergences:
+        key = (entry["request"], entry["output_position"])
+        if entry.get("label") == "engine-disagreement" and key in unstable:
+            entry["label"] = "target-unstable"
+            entry["target_greedy_tokens_by_shape"] = {
+                shape: outcome["greedy_token"]
+                for shape, outcome in unstable[key]["engine_outcomes"].items()
+            }
+
+
+def gate_verdict(divergences: list[dict]) -> tuple[bool, list[dict]]:
+    """Whether every first divergence is admissible, and the offenders."""
+    offenders = [d for d in divergences if d.get("label") not in ADMISSIBLE_LABELS]
+    return not offenders, offenders
+
+
 def load_run(run_dir: Path, width: int) -> tuple[dict, dict]:
     result_path = run_dir / f"k{width}.result.json"
     failure_path = run_dir / f"k{width}.result.failure.json"
@@ -212,6 +250,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--replay", type=Path, help="dspark_target_replay output for this failure"
+    )
+    parser.add_argument(
+        "--stability",
+        type=Path,
+        help="dspark_target_stability output; relabels engine-disagreements at "
+        "prefixes where the target-only engine is itself unstable",
+    )
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="exit nonzero unless every first divergence is a tie or target-unstable",
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -332,8 +381,15 @@ def main() -> None:
                 entry["label"] = "untraced"
             self_divergences.append(entry)
 
+    if args.stability is not None:
+        apply_stability(divergences, json.loads(args.stability.read_text()))
+    admissible, offenders = gate_verdict(divergences)
     labels = [entry["label"] for entry in divergences]
     summary = {
+        "contract": "tie (<=2 bfloat16 ULPs in both engines) or target-unstable "
+        "(target-only engine disagrees with itself across execution shapes)",
+        "admissible": admissible,
+        "inadmissible_divergences": len(offenders),
         "run_dir": str(args.run_dir),
         "width": args.width,
         "logits_dtype": speculative_trace.get("logits_dtype"),
@@ -360,6 +416,13 @@ def main() -> None:
             f"  self-divergence [{entry['engine']}] requests {entry['requests']} "
             f"pos {entry['output_position']}: {entry['tokens']} -> {entry['label']}"
         )
+    print(
+        "GATE PASS: every divergence is admissible"
+        if admissible
+        else f"GATE FAIL: {len(offenders)} inadmissible divergence(s)"
+    )
+    if args.gate and not admissible:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

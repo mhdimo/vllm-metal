@@ -113,6 +113,10 @@ These repeated prompts are numerical fixtures, not a held-out workload corpus.
 
 ## Failed extended parity checks: M4 remains open
 
+The M5 Max diagnosis of these two cases, with both engines' logits and the
+target-stability probe, is in the [M4a parity record](dspark-m4-parity.md).
+The strict exact-token results below are unchanged.
+
 A 900-output-token run at model limit 1,024 failed strict greedy comparison in
 three of four requests, first at output positions 172, 239 and 94 (zero-based).
 Its baseline prompt lengths were 5/106/116/116 after the fixed input-limit
