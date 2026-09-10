@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal.v1.dspark.config import DSparkConfig
+from vllm_metal.v1.dspark.memory import CONTEXT_ALIGNMENT, DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
 
 if TYPE_CHECKING:
@@ -73,6 +74,8 @@ class DSparkProposer:
         config: DSparkConfig,
         runner: MetalModelRunner,
         controller: SpeculativeDecodeController,
+        memory_plan: DSparkMemoryPlan,
+        memory_budget_bytes: int | None = None,
     ) -> None:
         self._drafter = drafter
         self._config = config
@@ -82,9 +85,9 @@ class DSparkProposer:
         self._block_size = config.block_size
         self._mask_token_id = config.mask_token_id
         self._contexts: dict[str, _RequestContext] = {}
-        # Temporary execution bound inherited from the prototype. Full resource
-        # admission and workload qualification belong to M3/M4.
-        self._max_drafts_per_step = 32
+        self.memory_plan = memory_plan
+        self._memory_budget_bytes = memory_budget_bytes
+        self._max_drafts_per_step = memory_plan.max_contexts
 
     def needs_target_hidden_states(
         self,
@@ -141,13 +144,42 @@ class DSparkProposer:
                     plans.append(_DraftPlan(req_id, state.token_ids[-1], record, cap))
             if not plans:
                 return None
+            if not self._memory_available():
+                logger.debug("DSpark draft skipped: workspace memory budget exhausted")
+                return None
             req_ids, rows = self._batch_draft(plans[: self._max_drafts_per_step])
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
-        except Exception:
+        except Exception as error:
             # A partially written layer set cannot survive an ingest/draft
             # failure, even if the engine subsequently retries these requests.
             self.release_requests(scheduled)
+            if isinstance(error, MemoryError) or (
+                isinstance(error, RuntimeError)
+                and str(error).startswith(
+                    (
+                        "[metal::malloc] Resource limit (",
+                        "[metal::malloc] Attempting to allocate ",
+                        "[malloc] Unable to allocate ",
+                    )
+                )
+            ):
+                # Drafting has no target KV side effects. Discard all private
+                # context under allocation pressure and keep the already
+                # sampled target output. Later requests/recomputation can
+                # obtain fresh complete context; other failures remain fatal.
+                self.release_requests(set(self._contexts))
+                mx.clear_cache()
+                logger.warning(
+                    "DSpark allocation failed; released draft context and using target-only output"
+                )
+                return None
             raise
+
+    def _memory_available(self, extra_bytes: int = 0) -> bool:
+        return self._memory_budget_bytes is None or (
+            mx.get_active_memory() + extra_bytes + self.memory_plan.workspace_bytes
+            <= self._memory_budget_bytes
+        )
 
     def _draft_cap(self, state: RequestState, requested: int) -> int:
         params = state.sampling_params
@@ -193,6 +225,10 @@ class DSparkProposer:
             or list(ctx.cu_seqlens) != boundaries
         ):
             raise ValueError("DSpark feature boundaries disagree with packed requests")
+        if boundaries[-1] > self.memory_plan.max_step_tokens:
+            raise ValueError(
+                "DSpark packed features exceed the reserved scheduler token bound"
+            )
         hidden = ctx.target_hidden_states
         if hidden is not None and hidden.shape != (
             boundaries[-1],
@@ -283,8 +319,32 @@ class DSparkProposer:
         if start_pos > record.covered_end:
             self._disable(req_id, record, "missing target feature prefix")
             return
+        if end_pos > self.memory_plan.max_context_tokens:
+            self._disable(req_id, record, "context length exceeds reserved capacity")
+            return
         if not record.caches:
-            record.caches = self._drafter.make_ctx_cache()
+            if (
+                sum(bool(context.caches) for context in self._contexts.values())
+                >= self.memory_plan.max_contexts
+            ):
+                self._disable(req_id, record, "context capacity exhausted")
+                return
+            record.caches = self._drafter.make_ctx_cache(
+                self.memory_plan.max_context_tokens
+            )
+        required = (
+            min(
+                self.memory_plan.max_context_tokens,
+                (end_pos + CONTEXT_ALIGNMENT - 1)
+                // CONTEXT_ALIGNMENT
+                * CONTEXT_ALIGNMENT,
+            )
+            * self.memory_plan.kv_bytes_per_token
+        )
+        allocated = sum(cache.allocated_bytes for cache in record.caches)
+        if not self._memory_available(max(0, required - allocated)):
+            self._disable(req_id, record, "context memory budget exhausted")
+            return
         if len(record.caches) != len(self._drafter.layers) or any(
             cache.length != record.covered_end for cache in record.caches
         ):

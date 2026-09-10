@@ -134,7 +134,7 @@ For targets without a matched DSpark drafter, use [N-gram](#n-gram)
 # Prototype diagnostic example; not a production-qualified configuration.
 # vLLM 0.28 selects its GPU V2 path for DSpark unless explicitly overridden.
 VLLM_USE_V2_MODEL_RUNNER=0 \
-VLLM_METAL_MEMORY_FRACTION=0.12 \
+VLLM_METAL_MEMORY_FRACTION=0.22 \
 vllm serve mlx-community/Qwen3-4B-4bit \
   --revision 4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25 \
   --max-model-len 256 \
@@ -153,7 +153,9 @@ Startup currently permits matched standalone Qwen3 targets and vanilla Markov
 drafters. It rejects unimplemented adaptive/probabilistic/synthetic drafting,
 top-k Markov shortcuts, draft quantization/backend/cache overrides, non-paged
 attention and LoRA. The prototype's drafter still uses the existing MLX 4-bit
-recipe; broader precision/resource qualification is tracked in the roadmap.
+recipe. The loader validates the resolved checkpoint, admits conversion memory,
+and materializes draft weights before target KV planning. Broader model-pair
+precision qualification is tracked in the roadmap.
 Set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly. Request sampling eligibility remains
 greedy-only, with unsupported requests following the existing target-only path.
 
@@ -166,7 +168,8 @@ Draft acceptance rate` reflects the live acceptance.
 
 - **Greedy only**, like every Metal spec-decode method.
 - **Batched drafting.** The backbone runs across selected requests with padded
-  per-request contexts; the current fixed admission cap is 32 requests.
+  per-request contexts. Memory is reserved for up to `min(max_num_seqs, 32)`
+  complete contexts; excess requests use target-only generation.
 - **Contiguous context.** Every prefill chunk contributes features, including
   no-sample steps. Missing features on a target prefix-cache hit use target-only
   generation; the proposer does not replay full prompts or share private KV.
@@ -176,9 +179,14 @@ Draft acceptance rate` reflects the live acceptance.
 - **Matched models required.** Do not infer support for another target from a
   similar model name or tensor shape.
 - **Incomplete DSpark features.** Stochastic verification, calibrated confidence
-  scheduling and bounded draft memory remain roadmap work.
-- **Context grows with generation length.** Padded batch copies add to peak
-  memory; a lower memory fraction is not a complete resource budget.
+  scheduling and production serving qualification remain roadmap work.
+- **Bounded context and workspace.** The planner subtracts the draft context,
+  capture and execution reservation before sizing target KV. Context buffers
+  grow in reusable chunks up to the planned model length. Insufficient startup
+  capacity fails explicitly; request admission and recoverable draft allocation
+  failures fall back to the target. Lower context, sequence and batch-token
+  limits to reduce the reservation. The earlier `0.12` memory-fraction example
+  is insufficient for the complete 4B load and is now rejected.
 - **Output parity requires validation.** Investigate every divergence, including
   target logits layout and cache state, before attributing it to numerical ties.
 

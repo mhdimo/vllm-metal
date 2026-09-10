@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import mlx.core as mx
 import pytest
 from transformers import Qwen3Config
 from vllm.config import ModelConfig, ParallelConfig, SpeculativeConfig, VllmConfig
@@ -17,6 +18,7 @@ from tests.stub_runner import make_stub_runner
 from vllm_metal.v1.dspark import loader
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.contracts import is_dspark_config, validate_dspark_config
+from vllm_metal.v1.dspark.model import DSparkDrafter
 from vllm_metal.v1.dspark_proposer import DSparkProposer
 
 
@@ -82,13 +84,30 @@ def test_canonical_and_alias_install_resolved_draft(dspark_config, monkeypatch, 
     validate_dspark_config(dspark_config, use_paged_attention=True)
     runner = make_stub_runner(tokenizer=object())
     runner.vllm_config = dspark_config
-    weights = object()
-    load = Mock(
-        return_value=(weights, DSparkConfig.from_dict(draft_hf_config().to_dict()))
+    cfg = DSparkConfig.from_dict(draft_hf_config().to_dict())
+    weights = DSparkDrafter(cfg)
+    load = Mock(return_value=(weights, cfg))
+    runner.model = Mock(parameters=Mock(return_value={}))
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=32)
+    runner.cache_config.gpu_memory_utilization = 0.5
+    from vllm_metal.config import MetalConfig
+
+    runner.metal_config = MetalConfig(
+        memory_fraction=0.5, mlx_device="gpu", use_paged_attention=True
     )
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": 10_000_000}
+    )
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 1000)
     monkeypatch.setattr("vllm_metal.v1.model_runner.load_drafter", load)
+    runner._load_dspark_drafter()
     runner.install_drafter(num_blocks=1, block_size=16)
-    load.assert_called_once_with("resolved-draft", revision="a" * 40)
+    load.assert_called_once_with(
+        "resolved-draft",
+        revision="a" * 40,
+        memory_budget_bytes=4_999_000,
+        expected_config=cfg,
+    )
     assert isinstance(runner._drafter, DSparkProposer)
     assert runner._drafter._drafter is weights
 
@@ -179,6 +198,11 @@ def test_other_proposers_are_unchanged():
         ({"target_layer_ids": []}, "strictly increasing"),
         ({"mask_token_id": 64}, "vocabulary"),
         ({"block_size": 0}, "positive integer"),
+        ({"num_key_value_heads": 0}, "KV heads"),
+        ({"num_key_value_heads": 3}, "KV heads"),
+        ({"head_dim": 0}, "head dimension"),
+        ({"head_dim": 7}, "head dimension"),
+        ({"rms_norm_eps": float("nan")}, "finite and positive"),
         ({"use_sliding_window": True}, "sliding or causal"),
         ({"rope_parameters": {"rope_type": "yarn"}}, "full default RoPE"),
     ],

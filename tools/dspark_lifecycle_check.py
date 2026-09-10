@@ -163,7 +163,7 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, choices=(1, 4), default=4)
     parser.add_argument("--width", type=int, choices=range(1, 8), default=2)
     parser.add_argument("--prefix-cache", action="store_true")
-    parser.add_argument("--memory-fraction", default="0.12")
+    parser.add_argument("--memory-fraction", default="0.22")
     parser.add_argument("--worker-config", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_config:

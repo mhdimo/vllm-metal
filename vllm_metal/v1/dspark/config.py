@@ -13,6 +13,7 @@ Only the fields the MLX inference path needs are pulled out.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -219,6 +220,28 @@ class DSparkConfig:
                 raise NotImplementedError(
                     f"{path}: Qwen3 DSpark requires full default RoPE"
                 )
+
+        kv_heads = c.get("num_key_value_heads", 8)
+        head_dim = c.get("head_dim", c["hidden_size"] // c["num_attention_heads"])
+        if family == "gemma4":
+            head_dim = c.get("global_head_dim", 512)
+            if c.get("attention_k_eq_v", True):
+                kv_heads = c.get("num_global_key_value_heads", 1)
+        if (
+            type(kv_heads) is not int
+            or kv_heads <= 0
+            or c["num_attention_heads"] % kv_heads
+        ):
+            raise ValueError(
+                f"{path}: KV heads must be positive and divide attention heads"
+            )
+        if type(head_dim) is not int or head_dim <= 0 or head_dim % 2:
+            raise ValueError(
+                f"{path}: attention head dimension must be positive and even"
+            )
+        eps = c.get("rms_norm_eps", 1e-6)
+        if type(eps) not in (float, int) or not math.isfinite(eps) or eps <= 0:
+            raise ValueError(f"{path}: rms_norm_eps must be finite and positive")
 
         if family == "qwen3":
             rp = c.get("rope_parameters") or {}

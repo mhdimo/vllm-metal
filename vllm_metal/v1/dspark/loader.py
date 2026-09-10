@@ -10,6 +10,7 @@ ported: the target model is loaded by vllm-metal's own model lifecycle.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from safetensors import safe_open
 from vllm_metal.utils import get_model_download_path
 
 from .config import DSparkConfig
+from .memory import KERNEL_RESERVE_BYTES
 from .model import DSparkDrafter
 
 
@@ -77,7 +79,7 @@ def _checkpoint_files(path: Path) -> dict[Path, set[str] | None]:
 
 def _validate_weights(
     files: dict[Path, set[str] | None], drafter: DSparkDrafter
-) -> None:
+) -> dict[str, int]:
     # Header-only checks precede any weight materialization or conversion.
     parameters = tree_flatten(drafter.parameters())
     assert isinstance(parameters, list)
@@ -111,6 +113,8 @@ def _validate_weights(
             "DSpark requires a uniform float16, bfloat16 or float32 checkpoint; "
             f"got tensor dtypes {sorted(dtypes)}"
         )
+    itemsize = {"F16": 2, "BF16": 2, "F32": 4}[next(iter(dtypes))]
+    return {name: math.prod(shape) * itemsize for name, shape in actual.items()}
 
 
 def load_drafter(
@@ -120,6 +124,8 @@ def load_drafter(
     quantize: bool = True,
     bits: int = 4,
     group_size: int = 64,
+    memory_budget_bytes: int | None = None,
+    expected_config: DSparkConfig | None = None,
 ) -> tuple[DSparkDrafter, DSparkConfig]:
     """Load a DeepSpec-native standalone DSpark drafter. Returns ``(drafter, config)``.
 
@@ -127,6 +133,8 @@ def load_drafter(
     The serving recipe is MLX affine 4-bit/group-64, including embeddings and
     heads. ``quantize=False`` preserves source precision for numerical reference
     checks. Prepacked and mixed-precision checkpoints are not supported.
+    ``memory_budget_bytes`` is the remaining startup allowance after target
+    weights; admission includes final draft weights and conversion overlap.
     """
     if bits != 4 or group_size != 64:
         raise ValueError("DSpark only implements affine 4-bit/group-64 conversion")
@@ -139,10 +147,15 @@ def load_drafter(
     ):
         raise ValueError("DSpark requires an unpacked floating-point checkpoint")
     config = DSparkConfig.from_dict(raw, source=str(path / "config.json"))
+    if expected_config is not None and config != expected_config:
+        raise ValueError(
+            "DSpark snapshot config disagrees with the resolved draft ModelConfig"
+        )
     drafter = DSparkDrafter(config)
     files = _checkpoint_files(path)
-    _validate_weights(files, drafter)
+    source_bytes = _validate_weights(files, drafter)
     modules = dict(drafter.named_modules())
+    resident_bytes = sum(source_bytes.values())
     if quantize:
         for name, module in modules.items():
             if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -150,6 +163,26 @@ def load_drafter(
                     raise ValueError(
                         f"DSpark {name}: input dimension must be divisible by group_size={group_size}"
                     )
+                name_bytes = source_bytes[f"{name}.weight"]
+                itemsize = name_bytes // module.weight.size
+                packed_bytes = module.weight.size * bits // 8
+                scale_bytes = 2 * (module.weight.size // group_size) * itemsize
+                resident_bytes += packed_bytes + scale_bytes - name_bytes
+
+    # MLX's memory limit is a guideline, not a hard allocation cap. Check an
+    # explicit startup estimate before reading any data. Two source-tensor
+    # buffers cover conversion overlap; the allowance is separate from serving
+    # context/workspace because target KV does not exist during this phase.
+    startup_bytes = (
+        resident_bytes + 2 * max(source_bytes.values()) + KERNEL_RESERVE_BYTES
+    )
+    if memory_budget_bytes is not None and startup_bytes > memory_budget_bytes:
+        raise ValueError(
+            "DSpark startup memory budget is too small: "
+            f"draft_weights_and_conversion={startup_bytes} bytes, "
+            f"available_after_target={memory_budget_bytes} bytes. Increase "
+            "VLLM_METAL_MEMORY_FRACTION within device capacity or use a smaller pair."
+        )
 
     # Materialize/convert one tensor at a time. Keeping an evaluated dictionary
     # of all original weights alongside a quantized model doubles startup RAM.

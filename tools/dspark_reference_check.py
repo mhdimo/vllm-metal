@@ -101,6 +101,7 @@ def check_family(family: str) -> dict:
     from vllm.sampling_params import SamplingParams
 
     from vllm_metal.v1.dspark.config import DSparkConfig
+    from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
     from vllm_metal.v1.dspark.model import DSparkDrafter
     from vllm_metal.v1.dspark_proposer import (
         DSparkProposer,
@@ -215,6 +216,13 @@ def check_family(family: str) -> dict:
         config=port_config,
         runner=SimpleNamespace(),
         controller=SpeculativeDecodeController(),
+        memory_plan=DSparkMemoryPlan.build(
+            port_config,
+            itemsize=4,
+            max_num_seqs=2,
+            max_model_len=16,
+            max_num_batched_tokens=16,
+        ),
     )
     _, actual = proposer._batch_draft(plans)
     np.testing.assert_array_equal(actual, expected)
