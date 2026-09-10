@@ -435,6 +435,13 @@ class MetalModelRunner:
         # Keep the latest execution output so sample_tokens can return it.
         self._pending_output: ModelRunnerOutput | None = None
         self._draft_token_ids: DraftTokenIds | None = None
+        # Asynchronous scheduling: the engine never takes the drafts, so the
+        # runner keeps each request's last drafts until the scheduler's next
+        # placeholder slots for that request (or the request's release).
+        self._retained_drafts: dict[str, list[int]] = {}
+        self._step_spec_tokens: (
+            tuple[SchedulerOutput, dict[str, tuple[int, ...]], dict[str, int]] | None
+        ) = None
 
         # Paged attention state (set by worker when enabled)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
@@ -942,6 +949,53 @@ class MetalModelRunner:
         self._draft_token_ids = None
         return draft_token_ids
 
+    def _retain_drafts(self) -> None:
+        """Keep this step's drafts for the asynchronous scheduler's next slots."""
+        drafts = self._draft_token_ids
+        if not self.use_async_scheduling or drafts is None:
+            return
+        for req_id, token_ids in zip(
+            drafts.req_ids, drafts.draft_token_ids, strict=True
+        ):
+            if token_ids:
+                self._retained_drafts[req_id] = list(token_ids)
+            else:
+                self._retained_drafts.pop(req_id, None)
+
+    def _active_spec_tokens(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[str, tuple[int, ...]]:
+        """This step's drafts to verify, resolved once per scheduler output.
+
+        Synchronous scheduling verifies the scheduler's own draft handoff.
+        Under asynchronous scheduling the scheduler books placeholder slots
+        for every running request and the runner fills them with the drafts
+        it retained from the request's previous step; a request's retained
+        drafts are spent (used or dropped) by the first step that schedules
+        it again, because its anchor token then changes.
+        """
+        return self._resolve_spec_tokens(scheduler_output)[0]
+
+    def _resolve_spec_tokens(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[dict[str, tuple[int, ...]], dict[str, int]]:
+        """Resolved drafts and the unused placeholder slots the runner reported."""
+        cached = self._step_spec_tokens
+        if cached is not None and cached[0] is scheduler_output:
+            return cached[1], cached[2]
+        controller = self._spec_decode_controller
+        runner_invalid: dict[str, int] = {}
+        if self.use_async_scheduling:
+            resolved, runner_invalid = controller.substitute_retained_drafts(
+                scheduler_output, self._retained_drafts
+            )
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                self._retained_drafts.pop(req_id, None)
+        else:
+            resolved = controller.active_spec_decode_tokens(scheduler_output)
+        self._step_spec_tokens = (scheduler_output, resolved, runner_invalid)
+        return resolved, runner_invalid
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
 
@@ -1384,7 +1438,7 @@ class MetalModelRunner:
         """
         decode_segments = self._spec_decode_controller.build_decode_segments(
             decode_reqs,
-            self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
+            self._active_spec_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
@@ -1747,9 +1801,7 @@ class MetalModelRunner:
             has_resumed_requests=bool(cached_reqs.resumed_req_ids),
             has_preempted_requests=bool(scheduler_output.preempted_req_ids),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
-            has_spec_tokens=bool(
-                self._spec_decode_controller.active_spec_decode_tokens(scheduler_output)
-            ),
+            has_spec_tokens=bool(self._active_spec_tokens(scheduler_output)),
             has_structured_output=scheduler_output.has_structured_output_requests,
             has_mm_decode=has_mm_decode or mm_forward_forced,
             decode_req_ids=tuple(decode_req_ids),
@@ -1874,6 +1926,7 @@ class MetalModelRunner:
                         finished_req_ids=scheduler_output.finished_req_ids,
                     )
                 )
+                self._retain_drafts()
             return batch, scheduler_output
 
         # ---- wait for MLX forward to complete ----
@@ -2088,6 +2141,7 @@ class MetalModelRunner:
         self._draft_token_ids = (
             self._drafter.propose(draft_ctx) if self._drafter is not None else None
         )
+        self._retain_drafts()
 
         return batch, scheduler_output
 
@@ -2250,6 +2304,16 @@ class MetalModelRunner:
             # Only a proposer that keeps exact proposal distributions may
             # draft non-greedy requests.
             allow_stochastic=getattr(self._drafter, "proposals", None) is not None,
+            resolved_spec_tokens=(
+                self._resolve_spec_tokens(scheduler_output)[0]
+                if self.use_async_scheduling
+                else None
+            ),
+            runner_invalid_counts=(
+                self._resolve_spec_tokens(scheduler_output)[1]
+                if self.use_async_scheduling
+                else None
+            ),
         )
 
     def _run_vision_encoders(
@@ -2968,6 +3032,8 @@ class MetalModelRunner:
         # resumed request re-acquires it during recompute.
         if invalidated and self._drafter is not None:
             self._drafter.release_requests(invalidated)
+        for req_id in invalidated:
+            self._retained_drafts.pop(req_id, None)
 
         if runtime is not None:
             if invalidated:

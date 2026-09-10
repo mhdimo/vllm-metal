@@ -368,6 +368,12 @@ def main() -> None:
     parser.add_argument("--memory-fraction", default="0.2")
     parser.add_argument("--async-reference", action="store_true")
     parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="start every server with --async-scheduling (the production "
+        "scheduler; DSpark supports it since M9b) instead of --no-async-scheduling",
+    )
+    parser.add_argument(
         "--adaptive-calibration",
         type=Path,
         help="run every speculative server in the adaptive mode with this calibration artifact",
@@ -415,7 +421,7 @@ def main() -> None:
         }
 
     def start(
-        width: int, *, name: str | None = None, async_scheduling: bool = False
+        width: int, *, name: str | None = None, async_scheduling: bool | None = None
     ) -> Server:
         env = adaptive_env if width and adaptive_env else None
         server = Server(
@@ -424,7 +430,9 @@ def main() -> None:
             False,
             args.output_dir,
             name=name or (f"k{width}-adaptive" if env else None),
-            async_scheduling=async_scheduling,
+            async_scheduling=(
+                args.async_scheduling if async_scheduling is None else async_scheduling
+            ),
             env=env,
             expect_in_log="mode=adaptive" if env else None,
         )

@@ -592,6 +592,12 @@ def main() -> None:
     parser.add_argument("--memory-fraction", default="0.22")
     parser.add_argument("--startup-timeout", type=float, default=900)
     parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="start every server with --async-scheduling (DSpark supports it "
+        "since M9b) instead of --no-async-scheduling",
+    )
+    parser.add_argument(
         "--expect-no-drafts",
         action="store_true",
         help="the speculative servers run a mode that never drafts (bypass): "
@@ -617,7 +623,13 @@ def main() -> None:
     failures = 0
     try:
         for width, prefix in plan:
-            server = Server(args, width, prefix, args.output_dir)
+            server = Server(
+                args,
+                width,
+                prefix,
+                args.output_dir,
+                async_scheduling=args.async_scheduling,
+            )
             print(f"starting {server.name}: {' '.join(server.command)}", flush=True)
             server.wait_ready(args.startup_timeout)
             started = time.monotonic()

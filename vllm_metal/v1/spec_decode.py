@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_metal.v1.dspark.contracts import is_dspark_config
 from vllm_metal.v1.dspark.sampling import (
     DSparkProposal,
     SamplingTransforms,
@@ -112,13 +113,64 @@ class SpeculativeDecodeController:
         return {
             req_id: tuple(tokens)
             for req_id, tokens in spec_tokens.items()
-            if not (
-                tokens
-                and all(token_id == -1 for token_id in tokens)
-                and not invalid_counts.get(req_id)
-                and num_scheduled.get(req_id) == 1 + len(tokens)
+            if not SpeculativeDecodeController.is_placeholder_padding(
+                tokens, invalid_counts.get(req_id), num_scheduled.get(req_id)
             )
         }
+
+    @staticmethod
+    def is_placeholder_padding(
+        tokens: Sequence[int], invalid_count: int | None, num_scheduled: int | None
+    ) -> bool:
+        """Whether a scheduled draft list is the scheduler's own padding."""
+        return bool(
+            tokens
+            and all(token_id == -1 for token_id in tokens)
+            and not invalid_count
+            and num_scheduled == 1 + len(tokens)
+        )
+
+    @staticmethod
+    def substitute_retained_drafts(
+        scheduler_output: SchedulerOutput,
+        retained: Mapping[str, Sequence[int]],
+    ) -> tuple[dict[str, tuple[int, ...]], dict[str, int]]:
+        """Fill the asynchronous scheduler's placeholder slots with the runner's drafts.
+
+        Under asynchronous scheduling the scheduler books ``[-1] * K`` for
+        every running request and the worker supplies the drafts it produced
+        at the end of the previous step. Each placeholder list becomes the
+        request's retained drafts cut to the slot count; the unused slots are
+        reported through ``scheduler_output.num_invalid_spec_tokens`` so the
+        scheduler's statistics count real drafts (its rollback of
+        ``num_computed_tokens`` uses the slot count and needs nothing). Draft
+        lists that are not placeholders (the synchronous handoff) pass
+        through unchanged. Returns the resolved active drafts and the unused
+        slot counts this call added (the runner's accounting, as opposed to
+        counts the scheduler itself reported).
+        """
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        invalid_counts = dict(scheduler_output.num_invalid_spec_tokens or {})
+        num_scheduled = scheduler_output.num_scheduled_tokens
+        resolved: dict[str, tuple[int, ...]] = {}
+        runner_invalid: dict[str, int] = {}
+        for req_id, tokens in spec_tokens.items():
+            if not SpeculativeDecodeController.is_placeholder_padding(
+                tokens, invalid_counts.get(req_id), num_scheduled.get(req_id)
+            ):
+                resolved[req_id] = tuple(tokens)
+                continue
+            drafts = tuple(retained.get(req_id, ()))[: len(tokens)]
+            if any(token_id < 0 for token_id in drafts):
+                raise ValueError("retained drafts must be real token ids")
+            unused = len(tokens) - len(drafts)
+            if unused:
+                invalid_counts[req_id] = unused
+                runner_invalid[req_id] = unused
+            if drafts:
+                resolved[req_id] = drafts
+        scheduler_output.num_invalid_spec_tokens = invalid_counts or None
+        return resolved, runner_invalid
 
     def validate_supported(
         self,
@@ -130,25 +182,49 @@ class SpeculativeDecodeController:
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
         allow_stochastic: bool = False,
+        resolved_spec_tokens: Mapping[str, Sequence[int]] | None = None,
+        runner_invalid_counts: Mapping[str, int] | None = None,
     ) -> None:
         """Fail fast for unsupported or inconsistent scheduler handoffs.
 
         ``allow_stochastic`` admits drafts on plain temperature/top-k/top-p
         requests; only a proposer that keeps exact proposal distributions
-        (DSpark) may set it.
+        (DSpark) may set it. ``resolved_spec_tokens`` is the runner's own
+        resolution of the asynchronous scheduler's placeholder slots
+        (:meth:`substitute_retained_drafts`); the unused slots it reported
+        (``runner_invalid_counts``) are the runner's accounting, not
+        scheduler-invalid sentinels, and such a request may verify fewer rows
+        than the slots it was scheduled with.
         """
-        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
-        # back to the scheduler synchronously via take_draft_token_ids(), so
-        # async scheduling is unsupported whenever SD is enabled.
-        if use_async_scheduling and speculative_config is not None:
+        # The draft-model, MTP and n-gram Metal proposers hand drafts back to
+        # the scheduler synchronously via take_draft_token_ids(), so async
+        # scheduling is unsupported for them; DSpark follows the placeholder
+        # contract (the runner substitutes its retained drafts).
+        if (
+            use_async_scheduling
+            and speculative_config is not None
+            and not is_dspark_config(speculative_config)
+        ):
             raise NotImplementedError(
                 "Speculative decoding on Metal requires synchronous scheduling "
                 "so take_draft_token_ids() can hand drafts back to the "
                 "scheduler. Use --no-async-scheduling."
             )
 
-        spec_tokens = self.active_spec_decode_tokens(scheduler_output)
-        invalid_counts = scheduler_output.num_invalid_spec_tokens or {}
+        runner_resolved = resolved_spec_tokens is not None
+        spec_tokens = (
+            {req_id: tuple(tokens) for req_id, tokens in resolved_spec_tokens.items()}
+            if resolved_spec_tokens is not None
+            else self.active_spec_decode_tokens(scheduler_output)
+        )
+        own_counts = runner_invalid_counts or {}
+        invalid_counts = {
+            req_id: count
+            for req_id, count in (
+                scheduler_output.num_invalid_spec_tokens or {}
+            ).items()
+            if req_id not in own_counts
+        }
         if not spec_tokens and not invalid_counts:
             return
 
@@ -199,7 +275,13 @@ class SpeculativeDecodeController:
 
             expected_num_scheduled = len(draft_token_ids) + 1
             actual_num_scheduled = scheduler_output.num_scheduled_tokens.get(req_id)
-            if actual_num_scheduled != expected_num_scheduled:
+            consistent = (
+                actual_num_scheduled is not None
+                and actual_num_scheduled >= expected_num_scheduled
+                if runner_resolved and req_id in own_counts
+                else actual_num_scheduled == expected_num_scheduled
+            )
+            if not consistent:
                 raise ValueError(
                     "Speculative decode scheduler handoff has inconsistent "
                     f"token accounting for {req_id!r}: expected "

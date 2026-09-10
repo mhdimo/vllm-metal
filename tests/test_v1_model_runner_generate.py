@@ -107,6 +107,77 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     assert isinstance(runner._drafter, Gemma4MTPProposer)
 
 
+class TestAsyncSchedulingRetainedDrafts:
+    """Under asynchronous scheduling the runner fills the scheduler's slots."""
+
+    def _output(self, req_ids: list[str], slots: int) -> SchedulerOutput:
+        cached = CachedRequestData(
+            req_ids=list(req_ids),
+            resumed_req_ids=set(),
+            new_token_ids=[[] for _ in req_ids],
+            all_token_ids={},
+            new_block_ids=[None for _ in req_ids],
+            num_computed_tokens=[1 for _ in req_ids],
+            num_output_tokens=[1 for _ in req_ids],
+        )
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached,
+            num_scheduled_tokens=dict.fromkeys(req_ids, 1 + slots),
+            total_num_scheduled_tokens=(1 + slots) * len(req_ids),
+            scheduled_spec_decode_tokens={req_id: [-1] * slots for req_id in req_ids},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=slots,
+        )
+
+    def test_retained_drafts_are_resolved_once_and_spent(self) -> None:
+        runner = make_stub_runner()
+        runner.use_async_scheduling = True
+        runner._draft_token_ids = DraftTokenIds(
+            req_ids=["r0", "r1"], draft_token_ids=[[4, 5], []]
+        )
+        runner._retain_drafts()
+        assert runner._retained_drafts == {"r0": [4, 5]}
+        output = self._output(["r0", "r1"], slots=3)
+        assert runner._active_spec_tokens(output) == {"r0": (4, 5)}
+        assert output.num_invalid_spec_tokens == {"r0": 1, "r1": 3}
+        # Spent by the step that scheduled the request; the same step resolves
+        # to the same answer without touching the retained drafts again.
+        assert runner._retained_drafts == {}
+        assert runner._active_spec_tokens(output) == {"r0": (4, 5)}
+        # The next step has nothing to verify.
+        following = self._output(["r0", "r1"], slots=3)
+        assert runner._active_spec_tokens(following) == {}
+        assert following.num_invalid_spec_tokens == {"r0": 3, "r1": 3}
+
+    def test_synchronous_scheduling_keeps_the_scheduler_handoff(self) -> None:
+        runner = make_stub_runner()
+        runner.use_async_scheduling = False
+        runner._draft_token_ids = DraftTokenIds(req_ids=["r0"], draft_token_ids=[[4]])
+        runner._retain_drafts()
+        assert runner._retained_drafts == {}
+        output = self._output(["r0"], slots=2)
+        # Placeholder padding from the synchronous scheduler carries no drafts.
+        assert runner._active_spec_tokens(output) == {}
+        assert output.num_invalid_spec_tokens is None
+
+    def test_lifecycle_release_drops_retained_drafts(self) -> None:
+        runner = make_stub_runner()
+        runner.use_async_scheduling = True
+        runner._retained_drafts = {"r0": [4], "r1": [5]}
+        runner._reconcile_request_lifecycle(
+            evicted_req_ids={"r0"},
+            preempted_req_ids=set(),
+            resumed_req_ids=set(),
+            materialize_runtime_state=False,
+        )
+        assert runner._retained_drafts == {"r1": [5]}
+
+
 class TestDrafterReleaseOnLifecycle:
     def test_reconcile_releases_drafter_state_for_invalidated_requests(self) -> None:
         released: list[set[str]] = []

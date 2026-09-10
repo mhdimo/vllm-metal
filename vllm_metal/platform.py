@@ -478,7 +478,10 @@ class MetalPlatform(Platform):
                 "draft model that shares the target vocabulary."
             )
 
-        from vllm_metal.v1.dspark.contracts import validate_dspark_config
+        from vllm_metal.v1.dspark.contracts import (
+            is_dspark_config,
+            validate_dspark_config,
+        )
 
         validate_dspark_config(
             vllm_config, use_paged_attention=config.use_paged_attention
@@ -502,14 +505,18 @@ class MetalPlatform(Platform):
                 "1 + num_speculative_tokens, or leave it unset."
             )
 
-        # All three Metal proposers (draft-model, MTP, n-gram) hand drafts back
-        # to the scheduler synchronously via take_draft_token_ids(), so async
-        # scheduling cannot serve speculative decoding. vLLM 0.28.0 auto-enables
-        # async scheduling for draft-model SD (vllm#48341); restore the working
-        # default, the same downgrade shape as the STT scheduler policy.
+        # The draft-model, MTP and n-gram Metal proposers hand drafts back to
+        # the scheduler synchronously via take_draft_token_ids(), which vLLM's
+        # asynchronous engine loop never calls, so async scheduling cannot
+        # serve them. vLLM 0.28.0 auto-enables async scheduling for draft-model
+        # SD (vllm#48341); restore the working default, the same downgrade
+        # shape as the STT scheduler policy. DSpark follows the asynchronous
+        # scheduler's placeholder contract instead (the runner substitutes the
+        # drafts it retained at execution time), so it keeps vLLM's decision.
         if (
             speculative_config is not None
             and vllm_config.scheduler_config.async_scheduling
+            and not is_dspark_config(speculative_config)
         ):
             vllm_config.scheduler_config.async_scheduling = False
             logger.warning(
