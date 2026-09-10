@@ -232,6 +232,12 @@ def main() -> None:
     parser.add_argument("--batch-tokens", type=int, default=512)
     parser.add_argument("--memory-fraction", default="0.2")
     parser.add_argument("--async-reference", action="store_true")
+    parser.add_argument(
+        "--adaptive-calibration",
+        type=Path,
+        help="run every speculative server in the adaptive mode with this calibration artifact",
+    )
+    parser.add_argument("--adaptive-cost-model", type=Path)
     parser.add_argument("--startup-timeout", type=float, default=900)
     args = parser.parse_args()
     if not args.target.is_dir() or not args.draft.is_dir():
@@ -263,22 +269,36 @@ def main() -> None:
         memory_fraction=args.memory_fraction,
     )
 
+    adaptive_env: dict[str, str] | None = None
+    if args.adaptive_calibration or args.adaptive_cost_model:
+        if not (args.adaptive_calibration and args.adaptive_cost_model):
+            parser.error("--adaptive-calibration and --adaptive-cost-model go together")
+        adaptive_env = {
+            "VLLM_METAL_DSPARK_MODE": "adaptive",
+            "VLLM_METAL_DSPARK_CALIBRATION": str(args.adaptive_calibration.resolve()),
+            "VLLM_METAL_DSPARK_COST_MODEL": str(args.adaptive_cost_model.resolve()),
+        }
+
     def start(
         width: int, *, name: str | None = None, async_scheduling: bool = False
     ) -> Server:
+        env = adaptive_env if width and adaptive_env else None
         server = Server(
             server_args,
             width,
             False,
             args.output_dir,
-            name=name,
+            name=name or (f"k{width}-adaptive" if env else None),
             async_scheduling=async_scheduling,
+            env=env,
+            expect_in_log="mode=adaptive" if env else None,
         )
         server.wait_ready(args.startup_timeout)
         return server
 
     report: dict = {
         "protocol": {
+            "adaptive": adaptive_env is not None,
             "buckets": [f"{i}x{o}" for i, o in buckets],
             "concurrency": concurrencies,
             "repetitions": args.repetitions,
@@ -301,7 +321,7 @@ def main() -> None:
                         prompts = build_prompts(
                             tokenizer, args.repo, input_length, concurrency
                         )
-                        key = f"k{width}/{input_length}x{output}/c{concurrency}"
+                        key = f"{candidate.name}/{input_length}x{output}/c{concurrency}"
                         before = metrics(candidate.base)
                         measured = measure_bucket(
                             {"k0": reference, "k": candidate},

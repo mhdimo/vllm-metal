@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_DSPARK_MAX_CONTEXTS: int = 32
     VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP: int = 0
+    VLLM_METAL_DSPARK_MODE: str = "fixed"
+    VLLM_METAL_DSPARK_CALIBRATION: str = ""
+    VLLM_METAL_DSPARK_COST_MODEL: str = ""
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -133,6 +136,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # cap binds, requests rotate least-recently-drafted first, so none starves.
     "VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP": lambda: int(
         os.getenv("VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP", "0")
+    ),
+    # DSpark serving mode: "fixed" verifies the configured width; "adaptive"
+    # plans each request's draft prefix (and whether to draft at all) from the
+    # calibrated confidence and the measured cost model, and needs both
+    # artifacts below; "bypass" keeps the drafter loaded and the contexts
+    # advancing but never drafts (the planner's alternative step, for profiling
+    # and A/B serving).
+    "VLLM_METAL_DSPARK_MODE": lambda: os.getenv(
+        "VLLM_METAL_DSPARK_MODE", "fixed"
+    ).lower(),
+    "VLLM_METAL_DSPARK_CALIBRATION": lambda: os.getenv(
+        "VLLM_METAL_DSPARK_CALIBRATION", ""
+    ),
+    "VLLM_METAL_DSPARK_COST_MODEL": lambda: os.getenv(
+        "VLLM_METAL_DSPARK_COST_MODEL", ""
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended

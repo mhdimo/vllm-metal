@@ -170,6 +170,18 @@ repeats) and applies the M4a tie rule to every divergence; see the
 [progress record](design/dspark-progress.md). The Metal platform rejects
 `min_tokens` on every server, speculative or not.
 
+`VLLM_METAL_DSPARK_MODE=adaptive` (with `VLLM_METAL_DSPARK_CALIBRATION` and
+`VLLM_METAL_DSPARK_COST_MODEL` pointing at the pair's calibration artifact
+and this machine's cost model, see [configuration](configuration.md)) lets
+the proposer plan each request's draft prefix from its calibrated confidence
+and the measured step costs, and skip drafting altogether when the bypass
+step is predicted to be faster; `fixed`, the default, verifies the configured
+width for every eligible request, and `bypass` keeps the drafter loaded but
+never drafts. The artifacts come from
+`tools/dspark_confidence_calibrate.py` and `tools/dspark_cost_profile.py`;
+startup fails with the reason when either is missing or belongs to another
+pair.
+
 Fixed-K performance on M5 Max with the 4B pair (see the progress record for
 the protocol and every cell): at one request, `num_speculative_tokens` 2-4
 raises output tokens per second by 36-49% on 128-token prompts and by 10-14%

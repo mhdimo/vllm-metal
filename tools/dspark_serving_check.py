@@ -68,9 +68,12 @@ class Server:
         name: str | None = None,
         async_scheduling: bool = False,
         extra_args: tuple[str, ...] = (),
+        env: dict[str, str] | None = None,
+        expect_in_log: str | None = None,
     ):
         self.width = width
         self.prefix_caching = prefix_caching
+        self.expect_in_log = expect_in_log
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         name = name or f"k{width}{'-prefix' if prefix_caching else ''}"
@@ -111,8 +114,16 @@ class Server:
                 ),
             ]
         self.command = command
+        # ``vllm serve`` is an entry-point script, so the checkout this harness
+        # lives in must be put on the path explicitly (an editable install of
+        # another checkout would win otherwise).
+        repo_root = str(Path(__file__).resolve().parents[1])
         env = dict(
             os.environ,
+            PYTHONPATH=os.pathsep.join(
+                [repo_root, *filter(None, [os.environ.get("PYTHONPATH")])]
+            ),
+            **(env or {}),
             VLLM_USE_V2_MODEL_RUNNER="0",
             VLLM_METAL_USE_PAGED_ATTENTION="1",
             VLLM_METAL_MEMORY_FRACTION=str(args.memory_fraction),
@@ -139,11 +150,24 @@ class Server:
                     )
                 try:
                     if client.get(f"{self.base}/health").status_code == 200:
+                        self._check_log()
                         return
                 except httpx.HTTPError:
                     pass
                 time.sleep(1)
         raise RuntimeError(f"{self.name} did not become healthy; see {self.log_path}")
+
+    def _check_log(self) -> None:
+        """Prove the server runs the expected configuration, not a default."""
+        if self.expect_in_log is None:
+            return
+        self.log.flush()
+        text = Path(self.log_path).read_text(errors="replace")
+        if self.expect_in_log not in text:
+            raise RuntimeError(
+                f"{self.name} log lacks {self.expect_in_log!r}; the server did not "
+                f"start in the expected mode (see {self.log_path})"
+            )
 
     def stop(self) -> None:
         if self.process.poll() is None:

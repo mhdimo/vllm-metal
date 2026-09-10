@@ -35,17 +35,25 @@ def _manifest() -> CalibrationManifest:
 
 
 def _sample(
-    requests: int, width: int, target: float, draft: float = 2.0, host: float = 0.5
+    requests: int,
+    width: int,
+    target: float,
+    draft: float = 2.0,
+    host: float = 0.5,
+    context: int = 256,
 ) -> CostSample:
+    extra = (draft + host) if width else 0.0
     return CostSample(
         requests=requests,
         width=width,
         rows=requests * (width + 1),
+        context=context,
+        step_ms=target + extra,
         target_ms=target,
         draft_ms=draft,
         host_ms=host,
         steps=50,
-        target_p95_ms=target * 1.1,
+        step_p95_ms=(target + extra) * 1.1,
     )
 
 
@@ -63,12 +71,7 @@ def _convex_model(requests_levels=(1, 2, 4), widths=(0, 1, 2, 4, 7)) -> CostMode
                     draft=1.0 + 0.5 * requests,
                 )
             )
-    return CostModel(
-        manifest=_manifest(),
-        samples=samples,
-        machine={"chip": "test"},
-        context_tokens=256,
-    )
+    return CostModel(manifest=_manifest(), samples=samples, machine={"chip": "test"})
 
 
 def _oracle(survival, cost, requests):
@@ -81,38 +84,63 @@ def _oracle(survival, cost, requests):
         tokens = requests + sum(
             sum(row[:length]) for row, length in zip(survival, lengths, strict=True)
         )
-        ratio = tokens / cost.step_ms(requests, rows, drafted=True)
+        ratio = tokens / cost.step_ms(requests, rows, 256, drafted=True)
         if best is None or ratio > best[0] + 1e-12:
             best = (ratio, lengths)
     return best
 
 
-def test_cost_model_interpolates_rows_and_request_levels() -> None:
+def test_cost_model_interpolates_rows_requests_and_contexts() -> None:
     cost = _convex_model()
     # Exact at profiled cells.
-    assert cost.target_ms(1, 1) == pytest.approx(6.0 + 0.5 + 0.02)
-    assert cost.target_ms(4, 32) == pytest.approx(6.0 + 16.0 + 0.02 * 1024)
+    assert cost.target_ms(1, 1, 256) == pytest.approx(6.0 + 0.5 + 0.02)
+    assert cost.target_ms(4, 32, 256) == pytest.approx(6.0 + 16.0 + 0.02 * 1024)
     # Between profiled widths at one level: linear in rows.
-    low, high = cost.target_ms(1, 3), cost.target_ms(1, 5)
-    assert low < cost.target_ms(1, 4) < high
+    low, high = cost.target_ms(1, 3, 256), cost.target_ms(1, 5, 256)
+    assert low < cost.target_ms(1, 4, 256) < high
     # Between request levels: interpolated at equal rows per request.
-    assert cost.target_ms(2, 4) < cost.target_ms(3, 6) < cost.target_ms(4, 8)
-    assert cost.draft_ms(3) == pytest.approx(2.5)
-    assert cost.host_ms(2) == 0.5
-    assert cost.step_ms(2, 2, drafted=False) == cost.target_ms(2, 2)
-    assert cost.step_ms(2, 2, drafted=True) == pytest.approx(
-        cost.target_ms(2, 2) + 2.0 + 0.5
+    assert (
+        cost.target_ms(2, 4, 256)
+        < cost.target_ms(3, 6, 256)
+        < cost.target_ms(4, 8, 256)
     )
-    # Bounds: profiled request levels and rows per request.
+    assert cost.draft_ms(3, 256) == pytest.approx(2.5)
+    assert cost.host_ms(2, 256) == 0.5
+    assert cost.step_ms(2, 2, 256, drafted=False) == cost.target_ms(2, 2, 256)
+    assert cost.step_ms(2, 2, 256, drafted=True) == pytest.approx(
+        cost.target_ms(2, 2, 256) + 2.0 + 0.5
+    )
+    # Bounds: profiled request levels, rows per request and context.
     assert cost.max_requests == 4 and cost.max_rows(3) == 16 and cost.max_rows(4) == 32
-    assert cost.within_bounds(4, 32) and not cost.within_bounds(4, 33)
-    assert cost.within_bounds(3, 24) and not cost.within_bounds(3, 25)
-    assert not cost.within_bounds(5, 5) and not cost.within_bounds(0, 0)
+    assert cost.within_bounds(4, 32, 256) and not cost.within_bounds(4, 33, 256)
+    assert cost.within_bounds(3, 24, 100) and not cost.within_bounds(3, 25, 256)
+    assert not cost.within_bounds(5, 5, 256) and not cost.within_bounds(0, 0, 256)
+    assert not cost.within_bounds(1, 1, 257)  # beyond the longest profiled context
+    # Context levels interpolate linearly and clamp below the shortest.
+    samples = []
+    for context, slope in ((128, 0.5), (1024, 1.5)):
+        for requests in (1, 2):
+            for width in (0, 1, 2):
+                rows = requests * (width + 1)
+                samples.append(
+                    _sample(requests, width, 6.0 + slope * rows, context=context)
+                )
+    layered = CostModel(manifest=_manifest(), samples=samples)
+    assert layered.context_levels == [128, 1024] and layered.max_context == 1024
+    assert layered.target_ms(1, 2, 128) == pytest.approx(7.0)
+    assert layered.target_ms(1, 2, 1024) == pytest.approx(9.0)
+    assert layered.target_ms(1, 2, 576) == pytest.approx(8.0)
+    assert layered.target_ms(1, 2, 64) == pytest.approx(7.0)
+    with pytest.raises(ValueError, match="same request levels"):
+        CostModel(
+            manifest=_manifest(),
+            samples=[*samples, _sample(4, 0, 9.0, context=1024)],
+        )
 
 
 def test_cost_model_rejects_bad_samples_and_round_trips(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="rows = requests"):
-        CostSample(1, 2, 2, 1.0, 1.0, 1.0, 10, 1.0)
+        CostSample(1, 2, 2, 256, 3.0, 1.0, 1.0, 1.0, 10, 1.0)
     with pytest.raises(ValueError, match="width-0"):
         CostModel(manifest=_manifest(), samples=[_sample(1, 1, 5.0)])
     with pytest.raises(ValueError, match="duplicate"):
@@ -124,7 +152,7 @@ def test_cost_model_rejects_bad_samples_and_round_trips(tmp_path: Path) -> None:
     path.write_text(cost.to_json())
     loaded = CostModel.load(path)
     assert loaded.schema == COST_SCHEMA and loaded.samples == cost.samples
-    assert loaded.machine == {"chip": "test"} and loaded.context_tokens == 256
+    assert loaded.machine == {"chip": "test"} and loaded.context_levels == [256]
     loaded.validate(_manifest())
     other = replace(_manifest(), draft_revision="d2")
     with pytest.raises(ValueError, match="another model pair"):
@@ -150,7 +178,7 @@ def test_planner_matches_the_oracle_on_convex_costs(seed: int) -> None:
             running *= value
             row.append(running)
         survival.append(row)
-    plan = plan_prefixes(survival, cost)
+    plan = plan_prefixes(survival, cost, context=256)
     best_ratio, best_lengths = _oracle(survival, cost, requests)
     assert plan.ratio == pytest.approx(best_ratio)
     assert plan.rows == requests + sum(plan.lengths)
@@ -165,7 +193,7 @@ def test_planner_is_causal_prefix_closed_and_deterministic() -> None:
     cost = _convex_model()
     # Equal scores: the earlier position wins, then the lower batch index.
     survival = [[0.9, 0.9], [0.9, 0.9]]
-    plan = plan_prefixes(survival, cost)
+    plan = plan_prefixes(survival, cost, context=256)
     assert plan.admitted[:3] == ((0, 0), (1, 0), (0, 1))
     assert all(
         plan.lengths[index] == position + 1 or plan.lengths[index] > position
@@ -173,7 +201,7 @@ def test_planner_is_causal_prefix_closed_and_deterministic() -> None:
     )
     # A request whose next position was skipped never advances later.
     survival = [[0.99, 0.01, 0.01], [0.5]]
-    plan = plan_prefixes(survival, cost)
+    plan = plan_prefixes(survival, cost, context=256)
     assert plan.lengths[0] in (1, 2, 3) and plan.stopped_by in (
         "no-improvement",
         "exhausted",
@@ -181,14 +209,14 @@ def test_planner_is_causal_prefix_closed_and_deterministic() -> None:
     if plan.lengths[0] == 1:
         assert plan.stopped_by == "no-improvement"
     # Caps and the hard row cap truncate the prefix without reordering.
-    capped = plan_prefixes([[0.99, 0.98, 0.97, 0.96]], cost, caps=[2])
+    capped = plan_prefixes([[0.99, 0.98, 0.97, 0.96]], cost, context=256, caps=[2])
     assert capped.lengths == (2,)
-    rows = plan_prefixes([[0.99, 0.98, 0.97, 0.96]], cost, max_rows=3)
+    rows = plan_prefixes([[0.99, 0.98, 0.97, 0.96]], cost, context=256, max_rows=3)
     assert rows.lengths == (2,) and rows.stopped_by == "row-cap"
     with pytest.raises(ValueError, match="at least one request"):
-        plan_prefixes([], cost)
+        plan_prefixes([], cost, context=256)
     with pytest.raises(ValueError, match="lie in"):
-        plan_prefixes([[1.5]], cost)
+        plan_prefixes([[1.5]], cost, context=256)
 
 
 def test_planner_stops_early_on_a_non_unimodal_curve() -> None:
@@ -202,7 +230,7 @@ def test_planner_stops_early_on_a_non_unimodal_curve() -> None:
         _sample(1, 7, 13.0),
     ]
     cost = CostModel(manifest=_manifest(), samples=samples)
-    plan = plan_prefixes([[0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65]], cost)
+    plan = plan_prefixes([[0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65]], cost, context=256)
     assert plan.lengths == (1,) and plan.stopped_by == "no-improvement"
     best_ratio, _ = _oracle([[0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65]], cost, 1)
     assert best_ratio > plan.ratio  # no global-optimality claim on such a curve
@@ -211,17 +239,17 @@ def test_planner_stops_early_on_a_non_unimodal_curve() -> None:
 def test_should_draft_compares_with_target_only_and_bounds() -> None:
     cost = _convex_model()
     confident = [[0.95, 0.9, 0.85]]
-    decision = should_draft(confident, cost)
+    decision = should_draft(confident, cost, context=256)
     assert decision.draft and decision.reason == "ok" and decision.plan is not None
     assert decision.plan.ratio > decision.plan.target_only_ratio
     hopeless = [[0.05, 0.01]]
-    decision = should_draft(hopeless, cost)
+    decision = should_draft(hopeless, cost, context=256)
     assert not decision.draft and decision.reason in (
         "planner-empty",
         "target-only-faster",
     )
-    assert should_draft([], cost).reason == "no-requests"
-    assert should_draft([[0.9]] * 5, cost).reason == "outside-cost-bounds"
+    assert should_draft([], cost, context=256).reason == "no-requests"
+    assert should_draft([[0.9]] * 5, cost, context=256).reason == "outside-cost-bounds"
     # Drafting costs the backbone: with an expensive draft even a good prefix loses.
     pricey = CostModel(
         manifest=_manifest(),
@@ -229,7 +257,7 @@ def test_should_draft_compares_with_target_only_and_bounds() -> None:
             _sample(1, w, 6.0 + 0.5 * (w + 1), draft=40.0) for w in (0, 1, 2, 4, 7)
         ],
     )
-    assert should_draft(confident, pricey).reason == "target-only-faster"
+    assert should_draft(confident, pricey, context=256).reason == "target-only-faster"
 
 
 def test_cost_model_makes_measured_dips_non_decreasing() -> None:
@@ -241,5 +269,5 @@ def test_cost_model_makes_measured_dips_non_decreasing() -> None:
         _sample(1, 7, 12.0),
     ]
     cost = CostModel(manifest=_manifest(), samples=samples)
-    assert cost.target_ms(1, 3) == 9.0 and cost.target_ms(1, 5) == 9.0
-    assert cost.target_ms(1, 6) == pytest.approx(10.0)
+    assert cost.target_ms(1, 3, 256) == 9.0 and cost.target_ms(1, 5, 256) == 9.0
+    assert cost.target_ms(1, 6, 256) == pytest.approx(10.0)

@@ -8,8 +8,8 @@ and serving qualification gates pass.
 For the verified integration revision, M5 Max setup, exact reproduction commands,
 raw-evidence transfer and remaining implementation sequence, start with the
 [development handoff](dspark-handoff.md), checked on 2026-09-10. M4, M5 and
-M6a are qualified on the M5 Max destination machine (sections below); M6b, M7
-and M8 remain open.
+M6 are qualified on the M5 Max destination machine (sections below); M7 and
+M8 remain open.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ and M8 remain open.
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
 | M4: Fixed-greedy serving | Complete on M5 Max for the pinned 4B pair: M4a parity contract ([record](dspark-m4-parity.md)), M4b admission fairness, M4c HTTP serving semantics, M4d fixed-K performance | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; admission caps measured on a real engine; the HTTP matrix passes with every divergence a tie; fixed K=2-4 gives +36-49% tokens/s at one request on short prompts and loses 4-28% at four concurrent requests (multi-row verification cost), so adaptive bypass is M6 work. |
 | M5: Stochastic verification | Complete on M5 Max for the pinned 4B pair | Exact float32 proposal distributions kept with every scheduled draft, rejection/residual/bonus sampling from per-request streams, enumerated oracle and powered distribution tests, real-engine distribution and mixed-workload gate. |
-| M6: Calibrated adaptive planning | M6a done on M5 Max (calibration, cost model, planner); M6b serving integration open | Confidence recording with censored labels, sequential temperature scaling with holdout reliability, measured cost model with bounds, causal prefix planner with an oracle; adaptive mode, counters and its evaluation follow. |
+| M6: Calibrated adaptive planning | Complete on M5 Max for the pinned 4B pair | Confidence recording with censored labels, sequential temperature scaling with holdout reliability, measured cost model with bounds, causal prefix planner with an oracle, and the adaptive serving mode with bypass, history reset and counters, evaluated in the paired protocol. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
 | M8: Additional standalone pairs | Planned | Pair-specific target adapters, precision, capacity and serving qualification within 48 GB. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
@@ -819,7 +819,11 @@ cover the decision's reasons, the model's interpolation and bounds, and both
 artifacts' validation. Integration of the planner into serving (adaptive
 mode, counters, bypass) is M6b.
 
-The cost artifact for this machine (`results/m5max-m6-cost-01/cost.json`;
+The in-process cost artifact recorded here was superseded in M6b by a
+serving-path profile (`dspark-cost/2`, see the M6b section) after the first
+adaptive evaluation showed it under-predicts the served step; the numbers
+stay as the attribution record. The cost artifact for this machine
+(`results/m5max-m6-cost-01/cost.json`;
 Apple M5 Max, MLX 0.32.1, decode pipeline disabled, 128-token outputs on the
 natural prompts, memory fraction 0.22) covers 1, 2, 4, 8 and 16 active
 requests at widths 0, 1, 2, 3, 4, 5 and 7. Target forward with verification
