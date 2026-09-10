@@ -98,10 +98,16 @@ def check_family(family: str) -> dict:
     from deepspec.modeling.dspark.gemma4.modeling import Gemma4DSparkModel
     from deepspec.modeling.dspark.qwen3.modeling import Qwen3DSparkModel
     from transformers import DynamicCache
+    from vllm.sampling_params import SamplingParams
 
     from vllm_metal.v1.dspark.config import DSparkConfig
     from vllm_metal.v1.dspark.model import DSparkDrafter
-    from vllm_metal.v1.dspark_proposer import DSparkProposer, _DraftPlan
+    from vllm_metal.v1.dspark_proposer import (
+        DSparkProposer,
+        _DraftPlan,
+        _RequestContext,
+    )
+    from vllm_metal.v1.model_runner import RequestState
     from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
     cfg = _configuration(family)
@@ -195,7 +201,15 @@ def check_family(family: str) -> dict:
         tokens = port.sample_block(port.compute_logits(hidden)[0, :2], 2)
         mx.eval(tokens)
         expected.append(tokens.tolist())
-        plans.append(_DraftPlan(str(length), 2, length, cache, 2))
+        owner = RequestState(
+            token_ids=[2] * (length + 1),
+            prompt_len=length,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+        )
+        plans.append(
+            _DraftPlan(str(length), 2, _RequestContext(owner, cache, length), 2)
+        )
     proposer = DSparkProposer(
         drafter=port,
         config=port_config,

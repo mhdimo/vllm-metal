@@ -54,8 +54,13 @@ resume via `release_requests`. Do not replace that ownership with pruning based
 only on absence from `request_states`: IDs can be reused within a step. New
 probability/workspace/history state must join the same cleanup path.
 
-This documentation change corrects the stale F8 descriptions and adds part of
-the F7 reference evidence. Runtime findings and model qualification remain open.
+The initial documentation change corrected stale F8 descriptions and added part
+of the F7 reference evidence. M0-M2 subsequently resolved F1-F3 and the guarded
+support/provenance portions of F5/F8/F9. See the [progress record](dspark-progress.md)
+for passing regressions and real 4B results. F4 resource planning, full F5
+precision/loading qualification, F6 completion and the broader F7 serving matrix
+remain open; the baseline witnesses below intentionally preserve the original
+failure evidence.
 
 The MLX port is attributed to [ARahim3/mlx-dspark][port]; its inspected
 [MIT notice][port-license] names copyright holder `erahim3`. That independent
@@ -200,17 +205,19 @@ Using 5.10.2 resolved that reference-side failure. Do not patch the oracle's mod
 equations to make a port pass. The helper is a manual audit tool and adds no
 DeepSpec dependency to the serving package.
 
-### Resume the real-checkpoint smoke
+### Repeat the real-checkpoint checks
 
 The selected target is `mlx-community/Qwen3-4B-4bit` at
 `4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25`; the drafter is the official Qwen3-4B
 revision above. Their weight files are 2,263,022,529 and 2,786,273,970 bytes.
-Downloads were attempted, but the weight transfer did not complete during this
-audit. No model weights or partial downloads are part of this change.
+Weight downloads did not finish during the original audit. They completed during
+M0-M2 implementation, enabling the [capture and lifecycle checks](dspark-progress.md).
+No model weights or partial downloads are committed to the repository.
 
-The following uses local immutable snapshots for reproducibility. M0 also forwards
-the resolved draft revision when using a repository ID. Run the smoke after F1-F3 are fixed for qualification; running
-the audited baseline is useful only to capture failures and limited diagnostics.
+The following uses local immutable snapshots for reproducibility. M0 also
+forwards the resolved draft revision when using a repository ID. Use the updated
+checkers on the implementation branch; running the audited baseline remains
+useful only to capture failures and limited diagnostics.
 
 ```bash
 hf download mlx-community/Qwen3-4B-4bit \
@@ -222,19 +229,18 @@ hf download deepseek-ai/dspark_qwen3_4b_block7 \
   --include '*.json' '*.safetensors' \
   --local-dir .validation-dspark/draft
 
-VLLM_USE_V2_MODEL_RUNNER=0 VLLM_METAL_BUILD_FROM_SOURCE=1 \
-  python -m tools.check_sd_lossless \
-    --model "$PWD/.validation-dspark/target" \
+python -m tools.dspark_lifecycle_check \
+    --target "$PWD/.validation-dspark/target" \
     --draft "$PWD/.validation-dspark/draft" \
-    --method dspark -k 2 --num-prompts 12 --max-tokens 64 \
-    --max-model-len 512 --memory-fraction 0.35
+    --concurrency 4 --width 2 --prefix-cache \
+    --output-dir "$PWD/.validation-dspark/results"
 ```
 
-The existing checker has the F7 limitations above. Preserve stdout and engine
-metrics and require positive proposed/verified counts; its final `PASS` alone is
-insufficient. Add durable result output, timeout handling, shape/streaming tests,
-prefix hits and natural stopping before using it as the E4 gate. Do not use its
-single elapsed-time printout as a production benchmark.
+The new checker preserves engine logs/results, imposes a worker timeout, requires
+positive proposal/verification/acceptance counts, and exercises prefix hits and
+cancellation/cleanup. The older `check_sd_lossless` retains its F7 limitations.
+Streaming and natural stopping still require the broader E4 qualification;
+these bounded probes and their wall times are not production benchmarks.
 
 ## Required experiments
 
@@ -364,17 +370,18 @@ text out of production telemetry; bounded diagnostic capture should be explicit.
 
 ## Handoff order and open experiments
 
-Current status: E1 is **partially covered** by the committed tiny-model checker;
-E2/F1 and E3/F3 have **reproduced failures**; E4-E12 are **open**. E4's selected
-4B pair can fit an appropriately bounded local experiment once downloads and
-runtime fixes are complete. E5-E9 require implementation, not different hardware.
+After M0-M2: E1 remains **partially covered** by the committed tiny-model checker;
+E2/F1 and E3/F2-F3 pass the Qwen3 capture/context milestone gates, including real
+4B capture parity and bounded lifecycle probes. E4 has **partial 4B evidence**:
+40 paired request outputs at concurrency 1/4 and K=2/7 match baseline, with
+positive verification and acceptance. Full serving/resource/performance
+qualification and E5-E12 remain **open**. E5-E9 require implementation, not different hardware.
 E10/E11 need model-specific implementation and capacity/access checks. E12
 requires a V4 backend and hardware beyond both available Macs.
 
-1. Fix F1 with a runner-level failing regression, then establish absolute feature
-   span metadata and F2/F3 regressions. Preserve the current lifecycle release
-   owner while extending it.
-2. Implement the immutable pair/resource plan before increasing context length,
+1. Preserve the passing F1-F3 regressions and existing runner lifecycle owner.
+   Use the new local-checkpoint checkers as the starting smoke tests.
+2. Implement the complete immutable pair/resource plan before increasing context length,
    model size or concurrency. Re-run local 4B tests with positive verification
    counters, prefix caching and mixed arrivals.
 3. Complete E1-E4 locally for the supported greedy subset. Keep reference tests
