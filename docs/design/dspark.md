@@ -14,6 +14,9 @@ existing behavior or attributed to an external source.
 Completed changes and their validation are tracked in the
 [implementation progress record](dspark-progress.md). The audit findings below
 describe the original baseline, not the resolution status of later commits.
+The [development handoff](dspark-handoff.md) consolidates the verified M0-M3
+integration state, M5 Max migration instructions and remaining implementation
+and experiment work.
 
 ## Scope and completion criteria
 
