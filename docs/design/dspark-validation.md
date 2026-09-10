@@ -8,6 +8,9 @@ findings are fixed.
 
 See the [implementation progress record](dspark-progress.md) for resolutions
 after this audit and the validation attached to each milestone.
+For current status and migration to the M5 Max, use the
+[development handoff](dspark-handoff.md); this document retains the original
+audit findings and full experiment matrix.
 
 ## Checkpoint manifest
 

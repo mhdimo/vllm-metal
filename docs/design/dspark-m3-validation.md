@@ -6,6 +6,10 @@ M4 with 32 GB unified memory. It does **not** establish a production DSpark
 release: extended generation exposed an exact-token parity failure that remains
 an explicit M4 gate. The failed experiments are preserved below.
 
+The [development handoff](dspark-handoff.md) provides the verified integration
+revision, fresh M5 Max environment, evidence archive and ordered reproduction
+commands. No destination-machine qualification is implied by this M3 record.
+
 ## Model pair and environment
 
 | Component | Identity |

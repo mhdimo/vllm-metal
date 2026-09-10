@@ -5,13 +5,22 @@ The [specification](dspark.md) defines milestone gates; the
 All runtime support remains experimental until the corresponding model, memory
 and serving qualification gates pass.
 
+For the verified integration revision, M5 Max setup, exact reproduction commands,
+raw-evidence transfer and remaining implementation sequence, start with the
+[development handoff](dspark-handoff.md), checked on 2026-09-10. The handoff is
+documentation only; M4-M8 remain open and the destination machine is untested.
+
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
 | M0: Baseline and contract | [Complete: #1](https://github.com/mhdimo/vllm-metal/pull/1) | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions tracked the defects fixed in M1/M2. |
 | M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
-| M4-M8 | Planned | Serving, stochastic verification, confidence scheduling and additional model pairs. |
+| M4: Fixed-greedy serving | Open; parity blocked | Resolve both extended parity failures, qualify fair admission and HTTP semantics, then measure fixed-K performance. |
+| M5: Stochastic verification | Planned | Exact proposal-distribution ownership, rejection/bonus sampling and distribution tests. |
+| M6: Calibrated adaptive planning | Planned | Recipe-specific confidence calibration, measured cost curves and causal admission/planning. |
+| M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
+| M8: Additional standalone pairs | Planned | Pair-specific target adapters, precision, capacity and serving qualification within 48 GB. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
 
 ## M0: Baseline and supported contract
@@ -259,7 +268,7 @@ allocation was 4,729,488,612 bytes within the 5.04 GB configured allowance. The
 plan included 20.97 MB context, 3.28 MB capture and 194.49 MB workspace. These
 remain correctness/resource probes, not serving-speed qualification.
 
-### Step 3: Qualification and failure evidence
+### Step 3: Qualification and failure evidence ([PR #6](https://github.com/mhdimo/vllm-metal/pull/6))
 
 The final loader checks source tensors for NaN/Inf before conversion and restores
 the scoped allocator limit on failure. A preflight check rejects impossible

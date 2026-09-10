@@ -7,11 +7,11 @@ for method behavior and configuration details.
 | | MTP | DSpark | Draft model | N-gram |
 |---|---|---|---|---|
 | `--speculative-config` method | `mtp` | `dspark` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Qwen3 4B/8B/14B (needs a matched drafter) | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Target models | Gemma4 | Matched Qwen3 pair; M0-M3 evidence for pinned 4B only | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
 | Draft source | Matching Gemma4 assistant checkpoint | Parallel backbone and sequential Markov head (consumes target hidden states) | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Up to checkpoint block size; qualification pending | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | Drafter checkpoint | Draft model | None |
-| Additional KV cache | None; reads target KV | Proposer-owned context KV; currently unbudgeted | Second scheduler-managed cache | None |
+| Additional KV cache | None; reads target KV | Bounded proposer-owned context KV, reserved before target KV allocation | Second scheduler-managed cache | None |
 
 All four methods currently have these Metal-specific constraints:
 
@@ -103,6 +103,8 @@ Qwen3 target capture, context lifecycle and bounded resource foundations. See th
 [validation/experiment handoff](design/dspark-validation.md) before treating this
 path as production-ready, and the [milestone results](design/dspark-progress.md)
 for the bounded 4B checks already completed.
+The [development handoff](design/dspark-handoff.md) provides current integration
+status, M5 Max setup and the remaining implementation and experiment sequence.
 
 DSpark uses a parallel backbone with a sequential prediction head. A small
 backbone cross-attends over the *target's* fused intermediate-layer hidden
