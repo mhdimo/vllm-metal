@@ -233,9 +233,15 @@ trajectory and the spec-decode counters.
   defers (the `bypass` mode, or the `adaptive` planner's bypass decision for
   the batch), ingesting that step's target features without the sampled
   token values; drafting and verification steps stay synchronous. The
-  pipeline itself requires asynchronous scheduling, which the Metal platform
-  turns off whenever speculative decoding is configured, so a served DSpark
-  server does not reach this path yet (see the M9 progress record).
+  pipeline requires asynchronous scheduling, which DSpark servers run by
+  default (below); `--no-async-scheduling` keeps every step synchronous.
+- **Asynchronous scheduling.** A DSpark server runs vLLM's asynchronous
+  scheduler (the production default for target-only serving): the scheduler
+  books `num_speculative_tokens` placeholder slots per running request and
+  the runner fills them with the drafts it produced at the end of the
+  request's previous step, reporting unused slots so the speculative-decode
+  metrics count real drafts. The other Metal speculative methods still force
+  synchronous scheduling.
 
 ### Limitations
 

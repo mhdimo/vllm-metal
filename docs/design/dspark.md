@@ -105,7 +105,7 @@ release wiring; the older `Dspark-implement` branch is not the integration base.
 | `v1/dspark/{config,loader,model}.py` | Checkpoint parsing, quantization, MLX draft backbone, context K/V, heads | Strict architecture/precision validation, revision-aware loading, provenance, reference parity; make the confidence path usable. |
 | `v1/hidden_state_tap.py`, `v1/model_adapter.py` | Selected residual capture and target logits | Preserve the model's forward semantics and selective logits layout. Avoid a generic hand-written layer loop for unqualified architectures. |
 | `v1/dspark_proposer.py` | Context ingestion, prompt replay, padded batched drafting (an arena with per-row attention since M9), fixed cap | Exact position coverage, bounded storage/replay, per-row caps, fair admission, explicit proposal records. |
-| `v1/spec_decode.py` | Eligibility, packed verify segments and greedy verification | Retain one target verification owner; add probability-aware verification here or a helper it owns. |
+| `v1/spec_decode.py` | Eligibility, packed verify segments and greedy verification; since M9b the asynchronous scheduler's placeholder slots are resolved from the runner's retained drafts here | Retain one target verification owner; add probability-aware verification here or a helper it owns. |
 | `v1/cache_policy.py`, `v1/worker.py` | Physical/scheduler cache planning | Account for DSpark weights, context, workspace and lookahead; coordinate admission and eviction. |
 | `v1/model_runner.py::_reconcile_request_lifecycle` | Finish, preemption and resume invalidation | Preserve existing `release_requests` calls; extend cleanup to future probability, calibration-history and workspace state. |
 
