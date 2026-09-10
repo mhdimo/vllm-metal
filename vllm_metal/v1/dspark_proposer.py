@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# One informational counters snapshot per this many drafting steps.
+COUNTER_LOG_EVERY = 2000
+
 
 def _ctx_block_mask(ctx_lens: list[int], n_block: int) -> mx.array:
     """Each row attends its valid context and the entire bidirectional block."""
@@ -312,6 +315,8 @@ class DSparkProposer:
             self._proposals.update(proposals)
             self.counters.drafting_steps += 1
             self.counters.proposed_tokens += sum(len(row) for row in rows)
+            if self.counters.drafting_steps % COUNTER_LOG_EVERY == 0:
+                logger.info("DSpark counters: %s", self.counters.snapshot())
             if not req_ids:
                 return None
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
