@@ -240,10 +240,11 @@ trajectory and the spec-decode counters.
   similar model name or tensor shape.
 - **Incomplete DSpark features.** Calibrated confidence scheduling and
   production serving qualification remain roadmap work.
-- **Bounded context and workspace.** The planner subtracts the draft context,
-  capture and execution reservation before sizing target KV. The context arena
-  is allocated once at load: every slot holds the planned model length plus
-  the block's scratch positions. Insufficient startup
+- **Bounded context and workspace.** The context arena is allocated once at
+  load (every slot holds the planned model length plus the block's scratch
+  positions) and is then part of the measured model memory; the target KV
+  planner subtracts the capture staging and the per-step workspace that
+  remain. Insufficient startup
   capacity fails explicitly; request admission and recoverable draft allocation
   failures fall back to the target. Lower context, sequence and batch-token
   limits to reduce the reservation. The earlier `0.12` memory-fraction example
