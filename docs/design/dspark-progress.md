@@ -7,8 +7,8 @@ and serving qualification gates pass.
 
 For the verified integration revision, M5 Max setup, exact reproduction commands,
 raw-evidence transfer and remaining implementation sequence, start with the
-[development handoff](dspark-handoff.md), checked on 2026-09-10. The handoff is
-documentation only; M4-M8 remain open and the destination machine is untested.
+[development handoff](dspark-handoff.md), checked on 2026-09-10. M4a-M4c are
+qualified on the M5 Max destination machine (sections below); M4d-M8 remain open.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
@@ -16,7 +16,7 @@ documentation only; M4-M8 remain open and the destination machine is untested.
 | M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
-| M4: Fixed-greedy serving | M4a parity contract ([record](dspark-m4-parity.md)) and M4b admission fairness done on M5 Max; HTTP semantics and fixed-K performance still open | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; fair admission, HTTP harness and fixed-K measurements follow. |
+| M4: Fixed-greedy serving | M4a parity contract ([record](dspark-m4-parity.md)), M4b admission fairness and M4c HTTP serving semantics done on M5 Max; fixed-K performance still open | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; admission caps measured on a real engine; the HTTP matrix passes with every divergence a tie; fixed-K measurements follow. |
 | M5: Stochastic verification | Planned | Exact proposal-distribution ownership, rejection/bonus sampling and distribution tests. |
 | M6: Calibrated adaptive planning | Planned | Recipe-specific confidence calibration, measured cost curves and causal admission/planning. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
@@ -411,3 +411,64 @@ early. Every context holder drafted at least once in every run and no context
 remained after drain. Validation on M5 Max: 2,330 non-slow tests passed, ruff,
 mypy and the strict docs build clean.
 
+## M4c: HTTP serving semantics (M5 Max, `c15eeb0`)
+
+`tools/dspark_serving_check.py` qualifies the real serving path rather than the
+in-process checkers: it launches a target-only `vllm serve` (K=0), then one
+server per speculative width, each with vLLM's multiprocess engine core, model
+length 1,024, four sequences, 64 batch tokens, synchronous scheduling, seed 0
+and memory fraction 0.22, and drives every server through the same request
+matrix over the OpenAI completions API: output limits 1/2/31/128 and natural
+EOS on four prompts, `min_tokens`, a stop string, streaming versus
+non-streaming, a long prompt that needs more than three prefill chunks, four
+staggered concurrent arrivals (0/150/400/800 ms, limits 64/128/31/96), a
+client disconnect after eight streamed chunks followed by an idle check and a
+fresh request, a `logprobs` request and a sampled request, and, with
+`--prefix-widths`, a repeated prompt and a shared two-thirds prefix on servers
+with prefix caching. A speculative server's stream must equal the K=0 server's
+stream for the same request, or diverge at a position where the K=0 server's
+own top logprobs at that prefix put both tokens within 0.5 of each other (a
+logprob gap equals the logit gap, so 0.5 covers two bfloat16 ULPs up to logit
+magnitude 64: the M4a tie rule at the HTTP level). Concurrent arrivals are also
+compared with the same server's isolated results, streamed output with
+non-streamed, and a repeated prefix with its first run; those self-comparisons
+are judged the same way. Every speculative server must report draft and
+accepted tokens in `/metrics`, and no running or waiting request after the
+disconnect. Target instability, the other admissible M4a class, is not waived
+here; an HTTP divergence that is not a tie fails the gate.
+
+Final run with the pinned 4B pair (`results/m5max-m4c-serving-03-final`,
+counters from `/metrics` over the matrix, seconds excluding server startup):
+
+| Server | Failures | Compared with K=0 | Equal | Ties | Largest tie gap (logprob) | Drafts | Draft tokens | Accepted | Acceptance | Seconds |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| k0 | 0 | reference | – | – | – | 0 | 0 | 0 | – | 27 |
+| k1 | 0 | 29 | 22 | 7 | 0.125 | 1,465 | 1,465 | 1,043 | 71.2% | 27 |
+| k2 | 0 | 29 | 22 | 7 | 0.125 | 1,107 | 2,204 | 1,404 | 63.7% | 24 |
+| k4 | 0 | 29 | 20 | 9 | 0.125 | 894 | 3,537 | 1,615 | 45.7% | 21 |
+| k7 | 0 | 29 | 21 | 8 | 0.125 | 817 | 5,602 | 1,696 | 30.3% | 23 |
+| k0-prefix | 0 | reference | – | – | – | 0 | 0 | 0 | – | 24 |
+| k2-prefix | 0 | 31 | 13 | 18 | 0.25 | 815 | 1,622 | 1,097 | 67.6% | 30 |
+| k7-prefix | 0 | 31 | 14 | 17 | 0.25 | 587 | 4,040 | 1,328 | 32.9% | 31 |
+
+Every divergence in the matrix is a tie, at most half the admissible gap. The
+target-only servers show the same kind of divergence without any drafter: on
+`k0`, two of the four concurrent arrivals differ from their isolated results
+(gaps 0 and 0.125), and on `k0-prefix` the streamed request differs from the
+non-streamed one because the second request hits the prefix cache and takes
+a different arithmetic path (gap 0.125). Batching and cache hits, not
+speculation, move these ties; the speculative servers' ties are of the same
+kind, and the servers with prefix caching show more of them because the
+earlier scenarios leave their prompts cached. `min_tokens` is rejected with
+HTTP 400 by every server (the platform declares logits-processor controls
+unsupported); the stop string, the long prompt, `logprobs` and the repeated
+and shared prefixes match the K=0 server (`logprobs` ties on the
+prefix-caching servers); the sampled request returns its 32 tokens on the
+target-only path; after the disconnect every server is idle within the poll
+window and answers the next request correctly. Acceptance per draft token
+falls with width as in the in-process natural-workload run. An earlier full
+run (`results/m5max-m4c-serving-01`) flagged one strict streamed-versus-plain
+comparison on the prefix-caching K=0 server; that comparison now goes through
+the same tie judgement (gap 0.125), and the recorded matrix is the rerun with
+the final harness. Validation on M5 Max: 2,333 non-slow tests passed, ruff,
+mypy and the strict docs build clean.

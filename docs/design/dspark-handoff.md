@@ -31,7 +31,7 @@ record the actual checkout SHA when starting new experiments.
 | M3a: deterministic streamed loading | Complete, [PR #4](https://github.com/mhdimo/vllm-metal/pull/4), feature `19c010ff10f61aafc8abf4d45eb499e08ee45728` |
 | M3b: full resource planning and bounded storage | Complete, [PR #5](https://github.com/mhdimo/vllm-metal/pull/5), feature `b4aa6958bcf5208901b755552d98f7e2d25383fc` |
 | M3c: resource, recovery and precision qualification | Complete for its named 4B envelope, [PR #6](https://github.com/mhdimo/vllm-metal/pull/6), feature `bae84f915d4d30c9bb30382bd9445c7f12f12fc7` |
-| M4: complete fixed-greedy serving and performance | **Open.** M4a: the extended exact-token failures are ties or target-unstable prefixes under the [parity contract](dspark-m4-parity.md) (M5 Max). Admission fairness, HTTP semantics and fixed-K performance remain unqualified. |
+| M4: complete fixed-greedy serving and performance | **Open.** Done on M5 Max: M4a, the extended exact-token failures are ties or target-unstable prefixes under the [parity contract](dspark-m4-parity.md); M4b, configurable admission caps measured on a real engine; M4c, the HTTP serving matrix passes with every divergence a tie (see the [progress record](dspark-progress.md)). Fixed-K performance remains unqualified. |
 | M5: exact stochastic verification | Open; current drafter/proposer does not implement this supported serving path. |
 | M6: confidence calibration and adaptive planning | Open; confidence is not used by the current proposer. |
 | M7: production performance and reliability | Open; no qualifying HTTP soak or production speedup result. |
@@ -568,6 +568,29 @@ It lasted about 14.6 minutes with instrumentation. This is neither a controlled
 speed benchmark nor the required M7 production soak. Preserve positive draft
 work counters: target-only fallback throughout cannot qualify acceleration.
 
+### 7. M4 admission and HTTP serving gates (M5 Max)
+
+The M4b and M4c gates run against the same pinned pair after steps 1-6. The
+admission checker records, per request, the steps it held a complete context
+and the steps it was drafted; the serving harness launches real `vllm serve`
+processes and judges every divergence by the K=0 server's own logprobs:
+
+```bash
+python -m tools.dspark_admission_check --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" \
+  --requests 48 --max-num-seqs 48 --width 7 --context-cap 32 --output "$DSPARK_RUN/admission/cap32-c48.json"
+python -m tools.dspark_admission_check --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" \
+  --requests 48 --max-num-seqs 48 --width 7 --context-cap 8 --output "$DSPARK_RUN/admission/cap8-c48.json"
+python -m tools.dspark_serving_check --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" \
+  --widths 1,2,4,7 --prefix-widths 2,7 --output-dir "$DSPARK_RUN/serving"
+```
+
+The serving harness exits nonzero on any failure and prints `GATE PASS`
+otherwise; `summary.json` lists every scenario's verdict per server and each
+`kN.json` keeps the tokens, the tie probes and the `/metrics` deltas. Results
+and the qualification criteria are in the progress record (M4b, M4c). Both
+tools bind the default `VLLM_USE_V2_MODEL_RUNNER=0`, source-built kernels and
+offline Hugging Face access themselves.
+
 ## Remaining implementation and acceptance plan
 
 Follow the existing architecture and small staged PR pattern: extend the current
@@ -580,7 +603,7 @@ not counted as a completed M4 serving feature by inspection alone.
 | --- | --- |
 | M4a: target/verification parity | Done on M5 Max under the recorded contract: both witnesses are ties or target-unstable prefixes, no cache/layout defect found, DSpark behaved correctly in every trace. Remaining: repeat the natural-workload gate on the M4 machine when available; the paged path's higher junk-basin frequency at absolute 207 is an open numerics observation, not a gate. |
 | M4b: fixed-K admission | Done on M5 Max: configurable context cap (`VLLM_METAL_DSPARK_MAX_CONTEXTS`) budgeted by the planner, per-step draft cap (`VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP`) with least-recently-drafted rotation, per-row caps proven against independent rows, and `tools/dspark_admission_check.py` real-engine evidence (see the progress record). Remaining: repeat on the M4 machine when available. |
-| M4c: serving semantics | Add a real HTTP and mixed-arrival qualification harness. Cover K=1/2/4/7 and K=0 baseline, C=1/4, output limits 1/2/31/128, EOS/min tokens/stops, streaming/non-streaming, prefix hits/misses, intermediate prefill, cancel/disconnect and logprob/unsupported-feature behavior. Keep positive-work and cleanup assertions. |
+| M4c: serving semantics | Done on M5 Max: `tools/dspark_serving_check.py` drives real `vllm serve` processes (multiprocess engine core) for K=0 and K=1/2/4/7, with and without prefix caching, through output limits 1/2/31/128, natural EOS, stop strings, the platform's `min_tokens` rejection, streaming, long prompts, staggered arrivals, a mid-stream disconnect, `logprobs` and sampled requests, and prefix repeats; parity is judged by the M4a tie rule from the K=0 server's own logprobs; positive draft work and idle metrics are asserted. Results in the progress record. Remaining: repeat on the M4 machine when available. |
 | M4d: fixed-K performance | Measure at least K=0/1/2/7 before adapting K. Record draft, verify, context/host costs, TTFT, TPOT, p95/p99 token gaps and SLO goodput. Separate warmup/instrumented correctness from timed serving. |
 | M5: stochastic verification | Own exact normalized q and transforms per request generation/position; accept with min(1,p/q), sample rejection from normalized positive residual and full-acceptance bonus from p. Test finite/zero support, stops, penalties and RNG isolation under reorder/cancel. Use an enumerated tiny-vocabulary oracle and powered, predefined distribution tests. Unsupported transforms retain explicit target-only fallback. |
 | M6: calibrated planning | Implement confidence/Markov semantics, recording with correct censored survival labels, per-position STS fit/apply, disjoint calibration/evaluation data and recipe-matched manifests. Report ECE, Brier, reliability and uncertainty. Fit separate measured draft/verify/host cost curves; make causal admission and K=0 bypass decisions before affected candidates are sampled. Test against a pure planner oracle, including early stopping and history cleanup. |

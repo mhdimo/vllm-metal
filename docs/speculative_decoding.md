@@ -161,6 +161,13 @@ precision qualification is tracked in the roadmap.
 Set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly. Request sampling eligibility remains
 greedy-only, with unsupported requests following the existing target-only path.
 
+`tools/dspark_serving_check.py` qualifies the HTTP path against a target-only
+server (output limits, EOS and stop strings, streaming, long prompts, staggered
+arrivals, a mid-stream disconnect, `logprobs` and sampled requests, prefix
+repeats) and applies the M4a tie rule to every divergence; see the
+[progress record](design/dspark-progress.md). The Metal platform rejects
+`min_tokens` on every server, speculative or not.
+
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,
 target_layer_ids=[...])`, and the periodic `SpecDecoding metrics ... Avg
