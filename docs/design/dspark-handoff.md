@@ -103,8 +103,10 @@ Paths here are relative to the new repository checkout.
 4. Keep all seven trained backbone positions when reducing K. The draft block is
    bidirectional and uses per-row absolute offsets. Each row's cap reserves a
    correction/bonus slot. Prove ragged batching against independent rows.
-5. Check slots and bytes before allocating. The cap is 32 draft contexts; context
-   storage grows in chunks of 256 within a hard maximum. Allocation recovery
+5. Check slots and bytes before allocating. The context cap defaults to 32
+   (`VLLM_METAL_DSPARK_MAX_CONTEXTS`, planner-budgeted); context storage grows
+   in chunks of 256 within a hard maximum. A binding per-step draft cap
+   rotates least-recently-drafted requests first. Allocation recovery
    releases private contexts and preserves already computed target output;
    unrelated execution errors propagate. Cast target features to draft precision.
 6. Budget both models, full context/capture/workspace and loading overlap before
@@ -577,7 +579,7 @@ not counted as a completed M4 serving feature by inspection alone.
 | Next part | Concrete implementation and completion evidence |
 | --- | --- |
 | M4a: target/verification parity | Done on M5 Max under the recorded contract: both witnesses are ties or target-unstable prefixes, no cache/layout defect found, DSpark behaved correctly in every trace. Remaining: repeat the natural-workload gate on the M4 machine when available; the paged path's higher junk-basin frequency at absolute 207 is an open numerics observation, not a gate. |
-| M4b: fixed-K admission | Fair selection within slots/bytes and each request's output/context/scheduler caps; no starvation or use of another row's cap; compare batched/ragged/request-order results against independent rows. |
+| M4b: fixed-K admission | Done on M5 Max: configurable context cap (`VLLM_METAL_DSPARK_MAX_CONTEXTS`) budgeted by the planner, per-step draft cap (`VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP`) with least-recently-drafted rotation, per-row caps proven against independent rows, and `tools/dspark_admission_check.py` real-engine evidence (see the progress record). Remaining: repeat on the M4 machine when available. |
 | M4c: serving semantics | Add a real HTTP and mixed-arrival qualification harness. Cover K=1/2/4/7 and K=0 baseline, C=1/4, output limits 1/2/31/128, EOS/min tokens/stops, streaming/non-streaming, prefix hits/misses, intermediate prefill, cancel/disconnect and logprob/unsupported-feature behavior. Keep positive-work and cleanup assertions. |
 | M4d: fixed-K performance | Measure at least K=0/1/2/7 before adapting K. Record draft, verify, context/host costs, TTFT, TPOT, p95/p99 token gaps and SLO goodput. Separate warmup/instrumented correctness from timed serving. |
 | M5: stochastic verification | Own exact normalized q and transforms per request generation/position; accept with min(1,p/q), sample rejection from normalized positive residual and full-acceptance bonus from p. Test finite/zero support, stops, penalties and RNG isolation under reorder/cancel. Use an enumerated tiny-vocabulary oracle and powered, predefined distribution tests. Unsupported transforms retain explicit target-only fallback. |

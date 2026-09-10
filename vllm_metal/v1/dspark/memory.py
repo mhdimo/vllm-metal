@@ -42,16 +42,19 @@ class DSparkMemoryPlan:
         max_num_seqs: int,
         max_model_len: int,
         max_num_batched_tokens: int,
+        max_contexts: int = MAX_CONTEXTS,
     ) -> DSparkMemoryPlan:
         if min(max_num_seqs, max_model_len, max_num_batched_tokens) <= 0:
             raise ValueError(
                 "DSpark memory planning requires positive scheduler limits"
             )
+        if max_contexts <= 0:
+            raise ValueError("DSpark requires at least one draft context slot")
         if itemsize not in (2, 4):
             raise ValueError(
                 "DSpark context requires two- or four-byte floating values"
             )
-        rows = min(max_num_seqs, MAX_CONTEXTS)
+        rows = min(max_num_seqs, max_contexts)
         length = (
             (max_model_len + CONTEXT_ALIGNMENT - 1)
             // CONTEXT_ALIGNMENT

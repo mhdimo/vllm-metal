@@ -188,3 +188,26 @@ def test_loader_budget_and_resolved_identity_fail_before_reading_weights(
         load_drafter(str(tmp_path), memory_budget_bytes=1)
     with pytest.raises(ValueError, match="resolved draft ModelConfig"):
         load_drafter(str(tmp_path), expected_config=replace(model.config, block_size=5))
+
+
+def test_memory_plan_honors_configured_context_cap():
+    proposer = _proposer()
+    common = {"itemsize": 2, "max_model_len": 256, "max_num_batched_tokens": 32}
+    build = DSparkMemoryPlan.build
+    assert (
+        build(proposer._config, max_num_seqs=8, max_contexts=2, **common).max_contexts
+        == 2
+    )
+    assert (
+        build(proposer._config, max_num_seqs=8, max_contexts=64, **common).max_contexts
+        == 8
+    )
+    assert build(proposer._config, max_num_seqs=64, **common).max_contexts == 32
+    assert (
+        build(proposer._config, max_num_seqs=8, max_contexts=2, **common).context_bytes
+        == 2
+        * 256
+        * build(proposer._config, max_num_seqs=8, **common).kv_bytes_per_token
+    )
+    with pytest.raises(ValueError, match="at least one"):
+        build(proposer._config, max_num_seqs=8, max_contexts=0, **common)
