@@ -1873,10 +1873,12 @@ class MetalModelRunner:
                 if segment.draft_token_ids
             ]
             if spec_items:
-                spec_token_ids = self._spec_decode_controller.verify_greedy(
+                spec_token_ids = self._spec_decode_controller.verify(
                     logits,
                     [req for _, req, _ in spec_items],
                     [segment for _, _, segment in spec_items],
+                    proposals=getattr(self._drafter, "proposals", None),
+                    vocab_size=vocab_size,
                 )
                 for (decode_index, _, _), sampled_ids in zip(
                     spec_items,
@@ -2206,6 +2208,9 @@ class MetalModelRunner:
             is_hybrid=self.is_hybrid,
             use_async_scheduling=self.use_async_scheduling,
             speculative_config=self.vllm_config.speculative_config,
+            # Only a proposer that keeps exact proposal distributions may
+            # draft non-greedy requests.
+            allow_stochastic=getattr(self._drafter, "proposals", None) is not None,
         )
 
     def _run_vision_encoders(

@@ -5,11 +5,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
 from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_metal.v1.dspark.sampling import (
+    DSparkProposal,
+    SamplingTransforms,
+    acceptance_probabilities,
+    first_rejection,
+    residual_distribution,
+    sample_from_distribution,
+    transformed_distribution,
+)
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPDraftSeed
 from vllm_metal.v1.sampling_batch import GREEDY_TEMPERATURE_EPS
 
@@ -120,8 +129,14 @@ class SpeculativeDecodeController:
         is_hybrid: bool,
         use_async_scheduling: bool = False,
         speculative_config: SpeculativeConfig | None = None,
+        allow_stochastic: bool = False,
     ) -> None:
-        """Fail fast for unsupported or inconsistent scheduler handoffs."""
+        """Fail fast for unsupported or inconsistent scheduler handoffs.
+
+        ``allow_stochastic`` admits drafts on plain temperature/top-k/top-p
+        requests; only a proposer that keeps exact proposal distributions
+        (DSpark) may set it.
+        """
         # All three Metal proposers (draft-model, MTP, n-gram) hand drafts
         # back to the scheduler synchronously via take_draft_token_ids(), so
         # async scheduling is unsupported whenever SD is enabled.
@@ -192,7 +207,7 @@ class SpeculativeDecodeController:
                 )
             draft_reqs.append((req_id, request_by_id[req_id]))
 
-        self._validate_greedy_sampling(draft_reqs)
+        self._validate_draftable(draft_reqs, allow_stochastic)
 
     def build_decode_segments(
         self,
@@ -239,6 +254,148 @@ class SpeculativeDecodeController:
             start_row += segment.num_query_tokens
 
         return tuple(segments)
+
+    def verify(
+        self,
+        logits: mx.array,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        decode_segments: Sequence[PagedDecodeSegment],
+        *,
+        proposals: Mapping[str, DSparkProposal] | None = None,
+        vocab_size: int | None = None,
+    ) -> list[list[int]]:
+        """Verify scheduled drafts per request's sampling mode.
+
+        Greedy requests use :meth:`verify_greedy`; plain temperature/top-k/
+        top-p requests use exact rejection sampling against the DSpark
+        proposal record of their scheduled drafts (``proposals``), which must
+        match the request generation, anchor and drafted tokens. Drafts on a
+        request neither mode supports, or stochastic drafts without a record,
+        are invalid state and raise.
+        """
+        if len(decode_reqs) != len(decode_segments):
+            raise ValueError("decode_reqs and decode_segments must have equal length")
+        outputs: list[list[int] | None] = [None] * len(decode_reqs)
+        greedy: list[int] = []
+        stochastic: list[int] = []
+        for index, ((req_id, state), segment) in enumerate(
+            zip(decode_reqs, decode_segments, strict=True)
+        ):
+            if req_id != segment.req_id:
+                raise ValueError(
+                    "Speculative decode verification received mismatched request "
+                    f"metadata: {req_id!r} != {segment.req_id!r}"
+                )
+            mode = self.draft_mode(state)
+            if mode == "greedy":
+                greedy.append(index)
+            elif mode == "stochastic":
+                stochastic.append(index)
+            else:
+                raise NotImplementedError(
+                    "Speculative decode verification on Metal received drafts for "
+                    f"{req_id!r}, whose sampling parameters are not draftable"
+                )
+        if greedy:
+            verified = self.verify_greedy(
+                logits,
+                [decode_reqs[index] for index in greedy],
+                [decode_segments[index] for index in greedy],
+            )
+            for index, token_ids in zip(greedy, verified, strict=True):
+                outputs[index] = token_ids
+        if stochastic:
+            if proposals is None or vocab_size is None:
+                raise NotImplementedError(
+                    "Speculative decode verification on Metal supports greedy "
+                    "sampling only for proposers without exact proposal "
+                    "distributions (no proposal records or vocabulary size)."
+                )
+            verified = self._verify_stochastic(
+                logits,
+                [(decode_reqs[index], decode_segments[index]) for index in stochastic],
+                proposals,
+                vocab_size,
+            )
+            for index, token_ids in zip(stochastic, verified, strict=True):
+                outputs[index] = token_ids
+        return [token_ids for token_ids in outputs if token_ids is not None]
+
+    def _verify_stochastic(
+        self,
+        logits: mx.array,
+        items: Sequence[
+            tuple[tuple[str, _SpecDecodeRequestStateLike], PagedDecodeSegment]
+        ],
+        proposals: Mapping[str, DSparkProposal],
+        vocab_size: int,
+    ) -> list[list[int]]:
+        """Exact rejection sampling for stochastic requests with drafts.
+
+        Position ``k`` accepts draft ``x_k`` with probability
+        ``min(1, p_k(x_k) / q_k(x_k))`` where ``p_k`` is the target distribution
+        after the request's own transforms and ``q_k`` the recorded proposal
+        distribution; the first rejected position samples the normalized
+        positive residual and full acceptance samples the bonus row. Uniforms
+        come from the request's acceptance and target streams; the acceptance
+        stream advances by the scheduled width every step regardless of where
+        the first rejection falls.
+        """
+        pending = []
+        for (req_id, state), segment in items:
+            width = len(segment.draft_token_ids)
+            transforms = SamplingTransforms.from_params(state.sampling_params)
+            record = proposals.get(req_id)
+            if (
+                record is None
+                or width == 0
+                or not record.matches(
+                    state, segment.cache_start_pos, segment.input_token_ids[0]
+                )
+                or tuple(record.token_ids[:width]) != tuple(segment.draft_token_ids)
+                or record.transforms != transforms
+                or tuple(record.distributions.shape)
+                != (len(record.token_ids), vocab_size)
+            ):
+                raise RuntimeError(
+                    f"DSpark stochastic drafts for {req_id!r} have no matching "
+                    "proposal record"
+                )
+            rows = logits[0, segment.start_row : segment.start_row + width + 1]
+            target = transformed_distribution(rows, transforms, vocab_size=vocab_size)
+            draft = record.distributions[:width]
+            probabilities, q_at = acceptance_probabilities(
+                target[:width], draft, segment.draft_token_ids
+            )
+            pending.append((segment, record, target, draft, probabilities, q_at))
+        mx.eval(*(item[4] for item in pending), *(item[5] for item in pending))
+        decisions = []
+        tokens = []
+        for segment, record, target, draft, probabilities, q_at in pending:
+            width = len(segment.draft_token_ids)
+            if any(value <= 0.0 for value in cast("list[float]", q_at.tolist())):
+                raise RuntimeError(
+                    f"DSpark proposal for {segment.req_id!r} assigns zero mass to "
+                    "its own draft"
+                )
+            uniforms = record.streams.acceptance.random(width)
+            rejected = first_rejection(
+                cast("list[float]", probabilities.tolist()), uniforms.tolist()
+            )
+            uniform = mx.array([record.streams.target.random()], dtype=mx.float32)
+            if rejected < width:
+                distribution = residual_distribution(
+                    target[rejected : rejected + 1], draft[rejected : rejected + 1]
+                )
+            else:
+                distribution = target[width : width + 1]
+            tokens.append(sample_from_distribution(distribution, uniform))
+            decisions.append((segment, rejected))
+        mx.eval(*tokens)
+        return [
+            [*segment.draft_token_ids[:rejected], int(token.item())]
+            for (segment, rejected), token in zip(decisions, tokens, strict=True)
+        ]
 
     def verify_greedy(
         self,
@@ -348,17 +505,55 @@ class SpeculativeDecodeController:
 
         return tuple(seeds)
 
+    @staticmethod
+    def draft_mode(request_state: _SpecDecodeRequestStateLike) -> str | None:
+        """``"greedy"``, ``"stochastic"`` or ``None`` (target-only) for a request.
+
+        Penalties, logprobs and allowed/bad-token constraints exclude a
+        request from drafting in every mode. Greedy drafting needs plain
+        argmax sampling. Stochastic drafting needs plain temperature/top-k/
+        top-p sampling without structured output (grammar state would have to
+        evolve along the drafted prefix), ``min_p`` or ``logit_bias``; the
+        platform already rejects the last two.
+        """
+        params = request_state.sampling_params
+        if (
+            params.frequency_penalty != 0.0
+            or params.presence_penalty != 0.0
+            or params.repetition_penalty != 1.0
+            or params.num_logprobs is not None
+            or bool(params.allowed_token_ids)
+            or bool(params.bad_words_token_ids)
+        ):
+            return None
+        if params.temperature < GREEDY_TEMPERATURE_EPS:
+            return "greedy" if params.top_k <= 0 and params.top_p == 1.0 else None
+        if (
+            getattr(params, "structured_outputs", None) is not None
+            or params.min_p > 0.0
+            or bool(params.logit_bias)
+        ):
+            return None
+        return "stochastic"
+
+    def can_draft(
+        self,
+        req_id: str,
+        request_state: _SpecDecodeRequestStateLike,
+        *,
+        allow_stochastic: bool,
+    ) -> bool:
+        """Whether a request may be drafted, optionally in the stochastic mode."""
+        mode = self.draft_mode(request_state)
+        return mode == "greedy" or (allow_stochastic and mode == "stochastic")
+
     def can_draft_greedy(
         self,
         req_id: str,
         request_state: _SpecDecodeRequestStateLike,
     ) -> bool:
         """Whether a request may be drafted under greedy-only spec decode."""
-        try:
-            self._validate_greedy_sampling([(req_id, request_state)])
-        except NotImplementedError:
-            return False
-        return True
+        return self.can_draft(req_id, request_state, allow_stochastic=False)
 
     def draft_eligible_requests(
         self,
@@ -367,14 +562,16 @@ class SpeculativeDecodeController:
         prefill_reqs: Sequence[_SpecDecodePrefillLike],
         prefill_result_modes: Sequence[str],
         request_states: Mapping[str, _SpecDecodeRequestStateLike],
+        *,
+        allow_stochastic: bool = False,
     ) -> Sequence[tuple[str, RequestState]]:
         """Filter ``ctx`` to requests eligible for drafting this step.
 
-        Shared eligibility filter used by the draft-model and n-gram proposers
-        that draft greedily: skip decode rows that did not sample this step,
-        skip non-greedy requests via :meth:`can_draft_greedy`, skip
-        intermediate prefill chunks, and de-duplicate prefill rows whose
-        ``req_id`` was already admitted through decode.
+        Shared eligibility filter used by every proposer: skip decode rows
+        that did not sample this step, skip requests :meth:`can_draft`
+        rejects (greedy-only unless ``allow_stochastic``), skip intermediate
+        prefill chunks, and de-duplicate prefill rows whose ``req_id`` was
+        already admitted through decode.
 
         Callers post-process the returned pairs (e.g. the draft-model
         proposer maps each to its per-step ingest plan and drops rows with
@@ -389,7 +586,7 @@ class SpeculativeDecodeController:
         ):
             if not sampled_ids:
                 continue
-            if not self.can_draft_greedy(req_id, state):
+            if not self.can_draft(req_id, state, allow_stochastic=allow_stochastic):
                 continue
             eligible.append((req_id, state))  # type: ignore[arg-type]
             seen.add(req_id)
@@ -400,11 +597,33 @@ class SpeculativeDecodeController:
             if result_mode == "intermediate" or prefill.req_id in seen:
                 continue
             state = request_states.get(prefill.req_id)
-            if state is None or not self.can_draft_greedy(prefill.req_id, state):
+            if state is None or not self.can_draft(
+                prefill.req_id, state, allow_stochastic=allow_stochastic
+            ):
                 continue
             eligible.append((prefill.req_id, state))  # type: ignore[arg-type]
 
         return eligible
+
+    def _validate_draftable(
+        self,
+        decode_reqs: Sequence[tuple[str, _SpecDecodeRequestStateLike]],
+        allow_stochastic: bool,
+    ) -> None:
+        for req_id, request_state in decode_reqs:
+            if not self.can_draft(
+                req_id, request_state, allow_stochastic=allow_stochastic
+            ):
+                supported = (
+                    "greedy sampling and plain temperature/top-k/top-p sampling"
+                    if allow_stochastic
+                    else "greedy sampling"
+                )
+                raise NotImplementedError(
+                    "Speculative decode verification on Metal currently supports "
+                    f"{supported} only (no penalties, constraints, structured "
+                    "output or logprobs)."
+                )
 
     def _validate_greedy_sampling(
         self,
