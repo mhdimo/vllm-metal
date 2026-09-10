@@ -7,9 +7,9 @@ and serving qualification gates pass.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
-| M0: Baseline and contract | [Merged: #1](https://github.com/mhdimo/vllm-metal/pull/1) | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions track the remaining M1/M2 failures. |
-| M1: Target capture | [Merged: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
-| M2: Context lifecycle | Implemented and locally validated | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
+| M0: Baseline and contract | [Complete: #1](https://github.com/mhdimo/vllm-metal/pull/1) | Startup guards, resolved draft identity/revision, exact source provenance and normal lint coverage. Executable F1/F3 regressions tracked the defects fixed in M1/M2. |
+| M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
+| M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3-M8 | Planned | Loading/resource qualification, serving, stochastic verification, confidence scheduling and additional model pairs. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
 
