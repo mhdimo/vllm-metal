@@ -224,6 +224,11 @@ trajectory and the spec-decode counters.
 - **Contiguous context.** Every prefill chunk contributes features, including
   no-sample steps. Missing features on a target prefix-cache hit use target-only
   generation; the proposer does not replay full prompts or share private KV.
+- **Decode pipeline on non-drafting steps.** A pure-decode step that DSpark
+  will not draft at (the `bypass` mode, or the `adaptive` planner's bypass
+  decision for the batch) keeps the runner's one-step-ahead sampling
+  pipeline; the proposer ingests that step's target features without the
+  sampled token values. Drafting and verification steps stay synchronous.
 
 ### Limitations
 
