@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Statistics and workload helpers of the DSpark performance tools."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from tools.dspark_perf_bench import (
+    bootstrap_median_interval,
+    build_prompts,
+    paired_summary,
+    percentile,
+)
+from tools.dspark_step_profile import summarize
+
+
+def test_percentile_is_nearest_rank_on_sorted_values() -> None:
+    values = [5.0, 1.0, 3.0, 2.0, 4.0]
+    assert percentile(values, 0.0) == 1.0
+    assert percentile(values, 0.5) == 3.0
+    assert percentile(values, 1.0) == 5.0
+    assert percentile([7.0], 0.95) == 7.0
+
+
+def test_bootstrap_interval_brackets_the_median_and_is_deterministic() -> None:
+    differences = [0.12, 0.15, 0.11, 0.18, 0.14]
+    low, high = bootstrap_median_interval(differences, resamples=2000, seed=1)
+    assert low <= 0.14 <= high
+    assert low >= min(differences) and high <= max(differences)
+    assert bootstrap_median_interval(differences, resamples=2000, seed=1) == (low, high)
+
+
+def _rep(
+    tokens_per_s: float, tpot: float, gap95: float, goodput: float, ttft: float
+) -> dict:
+    return {
+        "output_tokens_per_s": tokens_per_s,
+        "tpot_median_s": tpot,
+        "gap_p95_s": gap95,
+        "goodput_requests_per_s": goodput,
+        "ttft_mean_s": ttft,
+    }
+
+
+def test_paired_summary_orients_benefit_and_applies_the_gate() -> None:
+    reference = [_rep(100.0, 0.020, 0.030, 1.0, 0.5) for _ in range(5)]
+    faster = [_rep(125.0, 0.016, 0.024, 1.2, 0.5) for _ in range(5)]
+    summary = paired_summary(reference, faster)
+    assert summary["output_tokens_per_s"]["median_relative_benefit"] == pytest.approx(
+        0.25
+    )
+    # Lower is better for TPOT: a 20% reduction is a +20% benefit.
+    assert summary["tpot_median_s"]["median_relative_benefit"] == pytest.approx(0.20)
+    assert summary["output_tokens_per_s"]["gate_10pct_ci_excludes_zero"]
+    assert not summary["ttft_mean_s"]["gate_10pct_ci_excludes_zero"]  # unchanged
+    slower = [_rep(90.0, 0.024, 0.040, 0.8, 0.6) for _ in range(5)]
+    worse = paired_summary(reference, slower)
+    assert worse["output_tokens_per_s"]["median_relative_benefit"] == pytest.approx(
+        -0.10
+    )
+    assert not worse["output_tokens_per_s"]["gate_10pct_ci_excludes_zero"]
+
+
+class _Tokenizer:
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        return [len(word) for word in text.split()]
+
+
+def test_build_prompts_are_exact_length_and_distinct(tmp_path: Path) -> None:
+    (tmp_path / "docs" / "design").mkdir(parents=True)
+    words = " ".join(f"w{i}" for i in range(5000))
+    for name in (
+        "docs/design/dspark.md",
+        "docs/design/dspark-validation.md",
+        "docs/index.md",
+    ):
+        (tmp_path / name).write_text(words)
+    prompts = build_prompts(_Tokenizer(), tmp_path, 128, 4)
+    assert [len(prompt) for prompt in prompts] == [128] * 4
+    assert len({tuple(prompt) for prompt in prompts}) == 4
+    short = build_prompts(_Tokenizer(), tmp_path, 4, 1)
+    assert len(short[0]) == 4
+
+
+def test_summarize_reports_percentiles_in_seconds() -> None:
+    stats = summarize([0.010, 0.020, 0.030, 0.040, 0.100])
+    assert stats["count"] == 5
+    assert stats["p50"] == 0.030
+    assert stats["p95"] == 0.100
+    assert stats["max"] == 0.100
+    assert summarize([]) == {"count": 0}
