@@ -1,0 +1,32 @@
+Small-M quantized matmul kernel provenance
+
+The Metal kernel in small_m.py follows the structure of avlp12's qmm_mma4
+(https://github.com/avlp12/mlx-lm, fast_qmm.py) as vendored by
+https://github.com/ARahim3/mlx-dspark (src/mlx_dspark/small_m_qmm.py): an 8x8
+simdgroup-matrix MMA tile per threadgroup with K split across eight simdgroups
+and each weight group dequantized once. The multi-tile form, the dispatch, the
+calibration and the integration are maintained in this repository. Both sources
+are MIT licensed:
+
+MIT License
+
+Copyright (c) avlp12
+Copyright (c) 2026 erahim3
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

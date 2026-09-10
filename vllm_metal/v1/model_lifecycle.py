@@ -19,6 +19,7 @@ from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.gguf.source import GGUFLoadSource
 from vllm_metal.pytorch_backend.tensor_bridge import torch_to_mlx
+from vllm_metal.quant import small_m
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
@@ -198,6 +199,7 @@ class ModelLifecycle:
             # would freeze that state at first call. LoRA serves stay eager.
             return
         CompiledMLPBlocks.install(self._runner._forward_model)
+        small_m.install(self._runner._forward_model, tag="target")
 
     def resolve_model_dims(self) -> None:
         """Resolve loaded model args into runner attention/cache dimensions."""

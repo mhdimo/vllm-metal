@@ -4,7 +4,9 @@
 Times the pinned target's own quantized linear layers at 1 to 32 query rows
 in process through mlx-lm: one decoder layer's MLP, its attention
 projections, and the language-model head, reporting milliseconds per call
-and the ratio to a single row. A verification step multiplies these row
+and the ratio to a single row, on the stock ``mx.quantized_matmul`` and, with
+``--small-m``, on the small-M kernel (``vllm_metal.quant.small_m`` installed
+in ``on`` mode, every eligible shape routed for 6 to 32 rows). A verification step multiplies these row
 counts by the active requests, so the ratios show whether the affine-4
 matmul path, not attention, carries the multi-row cost the M4d and M6 cost
 profiles measured. Output: JSON for the M7 profile record.
@@ -56,12 +58,14 @@ def probe_rows(model, rows: int) -> dict[str, float]:
 
 
 def main() -> None:
-    target, output = sys.argv[1], sys.argv[2]
+    args = [a for a in sys.argv[1:] if a != "--small-m"]
+    small_m_too = "--small-m" in sys.argv
+    target, output = args[0], args[1]
     from mlx_lm import load
 
     model, _tokenizer = load(target)
-    rows_list = [1, 2, 4, 8, 12, 16, 24, 32]
-    results: dict = {"target": target, "rows": {}}
+    rows_list = [1, 2, 4, 5, 6, 7, 8, 12, 16, 24, 32]
+    results: dict = {"target": target, "rows": {}, "small_m": small_m_too}
     # Two passes over the row counts: the first warms every kernel variant
     # (the one-row path compiles its own), the second is the record.
     for rows in rows_list:
@@ -74,6 +78,26 @@ def main() -> None:
             f"o {item['o_proj_ms']:.3f}, lm_head {item['lm_head_ms']:.3f}",
             flush=True,
         )
+    if small_m_too:
+        from vllm_metal.quant import small_m
+
+        swapped = small_m.install(model, mode="on", tag="probe")
+        print(f"small-M kernel installed on {swapped} layers", flush=True)
+        for rows in rows_list:
+            probe_rows(model, rows)
+        for rows in rows_list:
+            item = probe_rows(model, rows)
+            for key, value in item.items():
+                results["rows"][rows][key.replace("_ms", "_kernel_ms")] = value
+            stock = results["rows"][rows]
+            print(
+                f"M={rows} kernel: mlp {item['mlp_ms']:.3f} ms ({stock['mlp_ms'] / item['mlp_ms']:.2f}x), "
+                f"qkv {item['qkv_ms']:.3f} ({stock['qkv_ms'] / item['qkv_ms']:.2f}x), "
+                f"o {item['o_proj_ms']:.3f} ({stock['o_proj_ms'] / item['o_proj_ms']:.2f}x), "
+                f"lm_head {item['lm_head_ms']:.3f} ({stock['lm_head_ms'] / item['lm_head_ms']:.2f}x)",
+                flush=True,
+            )
+        small_m.uninstall(model)
     base = results["rows"][1]
     for rows in rows_list:
         item = results["rows"][rows]

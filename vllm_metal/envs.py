@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     VLLM_METAL_NATIVE_SAMPLING: bool = False
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_DISABLE_NAX: bool = False
+    VLLM_METAL_SMALL_M_QMM: str = "auto"
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
     VLLM_METAL_DSPARK_MAX_CONTEXTS: int = 32
@@ -101,6 +102,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
     # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
+    # Small-M quantized matmul dispatch for affine 4-bit layers: "auto" (the
+    # default) measures every eligible weight shape at install and routes
+    # 6..32-row calls (speculative verification rows, the DSpark drafter's
+    # block rows, 6-32 concurrent decodes) through the kernel where it beats
+    # mx.quantized_matmul by 10% or more; "off" keeps the stock kernel
+    # everywhere; "on" skips the race (the numerics check still runs).
+    "VLLM_METAL_SMALL_M_QMM": lambda: os.getenv("VLLM_METAL_SMALL_M_QMM", "auto"),
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
     # unless this opt-in is set. Set to "1" to merge K+1 verify windows

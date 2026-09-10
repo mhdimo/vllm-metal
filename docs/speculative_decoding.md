@@ -216,6 +216,14 @@ trajectory and the spec-decode counters.
   token from the target distribution, all from the request's own random
   streams (seeded requests reproduce). The emitted distribution equals the
   target's; the tokens at a given seed differ from target-only serving.
+- **Verification rows on the small-M kernel.** A verification step runs
+  `num_speculative_tokens + 1` rows per request through the target, and the
+  drafter's block backbone seven rows per request; on Apple GPUs the stock
+  quantized matmul prices six to sixteen rows like a full GEMM tile, so those
+  calls go through a kernel that reads each weight group once for every row
+  (`VLLM_METAL_SMALL_M_QMM`, measured per weight shape at load; see the
+  configuration reference). Outputs differ from the stock kernel only at the
+  bfloat16 ULP level, the parity contract's tie class.
 - **Batched drafting.** The backbone runs across selected requests, each row
   attending to its own slot of a per-layer context arena (no padding, gather or
   mask), and a step's accepted rows are ingested in one batched pass per layer.

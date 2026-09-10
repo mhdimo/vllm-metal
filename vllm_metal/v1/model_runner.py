@@ -66,6 +66,7 @@ from vllm_metal.distributed import (
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.quant import small_m
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.contiguous_cache import (
     _MIN_BATCH_SIZE_FOR_BATCHING,
@@ -716,6 +717,7 @@ class MetalModelRunner:
             memory_budget_bytes=budget - mx.get_active_memory(),
             expected_config=DSparkConfig.from_dict(draft.hf_config.to_dict()),
         )
+        small_m.install(model, tag="drafter")
         max_contexts = envs.VLLM_METAL_DSPARK_MAX_CONTEXTS
         max_drafts_per_step = envs.VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP
         if max_contexts < 1 or max_drafts_per_step < 0:
