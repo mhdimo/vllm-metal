@@ -117,6 +117,7 @@ from vllm_metal.v1.prompt_logprobs import (
     full_prompt_logprobs,
 )
 from vllm_metal.v1.proposer import (
+    DeferredStepProposer,
     Gemma4MTPProposer,
     MetalProposer,
     ProposeContext,
@@ -1702,6 +1703,20 @@ class MetalModelRunner:
             and adapter.forward_ready
             and adapter.requires_explicit_positions
         )
+        drafter = self._drafter
+        spec_configured = (
+            self.vllm_config.speculative_config is not None or drafter is not None
+        )
+        # A drafter that can consume a deferred step decides per step whether
+        # it will draft (and so needs the sampled tokens on the host).
+        deferred_drafter = isinstance(drafter, DeferredStepProposer)
+        drafter_needs_sync = False
+        if spec_configured and deferred_drafter and not states_missing:
+            assert drafter is not None
+            drafter_needs_sync = not drafter.deferred_step_allowed(
+                [(req_id, self._request_states[req_id]) for req_id in decode_req_ids],
+                scheduler_output.num_spec_tokens_to_schedule,
+            )
         capabilities = RunnerCapabilities(
             pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
             use_async_scheduling=self.use_async_scheduling,
@@ -1711,10 +1726,7 @@ class MetalModelRunner:
             hybrid_without_lazy_gdn=(
                 self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
             ),
-            spec_decode_configured=(
-                self.vllm_config.speculative_config is not None
-                or self._drafter is not None
-            ),
+            spec_decode_configured=spec_configured and not deferred_drafter,
             uniproc_executor=(
                 self.vllm_config.parallel_config.distributed_executor_backend == "uni"
             ),
@@ -1733,6 +1745,7 @@ class MetalModelRunner:
             has_structured_output=scheduler_output.has_structured_output_requests,
             has_mm_decode=has_mm_decode or mm_forward_forced,
             decode_req_ids=tuple(decode_req_ids),
+            drafter_needs_sync=drafter_needs_sync,
         )
         sampling = SamplingShape(
             native_greedy=(
@@ -3209,6 +3222,31 @@ class MetalModelRunner:
                     row=row,
                     token_index=len(state.token_ids) - 1,
                     output_idx=output_idx,
+                )
+            )
+
+        # A deferred-step-capable drafter advances its per-request state from
+        # this step's target features; the token values stay on the device.
+        # The placeholders are already appended, so the step's feature rows
+        # end at each request's pending anchor exactly as on the sync path.
+        drafter = self._drafter
+        if isinstance(drafter, DeferredStepProposer):
+            drafter.ingest_deferred_step(
+                ProposeContext(
+                    target_hidden_states=paged_state.target_hidden_states,
+                    decode_reqs=decode_reqs,
+                    decode_segments=paged_state.decode_segments,
+                    decode_token_ids=[() for _ in decode_reqs],
+                    prefill_reqs=[],
+                    prefill_token_ids=[],
+                    prefill_result_modes=[],
+                    request_states=self._request_states,
+                    cu_seqlens=paged_state.cu_seqlens,
+                    num_decode_segments=len(paged_state.decode_segments),
+                    num_speculative_tokens=(
+                        paged_state.scheduler_output.num_spec_tokens_to_schedule
+                    ),
+                    finished_req_ids=paged_state.scheduler_output.finished_req_ids,
                 )
             )
 

@@ -303,6 +303,79 @@ def test_decode_spans_of_one_step_ingest_in_one_batched_pass(monkeypatch):
         )
 
 
+def test_deferred_step_allowed_follows_the_mode_and_the_planner():
+    from vllm_metal.v1.dspark.planner import DraftDecision
+
+    proposer = _proposer()
+    state = _state([1, 2, 3])
+    _seed(proposer, state, k=0)
+    decode = [("r", state)]
+    # Fixed mode drafts every eligible request: the step keeps its sync.
+    assert proposer.deferred_step_allowed(decode, 2) is False
+    # No speculative tokens scheduled or the bypass mode: nothing to draft.
+    assert proposer.deferred_step_allowed(decode, 0) is True
+    proposer.bypass_only = True
+    assert proposer.deferred_step_allowed(decode, 2) is True
+    proposer.bypass_only = False
+    # Adaptive mode: the planner's own decision, offered every draftable
+    # request at its full cap and the batch's request count and context.
+    seen = []
+
+    class Planner:
+        def __init__(self, draft):
+            self.draft = draft
+
+        def decide(self, candidates, *, active_requests, context):
+            seen.append((candidates, active_requests, context))
+            return DraftDecision(draft=self.draft, reason="stub")
+
+    proposer.adaptive = Planner(draft=False)
+    assert proposer.deferred_step_allowed(decode, 2) is True
+    ((candidates, active, context),) = seen
+    assert [(c[0], c[2], c[3]) for c in candidates] == [("r", "greedy", 2)]
+    assert active == 1 and context == 3
+    proposer.adaptive = Planner(draft=True)
+    assert proposer.deferred_step_allowed(decode, 2) is False
+    # A request without a usable context is not a candidate; a batch of such
+    # requests has nothing to draft and may defer.
+    other = _state([5, 6])
+    proposer.adaptive = Planner(draft=True)
+    assert proposer.deferred_step_allowed([("other", other)], 2) is True
+    # A request at its output budget contributes no candidate either.
+    capped = _state([1, 2, 3], max_tokens=1)
+    _seed(proposer, capped, "c", k=0)
+    assert proposer.deferred_step_allowed([("c", capped)], 2) is True
+
+
+def test_ingest_deferred_step_advances_context_without_drafting(monkeypatch):
+    proposer = _proposer()
+    state = _state([1, 2, 3])
+    _seed(proposer, state, k=0)
+    # The runner appends the pending placeholder before the deferred ingest.
+    state.token_ids.append(-1)
+    state.generated_tokens += 1
+    real_backbone = proposer._drafter.backbone
+    backbone_calls: list = []
+    monkeypatch.setattr(
+        proposer._drafter,
+        "backbone",
+        lambda *a, **k: (backbone_calls.append(1), real_backbone(*a, **k))[1],
+    )
+    ctx = replace(_context(decode=[("r", state, 2, [3], [])]), decode_token_ids=[()])
+    proposer.ingest_deferred_step(ctx)
+    assert backbone_calls == []
+    _assert_context(proposer, "r", list(range(3)))
+    assert proposer._contexts["r"].covered_end == 3
+    assert proposer.counters.steps == 2
+    assert proposer.counters.bypass_reasons["deferred-step"] == 1
+    assert proposer.proposals == {}
+    # The next synchronous step continues from the resolved token.
+    state.token_ids[-1] = 9
+    result = proposer.propose(_context(decode=[("r", state, 3, [9], [9])]))
+    assert result is not None and result.req_ids == ["r"]
+    assert backbone_calls == [1]
+
+
 def test_write_spans_pads_past_the_committed_length_only():
     proposer = _proposer()
     short, long = _arena_caches(proposer), _arena_caches(proposer)

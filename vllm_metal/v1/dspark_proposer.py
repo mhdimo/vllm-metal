@@ -11,7 +11,7 @@ cancellation, preemption and resume, before any same-step request-ID reuse.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
 import numpy as np
@@ -243,11 +243,84 @@ class DSparkProposer:
             self._streams[req_id] = streams
         return streams
 
-    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
-        self.counters.steps += 1
+    @staticmethod
+    def _scheduled(ctx: ProposeContext) -> set[str]:
         scheduled = {seg.req_id for seg in ctx.decode_segments}
         scheduled.update(req_id for req_id, _ in ctx.decode_reqs)
         scheduled.update(pr.req_id for pr in ctx.prefill_reqs)
+        return scheduled
+
+    def deferred_step_allowed(
+        self,
+        decode_reqs: Sequence[tuple[str, RequestState]],
+        num_speculative_tokens: int,
+    ) -> bool:
+        """Whether a pure-decode step may defer its sampling sync.
+
+        True when this proposer will not draft at the end of the step: no
+        speculative tokens are scheduled, the bypass mode is on, or the
+        adaptive planner declines the batch for its request count, context
+        and calibrated expectations. Every draftable request is offered at
+        its full cap, so a batch the planner declines here it would decline
+        after sampling as well; the fixed mode drafts every eligible request
+        and always keeps the sync.
+        """
+        if num_speculative_tokens <= 0 or self.bypass_only:
+            return True
+        if self.adaptive is None:
+            return False
+        candidates: list[tuple[str, Any, str, int]] = []
+        lengths: list[int] = []
+        for req_id, state in decode_reqs:
+            lengths.append(len(state.token_ids))
+            record = self._contexts.get(req_id)
+            if (
+                record is None
+                or record.owner is not state
+                or record.disabled_reason is not None
+            ):
+                continue
+            mode = self._controller.draft_mode(state)
+            if mode is None:
+                continue
+            cap = self._draft_cap(state, num_speculative_tokens)
+            if cap <= 0:
+                continue
+            candidates.append((req_id, state, mode, cap))
+        if not candidates:
+            return True
+        decision = self.adaptive.decide(
+            candidates,
+            active_requests=len(decode_reqs),
+            context=max(1, round(sum(lengths) / len(lengths))),
+        )
+        return not decision.draft
+
+    def ingest_deferred_step(self, ctx: ProposeContext) -> None:
+        """Advance every scheduled context on a step whose sync is deferred.
+
+        The step's sampled tokens are still on the device, so nothing here
+        reads token values: the scheduled requests' proposal records are
+        spent, the target features are ingested and the arenas are queued
+        for evaluation behind the step's own work. No request is drafted.
+        """
+        self.counters.steps += 1
+        self.counters.bypass_reasons["deferred-step"] += 1
+        scheduled = self._scheduled(ctx)
+        self._observe_outcomes(ctx)
+        for req_id in scheduled:
+            self._proposals.pop(req_id, None)
+        try:
+            self._ingest_step(ctx)
+            mx.async_eval([(arena.keys, arena.values) for arena in self._arena])
+        except Exception as error:
+            self._recover(error, scheduled)
+            return
+        self._forget_idle(scheduled, ())
+
+    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        self.counters.steps += 1
+        scheduled = self._scheduled(ctx)
         # The scheduler consumes a request's drafts the next time it schedules
         # the request (verified this step, clipped, or dropped for a prefill
         # chunk), so a record of a scheduled request is spent either way.
@@ -348,30 +421,35 @@ class DSparkProposer:
                 return None
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
         except Exception as error:
-            # A partially written layer set cannot survive an ingest/draft
-            # failure, even if the engine subsequently retries these requests.
-            self.release_requests(scheduled)
-            if isinstance(error, MemoryError) or (
-                isinstance(error, RuntimeError)
-                and str(error).startswith(
-                    (
-                        "[metal::malloc] Resource limit (",
-                        "[metal::malloc] Attempting to allocate ",
-                        "[malloc] Unable to allocate ",
-                    )
+            self._recover(error, scheduled)
+            return None
+
+    def _recover(self, error: Exception, scheduled: set[str]) -> None:
+        """Release the step's contexts; swallow allocation failures, re-raise the rest."""
+        # A partially written layer set cannot survive an ingest/draft
+        # failure, even if the engine subsequently retries these requests.
+        self.release_requests(scheduled)
+        if isinstance(error, MemoryError) or (
+            isinstance(error, RuntimeError)
+            and str(error).startswith(
+                (
+                    "[metal::malloc] Resource limit (",
+                    "[metal::malloc] Attempting to allocate ",
+                    "[malloc] Unable to allocate ",
                 )
-            ):
-                # Drafting has no target KV side effects. Discard all private
-                # context under allocation pressure and keep the already
-                # sampled target output. Later requests/recomputation can
-                # obtain fresh complete context; other failures remain fatal.
-                self.release_requests(set(self._contexts))
-                mx.clear_cache()
-                logger.warning(
-                    "DSpark allocation failed; released draft context and using target-only output"
-                )
-                return None
-            raise
+            )
+        ):
+            # Drafting has no target KV side effects. Discard all private
+            # context under allocation pressure and keep the already
+            # sampled target output. Later requests/recomputation can
+            # obtain fresh complete context; other failures remain fatal.
+            self.release_requests(set(self._contexts))
+            mx.clear_cache()
+            logger.warning(
+                "DSpark allocation failed; released draft context and using target-only output"
+            )
+            return
+        raise error
 
     @staticmethod
     def _active_requests(ctx: ProposeContext) -> int:
