@@ -7,8 +7,9 @@ and serving qualification gates pass.
 
 For the verified integration revision, M5 Max setup, exact reproduction commands,
 raw-evidence transfer and remaining implementation sequence, start with the
-[development handoff](dspark-handoff.md), checked on 2026-09-10. M4 and M5 are
-qualified on the M5 Max destination machine (sections below); M6-M8 remain open.
+[development handoff](dspark-handoff.md), checked on 2026-09-10. M4, M5 and
+M6a are qualified on the M5 Max destination machine (sections below); M6b, M7
+and M8 remain open.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
@@ -18,7 +19,7 @@ qualified on the M5 Max destination machine (sections below); M6-M8 remain open.
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
 | M4: Fixed-greedy serving | Complete on M5 Max for the pinned 4B pair: M4a parity contract ([record](dspark-m4-parity.md)), M4b admission fairness, M4c HTTP serving semantics, M4d fixed-K performance | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; admission caps measured on a real engine; the HTTP matrix passes with every divergence a tie; fixed K=2-4 gives +36-49% tokens/s at one request on short prompts and loses 4-28% at four concurrent requests (multi-row verification cost), so adaptive bypass is M6 work. |
 | M5: Stochastic verification | Complete on M5 Max for the pinned 4B pair | Exact float32 proposal distributions kept with every scheduled draft, rejection/residual/bonus sampling from per-request streams, enumerated oracle and powered distribution tests, real-engine distribution and mixed-workload gate. |
-| M6: Calibrated adaptive planning | Planned | Recipe-specific confidence calibration, measured cost curves and causal admission/planning. |
+| M6: Calibrated adaptive planning | M6a done on M5 Max (calibration, cost model, planner); M6b serving integration open | Confidence recording with censored labels, sequential temperature scaling with holdout reliability, measured cost model with bounds, causal prefix planner with an oracle; adaptive mode, counters and its evaluation follow. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
 | M8: Additional standalone pairs | Planned | Pair-specific target adapters, precision, capacity and serving qualification within 48 GB. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
@@ -719,3 +720,129 @@ followed an EOS or stop token, and both stop-token requests ended on the stop
 token after drafting; the repeated batch reproduced every output token for
 token. Validation on M5 Max: 2,377 non-slow tests passed, ruff, mypy and the
 strict docs build clean.
+
+## M6a: confidence calibration, cost model and planner (M5 Max, `8b3d3ec`)
+
+The drafter's confidence head emits one raw logit per block position;
+`sigmoid` of it estimates the probability that the draft at that position is
+accepted given every earlier draft was, so the cumulative product is the
+survival probability of each prefix. `vllm_metal/v1/dspark/calibration.py`
+owns the pieces that make those estimates usable for planning. The
+proposer now keeps a proposal record for every drafted row (greedy rows too)
+with the raw confidence logits of the drafted positions, and when the request
+is scheduled again it derives the verification outcome from the committed
+tokens (the accepted count is the distance from the anchor to the new pending
+token minus one) and hands the recorder the logits and survival labels of
+the scheduled positions: `1` while the accepted prefix continues, `0` from
+the first rejection on; positions the scheduler clipped are censored, and a
+request that finished during verification is never scheduled again and
+records nothing (positions past an EOS or an output limit are unobservable).
+Sequential temperature scaling fits one positive temperature per position on
+a fixed grid (`2^(i/4)` from 0.25 to 8) by the binary cross-entropy of the
+cumulative survival prediction against the survival label, position by
+position with earlier temperatures held fixed; a position without
+observations keeps temperature 1. Reliability is reported per position as
+expected calibration error over 15 equal-width bins with a bootstrap 95%
+interval, Brier score and per-bin averages. The artifact
+(`dspark-confidence-calibration/1`) stores the temperatures per recorded
+sampling mode with the grid, bin definition, objective, sample counts, corpus
+files and revision, split sizes and metrics before and after fitting on both
+splits, and the model-pair manifest (target and draft identity and revision,
+block size, target layer ids, Markov rank, confidence inputs, draft dtype);
+loading rejects another schema, a wrong block size, non-finite or
+non-positive temperatures and a manifest mismatch.
+
+`tools/dspark_confidence_calibrate.py record` runs the pinned pair at K=7 on
+a deterministic corpus (prompt windows of 32 to 256 tokens cut from the
+repository documentation at the recorded git revision, plus the natural
+prompts; 240 prompts, 128 output tokens each, split by prompt index into
+calibration and holdout halves) in one sampling mode per run; `fit` fits the
+temperatures on the calibration split and evaluates both splits
+(`results/m5max-m6a-calibration-01`, corpus revision `8b3d3ec`; greedy: 120/120 prompts, 4,395/4,375 proposals; stochastic: 120/120 prompts, 6,122/6,072 proposals):
+
+| Mode | Position | Samples | Temperature | Holdout survival (label mean) | Predicted (raw → calibrated) | Holdout ECE raw [95% CI] | Holdout ECE calibrated [95% CI] | Holdout Brier raw → calibrated |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| greedy | 0 | 4,375 | 1.19 | 0.697 | 0.729 → 0.714 | 0.033 [0.027, 0.048] | 0.031 [0.025, 0.045] | 0.157 → 0.157 |
+| greedy | 1 | 4,357 | 1 | 0.514 | 0.525 → 0.514 | 0.022 [0.018, 0.037] | 0.021 [0.020, 0.037] | 0.162 → 0.161 |
+| greedy | 2 | 4,335 | 1 | 0.391 | 0.380 → 0.372 | 0.026 [0.022, 0.040] | 0.030 [0.024, 0.042] | 0.135 → 0.135 |
+| greedy | 3 | 4,308 | 0.841 | 0.303 | 0.284 → 0.282 | 0.025 [0.021, 0.038] | 0.029 [0.023, 0.040] | 0.106 → 0.106 |
+| greedy | 4 | 4,285 | 0.841 | 0.242 | 0.218 → 0.221 | 0.031 [0.024, 0.042] | 0.031 [0.025, 0.041] | 0.088 → 0.088 |
+| greedy | 5 | 4,263 | 1 | 0.197 | 0.172 → 0.174 | 0.032 [0.027, 0.042] | 0.030 [0.026, 0.040] | 0.077 → 0.077 |
+| greedy | 6 | 4,232 | 1 | 0.158 | 0.134 → 0.136 | 0.032 [0.026, 0.041] | 0.033 [0.027, 0.041] | 0.066 → 0.066 |
+| stochastic | 0 | 6,072 | 1.19 | 0.600 | 0.647 → 0.636 | 0.048 [0.039, 0.060] | 0.036 [0.028, 0.049] | 0.193 → 0.192 |
+| stochastic | 1 | 6,028 | 1.19 | 0.367 | 0.405 → 0.391 | 0.038 [0.030, 0.048] | 0.027 [0.021, 0.039] | 0.176 → 0.175 |
+| stochastic | 2 | 5,983 | 1.41 | 0.228 | 0.249 → 0.235 | 0.022 [0.018, 0.033] | 0.017 [0.014, 0.029] | 0.125 → 0.124 |
+| stochastic | 3 | 5,937 | 1.19 | 0.138 | 0.155 → 0.143 | 0.017 [0.014, 0.026] | 0.011 [0.010, 0.021] | 0.080 → 0.079 |
+| stochastic | 4 | 5,899 | 1.19 | 0.088 | 0.099 → 0.089 | 0.014 [0.012, 0.021] | 0.010 [0.009, 0.017] | 0.051 → 0.051 |
+| stochastic | 5 | 5,856 | 1 | 0.059 | 0.065 → 0.058 | 0.011 [0.008, 0.016] | 0.009 [0.007, 0.015] | 0.036 → 0.036 |
+| stochastic | 6 | 5,813 | 1.41 | 0.040 | 0.043 → 0.037 | 0.006 [0.005, 0.011] | 0.005 [0.004, 0.010] | 0.024 → 0.024 |
+
+The head is already well calibrated for this pair: the fitted temperatures
+stay within 0.84 to 1.41, the raw ECE is 2% to 5% at every position, and
+scaling lowers the holdout ECE at the early positions of the stochastic mode
+(0.048 to 0.036, 0.038 to 0.027, 0.022 to 0.017) while leaving the greedy
+mode within the bootstrap intervals; the objective is the survival
+likelihood, not the ECE, so a position's ECE can move either way by a few
+thousandths. Calibration is specific to the recorded sampling settings
+(greedy; temperature 0.8 with top-p 0.95), which the artifact records.
+
+`vllm_metal/v1/dspark/planner.py` holds the cost model and the planner.
+`tools/dspark_cost_profile.py` measures, alone on the machine and with the
+decode pipeline disabled, the per-step target forward with verification, the
+batched draft backbone and the host bookkeeping over a grid of active decode
+requests and drafted widths through the step profiler, and writes the cost
+artifact (`dspark-cost/1`: median and p95 per cell, steps, machine and MLX
+identity, profiled context length, manifest). The model interpolates the
+target cost piecewise-linearly in verify rows between the two profiled
+request levels that bracket the batch (at equal rows per request), the draft
+and host costs in the request count, and refuses queries outside the
+profiled bounds. The planner maximizes expected useful emitted tokens per
+step time for one drafting batch: every active request emits at least one
+token and needs one target input, so the batch starts at `R` rows and `R`
+tokens; the next position of each request is a candidate scored by its
+calibrated survival; candidates are admitted in descending score with
+deterministic ties (earlier position, then lower batch index), each frozen
+before the next is examined, and the walk stops at the first extension that
+does not raise the ratio or at a hard row cap. Survival decreases along a
+request, so admission is prefix-closed; caps from the output and model
+budgets bound each request. `should_draft` takes the draft-or-not decision
+before the backbone runs from the survival the previous block predicted (or
+the calibration prior for a request without history): it drafts only when
+the planned ratio strictly exceeds the target-only ratio inside the profiled
+bounds, and reports the reason otherwise (`no-requests`,
+`outside-cost-bounds`, `planner-empty`, `target-only-faster`). Tests compare
+the planner with a brute-force oracle over every prefix-closed allocation on
+convex cost curves, check causality, prefix closure, deterministic ties,
+caps and the row cap, show strict early stopping on a non-unimodal curve
+(where the oracle finds a better far point the planner does not claim), and
+cover the decision's reasons, the model's interpolation and bounds, and both
+artifacts' validation. Integration of the planner into serving (adaptive
+mode, counters, bypass) is M6b.
+
+The cost artifact for this machine (`results/m5max-m6-cost-01/cost.json`;
+Apple M5 Max, MLX 0.32.1, decode pipeline disabled, 128-token outputs on the
+natural prompts, memory fraction 0.22) covers 1, 2, 4, 8 and 16 active
+requests at widths 0, 1, 2, 3, 4, 5 and 7. Target forward with verification
+in milliseconds per step, median (p95), with the draft backbone and host
+bookkeeping per step averaged over the drafted widths:
+
+| Active requests | K=0 | K=1 | K=2 | K=3 | K=4 | K=5 | K=7 | Draft ms | Host ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 6.7 (7.1) | 7.4 (7.7) | 8.1 (8.3) | 8.6 (9.1) | 9.3 (9.5) | 11.0 (11.2) | 12.5 (12.9) | 2.7 | 0.40 |
+| 2 | 7.2 (7.7) | 8.5 (8.8) | 11.0 (11.2) | 12.5 (12.9) | 14.0 (14.3) | 16.8 (17.1) | 19.2 (19.6) | 4.1 | 0.54 |
+| 4 | 8.3 (8.6) | 12.7 (13.2) | 17.0 (17.3) | 19.3 (19.8) | 20.3 (21.0) | 21.6 (23.0) | 21.1 (22.0) | 5.6 | 0.93 |
+| 8 | 12.6 (13.2) | 19.6 (20.3) | 23.0 (24.3) | 22.5 (24.0) | 32.9 (35.0) | 33.9 (35.7) | 33.6 (36.2) | 9.7 | 1.79 |
+| 16 | 21.1 (22.1) | 23.3 (24.6) | 33.9 (36.4) | 35.0 (38.1) | 60.6 (62.4) | 56.6 (67.6) | 45.6 (54.1) | 15.9 | 4.03 |
+
+The undrafted step costs 6.7 ms at one request and 21.1 ms at sixteen; each
+verify row adds about 0.8 ms at one request but the curve steepens with
+concurrency (four requests at width 7 verify 32 rows for 21 ms, sixteen
+requests at width 4 verify 80 rows for 61 ms), which is the shape behind the
+M4d result. A few cells dip below a narrower neighbour (for example sixteen
+requests at width 7 against width 4 or 5, and eight requests at width 3
+against width 2); the p95 columns show those cells are also the noisiest, and
+the cost model makes each level's curve non-decreasing in rows before
+interpolating, so a dip can never make a longer prefix look cheaper. The
+draft backbone grows from 2.7 ms for one row to 15.9 ms for sixteen, host
+costs stay below 4 ms. Validation on M5 Max: 2,406 non-slow tests passed,
+ruff, mypy and the strict docs build clean.

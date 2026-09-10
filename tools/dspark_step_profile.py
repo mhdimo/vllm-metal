@@ -182,8 +182,14 @@ def worker(config: dict, output: Path) -> None:
     wall = time.perf_counter() - started
     generated = sum(len(item.outputs[0].token_ids) for item in outputs)
     steps = len(phases["step"])
+    from vllm_metal.v1.dspark.calibration import CalibrationManifest
+
     result = {
         "config": config,
+        "manifest": (
+            CalibrationManifest.from_runner(runner).to_dict() if width else None
+        ),
+        "device": mx.device_info(),
         "steps": steps,
         "generated_tokens": generated,
         "wall_s": wall,

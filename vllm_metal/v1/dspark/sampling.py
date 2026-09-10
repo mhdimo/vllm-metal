@@ -241,23 +241,31 @@ class RequestRandomStreams:
 
 @dataclass(slots=True)
 class DSparkProposal:
-    """One request's scheduled stochastic proposal and its exact provenance.
+    """One request's scheduled proposal and its provenance.
 
     ``owner`` is the runner's ``RequestState`` for this request generation;
     ``anchor_position`` is the absolute position of ``anchor_token`` (the last
     committed token when the block was drafted), ``token_ids`` are the drafted
-    tokens for positions ``anchor_position + 1 ...`` and ``distributions`` the
-    float32 ``[len(token_ids), vocab]`` rows they were sampled from.
+    tokens for positions ``anchor_position + 1 ...`` and ``confidence`` the
+    drafter's raw confidence logit per drafted position. A stochastic proposal
+    also keeps ``distributions``, the float32 ``[len(token_ids), vocab]`` rows
+    the tokens were sampled from, with its ``transforms`` and ``streams``; a
+    greedy proposal leaves those ``None``.
     """
 
     owner: Any
     anchor_position: int
     anchor_token: int
     token_ids: list[int]
-    distributions: mx.array
-    transforms: SamplingTransforms
-    streams: RequestRandomStreams
+    distributions: mx.array | None = None
+    transforms: SamplingTransforms | None = None
+    streams: RequestRandomStreams | None = None
+    confidence: list[float] | None = None
     precision: str = PROPOSAL_PRECISION
+
+    @property
+    def stochastic(self) -> bool:
+        return self.distributions is not None
 
     def matches(self, owner: Any, anchor_position: int, anchor_token: int) -> bool:
         return (

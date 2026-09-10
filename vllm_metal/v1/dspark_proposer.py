@@ -19,6 +19,7 @@ import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
+from vllm_metal.v1.dspark.calibration import ConfidenceRecorder
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import CONTEXT_ALIGNMENT, DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
@@ -116,17 +117,61 @@ class DSparkProposer:
         # in, so a binding cap rotates least-recently-drafted requests first.
         self._last_drafted: dict[str, int] = {}
         self._draft_step = 0
-        # Stochastic proposals of the most recent draft per request, consumed
-        # by the verifier at the request's next scheduled step, and the
-        # request-owned random streams behind them.
+        # Proposal records of the most recent draft per request (tokens,
+        # confidence logits, and for stochastic rows the exact distributions),
+        # consumed at the request's next scheduled step, and the request-owned
+        # random streams behind stochastic rows.
         self._proposals: dict[str, DSparkProposal] = {}
         self._streams: dict[str, RequestRandomStreams] = {}
         self._stream_ordinal = 0
+        # Optional confidence recorder (calibration tooling attaches it); it
+        # observes every verified proposal's raw logits and survival labels.
+        self.recorder: ConfidenceRecorder | None = None
 
     @property
     def proposals(self) -> Mapping[str, DSparkProposal]:
         """Proposal records of the drafts handed to the scheduler last step."""
         return self._proposals
+
+    def _observe_outcomes(self, ctx: ProposeContext) -> None:
+        """Feed the recorder with each scheduled proposal's verification outcome.
+
+        The runner has already committed the accepted prefix and the
+        correction or bonus token, so the accepted draft count is the distance
+        from the anchor to the new pending token minus one. Positions the
+        scheduler clipped are censored (the record is cut to the scheduled
+        width); a request that finished during verification is not scheduled
+        again and records nothing.
+        """
+        recorder = self.recorder
+        if recorder is None:
+            return
+        for (req_id, state), segment in zip(
+            ctx.decode_reqs, ctx.decode_segments, strict=True
+        ):
+            record = self._proposals.get(req_id)
+            width = len(segment.draft_token_ids)
+            if (
+                record is None
+                or record.confidence is None
+                or width == 0
+                or not record.matches(
+                    state, segment.cache_start_pos, segment.input_token_ids[0]
+                )
+                or list(record.token_ids[:width]) != list(segment.draft_token_ids)
+            ):
+                continue
+            accepted = len(state.token_ids) - 2 - segment.cache_start_pos
+            if not 0 <= accepted <= width:
+                continue
+            params = state.sampling_params
+            recorder.observe(
+                mode="stochastic" if record.stochastic else "greedy",
+                logits=record.confidence,
+                scheduled=width,
+                accepted=accepted,
+                temperature=float(params.temperature),
+            )
 
     def needs_target_hidden_states(
         self,
@@ -164,6 +209,7 @@ class DSparkProposer:
         # The scheduler consumes a request's drafts the next time it schedules
         # the request (verified this step, clipped, or dropped for a prefill
         # chunk), so a record of a scheduled request is spent either way.
+        self._observe_outcomes(ctx)
         for req_id in scheduled:
             self._proposals.pop(req_id, None)
         try:
@@ -576,6 +622,21 @@ class DSparkProposer:
             drafts.append(tokens)
             previous = tokens
         draft_array = mx.stack(drafts, axis=1)
+        # Raw confidence logit per block position: the head reads the block
+        # hidden state and the embedding of the token preceding each position
+        # (the anchor, then the drafted tokens), as in the reference evaluator.
+        confidence = None
+        if self._drafter.confidence_head is not None:
+            previous_tokens = mx.concatenate(
+                [
+                    mx.array([[plan.pending] for plan in plans], dtype=mx.int32),
+                    draft_array[:, : cap - 1],
+                ],
+                axis=1,
+            )
+            confidence = self._drafter.confidence_logits(
+                hidden[:, :cap], previous_tokens
+            ).astype(mx.float32)
         slices = []
         if distributions:
             stacked = mx.stack(distributions, axis=1)
@@ -583,19 +644,30 @@ class DSparkProposer:
                 stacked[position, : plans[index].cap]
                 for position, index in enumerate(stochastic)
             ]
-        mx.eval(draft_array, *slices)
+        mx.eval(draft_array, *slices, *([confidence] if confidence is not None else []))
         rows = cast("list[list[int]]", draft_array.tolist())
         clipped = [row[: plan.cap] for row, plan in zip(rows, plans, strict=True)]
+        confidence_rows = (
+            cast("list[list[float]]", confidence.tolist())
+            if confidence is not None
+            else None
+        )
         proposals = {}
-        for position, index in enumerate(stochastic):
-            plan = plans[index]
+        stochastic_slot = {index: position for position, index in enumerate(stochastic)}
+        for index, plan in enumerate(plans):
+            slot = stochastic_slot.get(index)
             proposals[plan.req_id] = DSparkProposal(
                 owner=plan.context.owner,
                 anchor_position=plan.context.covered_end,
                 anchor_token=plan.pending,
                 token_ids=clipped[index],
-                distributions=slices[position],
-                transforms=cast("SamplingTransforms", plan.transforms),
-                streams=cast("RequestRandomStreams", plan.streams),
+                distributions=slices[slot] if slot is not None else None,
+                transforms=plan.transforms,
+                streams=plan.streams,
+                confidence=(
+                    confidence_rows[index][: plan.cap]
+                    if confidence_rows is not None
+                    else None
+                ),
             )
         return [plan.req_id for plan in plans], clipped, proposals

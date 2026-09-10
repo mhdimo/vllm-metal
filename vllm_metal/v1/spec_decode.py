@@ -349,6 +349,8 @@ class SpeculativeDecodeController:
             if (
                 record is None
                 or width == 0
+                or record.distributions is None
+                or record.streams is None
                 or not record.matches(
                     state, segment.cache_start_pos, segment.input_token_ids[0]
                 )
@@ -361,6 +363,7 @@ class SpeculativeDecodeController:
                     f"DSpark stochastic drafts for {req_id!r} have no matching "
                     "proposal record"
                 )
+            assert record.distributions is not None and record.streams is not None
             rows = logits[0, segment.start_row : segment.start_row + width + 1]
             target = transformed_distribution(rows, transforms, vocab_size=vocab_size)
             draft = record.distributions[:width]
@@ -378,6 +381,7 @@ class SpeculativeDecodeController:
                     f"DSpark proposal for {segment.req_id!r} assigns zero mass to "
                     "its own draft"
                 )
+            assert record.streams is not None
             uniforms = record.streams.acceptance.random(width)
             rejected = first_rejection(
                 cast("list[float]", probabilities.tolist()), uniforms.tolist()
