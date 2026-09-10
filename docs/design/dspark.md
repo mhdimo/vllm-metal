@@ -11,6 +11,10 @@ revision, observed results, reproductions, and experiments still required.
 Requirements below are proposed engineering decisions unless identified as
 existing behavior or attributed to an external source.
 
+Completed changes and their validation are tracked in the
+[implementation progress record](dspark-progress.md). The audit findings below
+describe the original baseline, not the resolution status of later commits.
+
 ## Scope and completion criteria
 
 There are two distinct checkpoint interfaces:
@@ -396,6 +400,36 @@ lengths, replayed tokens, context bytes, and draft/verify/host times. Keep reque
 IDs and per-step informational logs out of the default hot path.
 
 ## Implementation sequence
+
+### Alignment with earlier Metal integrations
+
+Gemma4 MTP landed as separate [target capture](https://github.com/vllm-project/vllm-metal/pull/369),
+[assistant loading](https://github.com/vllm-project/vllm-metal/pull/374),
+[KV sharing](https://github.com/vllm-project/vllm-metal/pull/384),
+[scheduler handoff](https://github.com/vllm-project/vllm-metal/pull/387), and
+[documentation/benchmark](https://github.com/vllm-project/vllm-metal/pull/410)
+changes. DSpark follows that staged integration, retaining the existing proposer,
+adapter, lifecycle and verification owners.
+
+The subsequent [proposer-policy cleanup](https://github.com/vllm-project/vllm-metal/pull/483)
+removed an unnecessary generic registry. The [resolved-config cleanup](https://github.com/vllm-project/vllm-metal/pull/597)
+made upstream's draft `ModelConfig` authoritative. DSpark should use these
+contracts directly, without speculative abstractions or fallback config sources.
+
+[Draft cache integration](https://github.com/vllm-project/vllm-metal/pull/630)
+replaced a rejected private prefix cache with scheduler-owned cache groups so
+cache salts, prefix-read policy and admission stayed consistent. DSpark must not
+introduce cross-request prefix reuse outside that ownership. A temporary bounded
+context allocation must be accounted for by the cache planner and remain
+request-local until a proper shared-cache contract exists. [Lifecycle release](https://github.com/vllm-project/vllm-metal/pull/551)
+and the [measured proposer overhead investigation](https://github.com/vllm-project/vllm-metal/issues/482)
+also motivate exact invalidation, incremental ingest and before/after measurements.
+
+Each milestone is committed on a focused branch, reviewed as a PR into `Dspark`,
+validated and merged before the next milestone is based on it. The fork's current
+CI filters target `main`; PRs into `Dspark` therefore need recorded local checks.
+This branch workflow does not establish upstream approval or full-feature release
+readiness.
 
 Each row is an independently reviewable change with a measurable exit gate.
 Dependencies are semantic; estimated calendar dates are intentionally omitted.

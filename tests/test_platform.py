@@ -1156,6 +1156,7 @@ class TestMetalPlatform:
             speculative_config=SimpleNamespace(
                 use_heterogeneous_vocab=False,
                 num_speculative_tokens=3,
+                method="ngram",
             ),
             scheduler_config=SimpleNamespace(async_scheduling=True),
         )
@@ -1199,6 +1200,7 @@ class TestMetalPlatform:
                 SimpleNamespace(
                     use_heterogeneous_vocab=False,
                     num_speculative_tokens=2,
+                    method="ngram",
                 ),
             ),
         ],
