@@ -332,9 +332,12 @@ class DSparkProposer:
             # Materialize once per step, including K=0 and intermediate chunks.
             # Persistent KV must not retain the target activation graph from
             # every earlier chunk. There is no full-prompt feature stash/replay.
-            # Every context lives in the per-layer arenas, so evaluating those
-            # arrays settles all of this step's writes in one call.
-            mx.eval(
+            # Every context lives in the per-layer arenas, so one call settles
+            # all of this step's writes; it is queued behind the step's GPU
+            # work without a host wait (a drafting step's own evaluation
+            # waits for it, a non-drafting step overlaps it with the next
+            # step's preparation).
+            mx.async_eval(
                 [(arena.keys, arena.values) for arena in self._arena]
                 + [
                     (cache.k, cache.v)

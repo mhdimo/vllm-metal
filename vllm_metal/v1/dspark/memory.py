@@ -38,7 +38,18 @@ class DSparkMemoryPlan:
 
     @property
     def reserve_bytes(self) -> int:
+        """Everything the drafter will hold: checked before the arena exists."""
         return self.context_bytes + self.capture_bytes + self.workspace_bytes
+
+    @property
+    def planning_reserve_bytes(self) -> int:
+        """What the target cache planner subtracts once the drafter is loaded.
+
+        The context arena is allocated at load, so by the time the target KV
+        cache is sized it is already part of the measured model memory; only
+        the capture staging and the per-step workspace remain to be reserved.
+        """
+        return self.capture_bytes + self.workspace_bytes
 
     @classmethod
     def build(
@@ -74,10 +85,10 @@ class DSparkMemoryPlan:
         # Captured layer outputs and their concatenation can coexist. Use FP32
         # sizing even for a two-byte target, including target/draft dtype casts.
         capture = 2 * tokens * len(config.target_layer_ids) * config.hidden_size * 4
-        # Reserve a complete copy-on-write buffer set, a padded batch and the
-        # context+block attention inputs. This covers lazy graph overlap without
-        # depending on a particular MLX buffer-reuse optimization.
-        copies = 3 * context
+        # One transient copy of the context arena: an in-place update that
+        # cannot reuse its buffer (a view still alive) rewrites the whole arena
+        # once. Drafting attends rows in place, so no padded batch copy exists.
+        copies = context
         ingest = (
             tokens
             * (4 * config.hidden_size + 4 * config.num_hidden_layers * kv_width)

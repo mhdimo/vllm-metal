@@ -177,12 +177,16 @@ def test_target_kv_plan_subtracts_complete_dspark_reservation(monkeypatch):
     plain = planner._paged_attention_plan(overhead=100_000_000)
     planner._worker.vllm_config.speculative_config = SimpleNamespace(method="dspark")
     spec = planner._paged_attention_plan(overhead=100_000_000)
-    assert plain.kv_budget - spec.kv_budget == proposer.memory_plan.reserve_bytes
+    # The arena is allocated at load and therefore inside the measured model
+    # memory; the planner subtracts the capture and workspace that remain.
+    plan = proposer.memory_plan
+    assert plan.planning_reserve_bytes == plan.reserve_bytes - plan.context_bytes
+    assert plain.kv_budget - spec.kv_budget == plan.planning_reserve_bytes
     assert (
         spec.num_blocks * spec.per_block_bytes
         + spec.model_memory
         + spec.overhead
-        + proposer.memory_plan.reserve_bytes
+        + plan.planning_reserve_bytes
         <= spec.usable_metal
     )
     runner._dspark_memory_plan = None
