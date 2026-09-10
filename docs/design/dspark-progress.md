@@ -295,3 +295,27 @@ with no expected failures; Ruff check/format, mypy (145 source files), shellchec
 and the strict MkDocs build passed. The final-source engine run repeated all
 controlled faults and full-capacity allocation with 80 matching batch completions,
 two cancellations and two ID reuses, and zero retained active-memory drift.
+
+## M5 Max migration and numerics (2026-09-10)
+
+The destination machine is an Apple M5 Max, 48 GB unified memory, macOS 26.6,
+SDK 26.5, Command Line Tools only, MLX 0.32.1 with the Metal recommended
+working set at 40,200,896,512 bytes. Shaders compile in-process under
+`VLLM_METAL_BUILD_FROM_SOURCE=1`, so no Metal compiler is needed for the
+checkers; wheel packaging still needs Xcode and is deferred on this machine.
+The NAX prefill kernels load on this GPU, which the M4 did not exercise.
+
+Fresh install at `4af9a92` with the pinned constraints matched all 188
+recorded versions (`uv pip check` clean). The interpreter is CPython 3.12.12
+because uv 0.9.18 offers no 3.12.13 build.
+
+The not-slow suite gave 2,310 passed and 5 failed at MLX defaults. Every
+failure was an FP32 oracle: MLX runs multi-row FP32 matmuls on the M5 tensor
+units at TF32 precision (8e-4 relative error measured against float64, versus
+4e-7 for one row). `MLX_ENABLE_TF32=0` restores 9e-7 and all tests pass. The
+suite and the tiny reference checker now pin that switch, and
+`tests/test_metal_numerics.py` guards it. BF16 (9.5e-4) and affine-4 (7.8e-3)
+differences between one-row and eight-row matmuls are unaffected by the switch
+and are intrinsic kernel behavior; they explain near-tie token flips between
+single-row decode and multi-row verification. See the
+[handoff numerics section](dspark-handoff.md#m5-max-numerics-tf32-is-the-fp32-gemm-default).
