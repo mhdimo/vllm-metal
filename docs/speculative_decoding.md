@@ -193,8 +193,14 @@ DSpark for low-concurrency serving with K=2-4 until adaptive planning lands.
 
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,
-target_layer_ids=[...])`, and the periodic `SpecDecoding metrics ... Avg
-Draft acceptance rate` reflects the live acceptance.
+target_layer_ids=[...]) ... mode=<fixed|adaptive|bypass>`, the periodic
+`SpecDecoding metrics ... Avg Draft acceptance rate` reflects the live
+acceptance, and every 2,000 drafting steps the proposer logs a `DSpark
+counters` snapshot (bypass reasons, proposed, scheduled and accepted tokens,
+per-position acceptance, planner lengths). `tools/dspark_soak.py` drives a
+server with a mixed closed-loop workload for a duration and request count
+and reports latency percentiles, throughput, cancellations, the memory
+trajectory and the spec-decode counters.
 
 ### Characteristics
 

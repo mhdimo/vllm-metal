@@ -974,11 +974,12 @@ it is recorded as the first M7 optimization target. The serving-path cost
 model explains the M4d and first-evaluation results that the in-process
 model contradicted: through `vllm serve`, a drafted step at sixteen
 requests and 1,300 tokens of context costs 138 ms against 34 ms for the
-bypass step and about 40 ms for the same step measured in process, so
-verify rows are roughly five times more expensive served than in process,
-and the planner therefore drafts only at one or two concurrent requests
-(the cost table above; the in-process gap is the second M7 profiling
-question). The specification's adaptive criterion (goodput and p95 within
+bypass step, and the planner therefore drafts only at one or two
+concurrent requests (the cost table above). The M6a in-process table's
+40 ms for that width and request count was measured at the natural
+prompts' short contexts, not at 1,300 tokens; the M7 probe measured the
+same cell in process at 114 ms, so the serving path adds about a fifth
+and context length accounts for the rest. The specification's adaptive criterion (goodput and p95 within
 5% of target-only, or an explicit bypass) is met by the explicit bypass at
 four and eight requests with the floor recorded, and by the one-request
 gains that exceed the 10% gate with the interval above zero.
@@ -1015,3 +1016,86 @@ of the target's own disagreement with itself across the single-row and
 batched paths; the verifier and the adaptive mode add nothing to it, and
 the gate's own control column is the way to read such a result.
 
+## M7: production hardening (M5 Max, `5b2bd1e`)
+
+Profile before optimization. The M4d step profile, the M6 cost model and the
+M6b evaluation locate DSpark's serving cost in three places, and the two
+probes recorded here separate them. First, context: the in-process cost
+table of M6a was taken at the natural prompts' short contexts, and its
+40 ms engine step for K=7 at sixteen requests became 114 ms at 1,300 tokens
+of context in process (`results/m5max-m7-served-gap-01`, the engine-core
+step timed over the all-decoding half of the run), against 138 ms through
+`vllm serve` at the same cell; the M6b record's sentence that put the
+served step at about three times the in-process one compared cells at
+different contexts and is corrected here: the serving path adds about a
+fifth, and the multiprocess engine core and request statistics add nothing
+(decode throughput 338, 346 and 347 tokens per second with the core in
+process, in its own process, and with statistics on). Second, the target
+forward that verifies `K+1` rows per request: the matmul probe
+(`tools/dspark_matmul_rows_probe.py`) times the pinned target's own affine-4
+linear layers at 1 to 32 query rows. The affine-4 linear layers are memory-bound only up to about four rows: one decoder layer's MLP takes 0.23 ms for one row, 0.26 for four, 0.42 for eight and 0.58 for thirty-two (2.5 times the one-row cost for thirty-two times the rows), the attention projections follow the same shape, and the language-model head goes from 0.61 ms at one row through 1.04 at eight to 1.45 at thirty-two. Past four rows each extra row adds a near-constant cost, about 7 µs per row for the MLP, so a K=7 verification (eight rows per request) costs the target roughly twice a single-row decode per request, and sixteen such requests (128 rows) sit well inside the compute-bound regime of the quantized matmul: the multi-row verification cost the M4d and M6 profiles measured is the matmul path, not attention, and it is inherent to this kernel rather than to the port. The probe's first pass showed the one-row path 2.6 times slower than two rows until its kernel variant had been compiled once (`results/m5max-m7-matmul-01`); the recorded numbers (`results/m5max-m7-matmul-02`) are a second pass after warming every row count:
+
+| Rows | MLP ms | MLP ratio | QKV ms | O ms | LM head ms | LM head ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.230 | 1.00 | 0.181 | 0.174 | 0.610 | 1.00 |
+| 2 | 0.240 | 1.04 | 0.188 | 0.168 | 0.582 | 0.95 |
+| 4 | 0.263 | 1.14 | 0.188 | 0.172 | 0.810 | 1.33 |
+| 8 | 0.416 | 1.81 | 0.241 | 0.224 | 1.040 | 1.71 |
+| 12 | 0.441 | 1.91 | 0.223 | 0.200 | 1.555 | 2.55 |
+| 16 | 0.536 | 2.33 | 0.269 | 0.225 | 1.390 | 2.28 |
+| 24 | 0.536 | 2.33 | 0.290 | 0.268 | 1.465 | 2.40 |
+| 32 | 0.578 | 2.51 | 0.347 | 0.270 | 1.452 | 2.38 |
+
+Third, the
+structural cost of a speculative server that does not draft: with
+speculative decoding configured the Metal decode pipeline is disabled and
+target features are captured and ingested every step, so the bypass step
+runs 6% to 11% below a target-only server on the 128-token buckets and 20%
+below it at eight requests on the 1,024-token bucket (M6b). That bypass
+floor, the affine-4 multi-row matmul path and the fifth the serving path
+adds are the optimization targets recorded here; none is changed in this
+milestone, which qualifies the serving path as it is.
+
+`tools/dspark_soak.py` is the HTTP soak. It launches one `vllm serve` (any
+mode through the environment) and drives it with a closed-loop client pool
+for at least the requested duration and request count: greedy and sampled
+requests (temperature 0.8, half of them seeded with top-p 0.95), output
+budgets from 8 to 256 tokens, natural prompts, long documentation windows
+that need several prefill chunks, a shared prefix on a fifth of the
+requests, streaming and non-streaming calls, and streamed requests the
+client abandons after one to four chunks (cancellations). It samples the
+server process tree's resident memory and the `/metrics` counters every
+fifteen seconds and requires at the end that no request failed, the server
+holds no running or waiting request, draft work was reported and kept
+flowing through the last quarter of the run, and records latency
+percentiles, throughput, the cancellation count, the memory trajectory and
+the spec-decode counters. The proposer now logs its counters snapshot once
+per 2,000 drafting steps (bypass reasons, proposed, scheduled and accepted
+tokens, per-position acceptance, planner lengths) so an operator can read
+the mode's behaviour from the server log without per-step logging.
+
+The soak runs the fixed mode at K=7, the demanding path (every step
+drafts and verifies eight rows per request, proposal records and their
+distributions turn over on every stochastic request, cancellations land
+mid-draft); in the adaptive mode at eight clients the planner bypasses
+nearly every step (M6b), so a soak there would exercise only the bypass
+path. The first attempt (`results/m5max-m7-soak-01`) lost its server after
+51 minutes and 10,264 requests to a Metal command-buffer OOM
+(`kIOGPUCommandBufferCallbackErrorOutOfMemory`) at the moment a full test
+suite with end-to-end engine tests ran on the same GPU (the suite logged the
+same error); the soak tool now ends the run as soon as the server process
+exits, with the exit code and the moment, and the recorded run below had the
+GPU to itself. Result (`results/m5max-m7-soak-02`, eight concurrent
+clients, 4B pair):
+
+| Duration | Requests (completed / cancelled / errors) | Output tokens | Requests/s | Tokens/s | TTFT p50 / p95 s | E2E p50 / p95 / p99 s | Draft / accepted tokens | RSS first → peak → last |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 65.0 min | 13,289 (12,220 / 1,069 / 0) | 1,009,629 | 3.40 | 258.7 | 0.200 / 0.455 | 1.57 / 7.75 / 9.44 | 2,303,046 / 649,888 (28.2%) | 4.38 GB → 4.38 GB → 4.28 GB |
+
+The 260 fifteen-second samples put the draft-token counter at 0, 1,162,997 and 2,300,418 tokens at the start, middle and end of the run (never idle), at most 8 requests running and 2 waiting at any sample, and the failure list empty: none.
+
+Packaged deployment (`scripts/test.sh` wheel build) needs Xcode's Metal
+compiler, which this machine does not have; the source-built kernels
+(`VLLM_METAL_BUILD_FROM_SOURCE=1`) served every run in this record. Packaging
+validation stays deferred to a machine with Xcode and is listed as such in the
+handoff.
