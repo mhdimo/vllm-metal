@@ -2,6 +2,7 @@
 """In-process per-step cost attribution for DSpark at a fixed K.
 
 Runs an offline engine on natural prompts and times, per scheduler step, the
+whole engine-core step (scheduling, execution and output processing) and the
 phases the proposer seam exposes: the target forward with verification and
 sampling (from ``execute_model`` entry to the proposer call), feature ingest
 (host bookkeeping), context materialization (the proposer's evaluation of the
@@ -81,7 +82,23 @@ def worker(config: dict, output: Path) -> None:
         "draft": [],
         "propose_other": [],
         "step": [],
+        "engine_step": [],
     }
+    # Whole engine-core step (scheduling, execution, output processing): the
+    # per-step cost serving actually pays, which the runner-side phases
+    # underestimate at many verify rows.
+    core = getattr(llm.llm_engine.engine_core, "engine_core", None)
+    if core is not None and hasattr(core, "step_fn"):
+        real_step_fn = core.step_fn
+
+        def step_fn():
+            started = time.perf_counter()
+            try:
+                return real_step_fn()
+            finally:
+                phases["engine_step"].append(time.perf_counter() - started)
+
+        core.step_fn = step_fn
     emitted: list[int] = []
     marks: dict[str, float] = {}
     real_execute = runner.execute_model
@@ -284,6 +301,7 @@ def main() -> None:
         print(
             f"K={width} C={args.concurrency}: {result['steps']} steps, "
             f"{result['tokens_per_step']:.2f} tok/step, step p50 {ms['step']['p50']:.1f} ms "
+            f"(engine {ms['engine_step'].get('p50', 0.0):.1f}) "
             f"(target {ms['target']['p50']:.1f}, draft {ms['draft'].get('p50', 0.0):.1f}, "
             f"ingest {ms['ingest_host'].get('p50', 0.0):.2f}, context {ms['context_eval'].get('p50', 0.0):.2f}), "
             f"{result['tokens_per_second_instrumented']:.1f} tok/s instrumented",

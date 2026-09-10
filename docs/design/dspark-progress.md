@@ -8,8 +8,8 @@ and serving qualification gates pass.
 For the verified integration revision, M5 Max setup, exact reproduction commands,
 raw-evidence transfer and remaining implementation sequence, start with the
 [development handoff](dspark-handoff.md), checked on 2026-09-10. M4, M5 and
-M6a are qualified on the M5 Max destination machine (sections below); M6b, M7
-and M8 remain open.
+M6 are qualified on the M5 Max destination machine (sections below); M7 and
+M8 remain open.
 
 | Milestone | Status | Change and validation |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ and M8 remain open.
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
 | M4: Fixed-greedy serving | Complete on M5 Max for the pinned 4B pair: M4a parity contract ([record](dspark-m4-parity.md)), M4b admission fairness, M4c HTTP serving semantics, M4d fixed-K performance | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; admission caps measured on a real engine; the HTTP matrix passes with every divergence a tie; fixed K=2-4 gives +36-49% tokens/s at one request on short prompts and loses 4-28% at four concurrent requests (multi-row verification cost), so adaptive bypass is M6 work. |
 | M5: Stochastic verification | Complete on M5 Max for the pinned 4B pair | Exact float32 proposal distributions kept with every scheduled draft, rejection/residual/bonus sampling from per-request streams, enumerated oracle and powered distribution tests, real-engine distribution and mixed-workload gate. |
-| M6: Calibrated adaptive planning | M6a done on M5 Max (calibration, cost model, planner); M6b serving integration open | Confidence recording with censored labels, sequential temperature scaling with holdout reliability, measured cost model with bounds, causal prefix planner with an oracle; adaptive mode, counters and its evaluation follow. |
+| M6: Calibrated adaptive planning | Complete on M5 Max for the pinned 4B pair | Confidence recording with censored labels, sequential temperature scaling with holdout reliability, measured cost model with bounds, causal prefix planner with an oracle, and the adaptive serving mode with bypass, history reset and counters, evaluated in the paired protocol. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
 | M8: Additional standalone pairs | Planned | Pair-specific target adapters, precision, capacity and serving qualification within 48 GB. |
 | Integrated V4 | Deferred | Outside available 32/48 GB hardware; also requires a qualified V4 target backend. |
@@ -819,7 +819,11 @@ cover the decision's reasons, the model's interpolation and bounds, and both
 artifacts' validation. Integration of the planner into serving (adaptive
 mode, counters, bypass) is M6b.
 
-The cost artifact for this machine (`results/m5max-m6-cost-01/cost.json`;
+The in-process cost artifact recorded here was superseded in M6b by a
+serving-path profile (`dspark-cost/2`, see the M6b section) after the first
+adaptive evaluation showed it under-predicts the served step; the numbers
+stay as the attribution record. The cost artifact for this machine
+(`results/m5max-m6-cost-01/cost.json`;
 Apple M5 Max, MLX 0.32.1, decode pipeline disabled, 128-token outputs on the
 natural prompts, memory fraction 0.22) covers 1, 2, 4, 8 and 16 active
 requests at widths 0, 1, 2, 3, 4, 5 and 7. Target forward with verification
@@ -846,3 +850,168 @@ interpolating, so a dip can never make a longer prefix look cheaper. The
 draft backbone grows from 2.7 ms for one row to 15.9 ms for sixteen, host
 costs stay below 4 ms. Validation on M5 Max: 2,406 non-slow tests passed,
 ruff, mypy and the strict docs build clean.
+## M6b: adaptive serving mode (M5 Max, `adc00d8`)
+
+`VLLM_METAL_DSPARK_MODE=adaptive` binds the calibration artifact and the
+cost model (`VLLM_METAL_DSPARK_CALIBRATION`, `VLLM_METAL_DSPARK_COST_MODEL`,
+both validated against the served pair's manifest at startup; a missing or
+mismatched artifact or an unknown mode fails startup with the reason, and
+`fixed`, the default, keeps the M4 behaviour) to the proposer through
+`vllm_metal/v1/dspark/adaptive.py`. A third mode, `bypass`, keeps the
+drafter loaded and every context advancing but never drafts: it is the
+step the planner weighs drafting against, and serves profiling and A/B
+comparisons. Each step the proposer first selects the eligible, capped plans
+as before, counts the requests the next target step will decode or verify
+(drafted or not, one row each at least) and their mean committed length,
+and asks the planner whether drafting the batch pays: the expected survival
+of every candidate is the calibrated survival its previous block predicted,
+or the calibration prior (mean survival per position on the calibration
+split) for a request without history, and `should_draft` compares the
+planned ratio of expected emitted tokens per step time with the bypass
+ratio inside the profiled cost bounds. A bypass skips the backbone entirely
+(its cost is not recoverable afterwards), counts its reason and leaves the
+contexts advancing. When drafting proceeds, the backbone runs once for the
+batch, the fresh confidence logits are calibrated with the mode's
+temperatures, the planner allocates a causal prefix per request, and every
+row and its proposal record (tokens, distributions of a stochastic row,
+confidence) is cut to that length; rows planned at zero are not handed to
+the scheduler. History is per request generation: it is dropped when the
+request is released (finish, cancel, preemption) and when a scheduled
+request goes a step without a draft, so a resumed or idle request starts
+again from the prior. `DSparkCounters` accumulates steps, drafting steps,
+bypass reasons, proposed, scheduled and accepted tokens, verified requests,
+correction or bonus tokens, per-position opportunities and acceptances,
+planner lengths and the last planned and bypass ratios, from the same
+outcome derivation the recorder uses; nothing is logged per step.
+
+The first evaluation exposed the in-process cost model of M6a as
+insufficient. Its target cost was the runner's own phase (execute to
+sample), and even the whole engine-core step measured in process differed
+from it by less than a millisecond, yet the paired HTTP benchmark at four
+concurrent requests lost 20% where the model predicted a small gain: the
+step a served request experiences is longer than the in-process step, the
+gap grows with drafted tokens, and the model ignored the decode context,
+which the 1,024-token buckets showed to matter. `tools/dspark_cost_profile.py`
+therefore measures through the serving path: for every drafted width one
+`vllm serve` runs in the fixed mode and for width 0 the same speculative
+server runs in the bypass mode, each driven, per profiled request count and
+context, by that many concurrent streaming requests of exactly the
+context's length; the step cost of a cell is the median gap between
+consecutive streamed chunks of one request while every request of the
+batch is decoding (p95 kept as the uncertainty), and the drafter's own work
+per step comes from the in-process profiler at one width per request level
+and is subtracted to give the planner's target cost. The artifact
+(`dspark-cost/2`) adds the decode context as a dimension; the model
+interpolates in rows, then request level, then context, and treats a batch
+beyond the longest profiled context as outside its bounds. Serving-path step costs in milliseconds, median (p95), of the 4B pair on this
+machine (`results/m5max-m6-cost-03`; memory fraction 0.4 so sixteen long requests
+fit, 64-token outputs, the drafter's work from the in-process profiler at width 4):
+
+| Context (decode tokens) | Requests | bypass | K=1 | K=2 | K=4 | K=7 | Draft ms | Host ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 160 | 1 | 7.4 (7.8) | 10.7 (12.1) | 11.2 (11.6) | 14.3 (15.0) | 19.4 (20.5) | 2.6 | 0.42 |
+| 160 | 2 | 8.2 (9.0) | 13.3 (13.7) | 20.3 (22.3) | 25.9 (26.4) | 31.5 (32.1) | 4.2 | 0.58 |
+| 160 | 4 | 9.5 (9.8) | 19.4 (19.7) | 30.3 (30.6) | 40.8 (42.6) | 35.2 (36.0) | 5.7 | 0.92 |
+| 160 | 8 | 14.5 (14.8) | 31.5 (32.5) | 41.4 (45.6) | 56.1 (59.9) | 54.4 (57.6) | 9.5 | 1.62 |
+| 160 | 16 | 24.5 (28.6) | 42.9 (45.7) | 60.6 (65.3) | 87.2 (88.6) | 68.8 (74.7) | 14.3 | 3.77 |
+| 672 | 1 | 8.1 (8.4) | 11.7 (12.0) | 13.8 (14.2) | 17.2 (20.6) | 24.3 (24.8) | 2.6 | 0.42 |
+| 672 | 2 | 8.9 (9.3) | 16.0 (16.4) | 22.8 (24.2) | 28.8 (30.4) | 34.9 (38.0) | 4.2 | 0.58 |
+| 672 | 4 | 12.0 (13.1) | 25.4 (26.3) | 33.7 (35.8) | 41.1 (44.8) | 43.0 (46.8) | 5.7 | 0.92 |
+| 672 | 8 | 18.8 (20.8) | 40.5 (42.1) | 48.2 (50.8) | 64.2 (67.1) | 66.8 (71.3) | 9.5 | 1.62 |
+| 672 | 16 | 28.5 (29.3) | 55.8 (59.1) | 74.9 (80.4) | 102.5 (108.7) | 94.7 (100.0) | 14.3 | 3.77 |
+| 1312 | 1 | 8.3 (8.7) | 12.9 (13.8) | 16.7 (18.1) | 19.4 (20.9) | 26.0 (27.7) | 2.6 | 0.42 |
+| 1312 | 2 | 10.4 (12.0) | 18.8 (20.5) | 25.7 (28.6) | 32.2 (33.5) | 39.3 (42.9) | 4.2 | 0.58 |
+| 1312 | 4 | 12.7 (13.8) | 27.9 (30.1) | 42.0 (46.9) | 47.1 (51.1) | 50.2 (54.6) | 5.7 | 0.92 |
+| 1312 | 8 | 20.7 (22.1) | 47.7 (49.9) | 64.1 (68.5) | 76.5 (80.5) | 82.8 (95.0) | 9.5 | 1.62 |
+| 1312 | 16 | 34.4 (35.7) | 71.5 (78.3) | 98.3 (105.5) | 132.4 (142.0) | 137.6 (148.1) | 14.3 | 3.77 |
+
+Evaluation (`results/m5max-m6b-adaptive-03`), the M4d protocol with the
+speculative server in the adaptive mode (K=7 configured, both artifacts
+bound), against the synchronous target-only server, five paired
+repetitions per cell:
+
+| Server | Bucket | C | Target-only tok/s | Candidate tok/s | Tokens/s benefit (median, 95% CI) | TPOT ms | Gap p95 ms | Goodput req/s | Accepted / drafted |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| k7-adaptive | 128x128 | 1 | 136.6 | 197.8 | +40.5% [+35.2, +45.5] ✓ | 7.0 → 4.7 | 7 → 18 | 1.07 → 1.55 | 510 / 690 |
+| k7-adaptive | 128x128 | 4 | 364.6 | 329.8 | -11.0% [-11.5, -6.6] | 9.8 → 11.0 | 10 → 11 | 2.85 → 2.58 | 0 / 12 |
+| k7-adaptive | 128x128 | 8 | 439.1 | 412.5 | -6.4% [-9.7, -5.4] | 16.4 → 17.8 | 17 → 18 | 3.43 → 3.22 | 0 / 12 |
+| k7-adaptive | 1024x128 | 1 | 106.0 | 106.2 | +1.5% [-4.7, +6.7] | 7.8 → 7.5 | 8 → 19 | 0.83 → 0.83 | 360 / 576 |
+| k7-adaptive | 1024x128 | 4 | 200.1 | 182.5 | -8.2% [-9.1, -4.4] | 14.2 → 15.6 | 13 → 15 | 1.17 → 1.07 | 6 / 12 |
+| k7-adaptive | 1024x128 | 8 | 215.3 | 172.1 | -20.1% [-20.7, -18.7] | 26.3 → 25.8 | 59 → 79 | 0.00 → 0.00 | 27 / 33 |
+| k7-adaptive | 128x512 | 1 | 126.4 | 168.4 | +33.3% [+28.5, +38.7] ✓ | 7.7 → 5.8 | 8 → 22 | 0.25 → 0.33 | 2040 / 2964 |
+| k7-adaptive | 128x512 | 4 | 329.7 | 306.9 | -7.1% [-7.6, -6.8] | 11.8 → 12.7 | 13 → 14 | 0.64 → 0.60 | 0 / 12 |
+| k7-adaptive | 128x512 | 8 | 417.9 | 389.9 | -6.4% [-6.8, -6.3] | 18.7 → 20.0 | 20 → 22 | 0.82 → 0.76 | 0 / 12 |
+
+Fixed K=2 and K=7 at eight clients under the same protocol
+(`results/m5max-m6b-adaptive-01/bench-fixed-c8`), for comparison:
+
+| Server | Bucket | C | Target-only tok/s | Candidate tok/s | Tokens/s benefit (median, 95% CI) | TPOT ms | Gap p95 ms | Goodput req/s | Accepted / drafted |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| k2 | 128x128 | 8 | 423.8 | 382.2 | -10.0% [-12.5, -7.4] | 17.1 → 18.3 | 17 → 43 | 3.31 → 2.99 | 3478 / 5167 |
+| k2 | 1024x128 | 8 | 225.6 | 166.2 | -26.3% [-27.9, -26.0] | 25.2 → 23.2 | 57 → 155 | 0.00 → 0.00 | 3430 / 5296 |
+| k2 | 128x512 | 8 | 434.6 | 405.3 | -6.8% [-6.9, -6.1] | 18.0 → 18.1 | 20 → 48 | 0.85 → 0.79 | 14391 / 20241 |
+| k7 | 128x128 | 8 | 389.9 | 348.2 | -12.6% [-15.9, -10.5] | 18.7 → 17.6 | 20 → 61 | 3.05 → 2.72 | 4116 / 13410 |
+| k7 | 1024x128 | 8 | 212.3 | 134.3 | -37.0% [-43.5, -35.7] | 25.7 → 30.9 | 62 → 215 | 0.00 → 0.00 | 3975 / 14503 |
+| k7 | 128x512 | 8 | 413.5 | 385.7 | -8.1% [-10.9, -4.2] | 18.9 → 16.7 | 21 → 67 | 0.81 → 0.75 | 17536 / 48718 |
+
+At one request the adaptive mode gains +40.5% on the 128x128 bucket and
++33.3% on 128x512 (fixed K=2 gave +48.6% and +35.9% under the same protocol
+in M4d, fixed K=7 +13.7% and +25.8%) with acceptance of 69% to 74% per draft
+token, because the planner keeps prefixes short (three to four positions);
+on the 1,024-token bucket it drafts but the end-to-end gain is within noise
+(+1.5%), since the per-step ratio it optimizes is diluted by the prompt's
+prefill in this bucket's wall time. At four and eight requests the planner
+bypasses drafting in every bucket except a few steps on the 1,024-token
+bucket at eight requests (33 draft tokens over the five repetitions), and
+the server then sits on the bypass floor: 6% to 11% below the target-only
+server on the 128-token buckets and 20% below it on the 1,024-token bucket
+at eight requests, where fixed K=7 lost 8% to 37% and fixed K=2 7% to 26%
+(and 18% to 28% at four requests in M4d).
+That floor is not the planner's cost: with speculative decoding configured
+the decode pipeline is off and target features are captured every step,
+which is why a bypassing speculative server cannot match a target-only one;
+it is recorded as the first M7 optimization target. The serving-path cost
+model explains the M4d and first-evaluation results that the in-process
+model contradicted: through `vllm serve`, a drafted step at sixteen
+requests and 1,300 tokens of context costs 138 ms against 34 ms for the
+bypass step and about 40 ms for the same step measured in process, so
+verify rows are roughly five times more expensive served than in process,
+and the planner therefore drafts only at one or two concurrent requests
+(the cost table above; the in-process gap is the second M7 profiling
+question). The specification's adaptive criterion (goodput and p95 within
+5% of target-only, or an explicit bypass) is met by the explicit bypass at
+four and eight requests with the floor recorded, and by the one-request
+gains that exceed the 10% gate with the interval above zero.
+
+Gates in the adaptive mode. The HTTP serving matrix (K=0 and K=7 servers
+with and without prefix caching, the mode bound to the K=7 servers) passed
+with zero failures. The stochastic distribution gate needs the planner to
+draft, which it declines at two or more concurrent requests on this cost
+model, so it ran at one sequence: every request drafted (4,000 drafts per
+scenario, 54% and 76% accepted at temperature 1.0 and at 0.7 with top-p
+0.9), the mixed batch drafted every draftable kind and none of the
+undraftable ones, greedy outputs matched the target-only engine (five equal,
+two ties), budgets, EOS and stop tokens held and the seeded repeat was
+identical; at temperature 1.0 every position passed, and at temperature
+0.7 with top-p 0.9 the second verified position failed the predefined test
+(chi-square 129 over 26 buckets). The histograms show a nucleus-boundary
+flip rather than a verifier defect: one token (`1246`) carries 1.6% of the
+mass on the target-only engine and none on the speculative engine, and its
+neighbour (`4263`) the reverse, because at one sequence the target-only
+engine decodes single-row logits while verification computes two-row
+logits, the two arithmetic paths of the M4a numerics contract, and top-p
+truncation turns their sub-ULP logit difference into a token that is inside
+the nucleus on one path and outside on the other. Without truncation
+(temperature 1.0) the same run passes at every position, and the fixed-mode
+gate at sixty-four sequences (M5) passed both scenarios because both
+engines then batch. The numerics control confirms
+it (`results/m5max-m6b-adaptive-03/stochastic-adaptive-1seq-control`): the
+same target-only engine run at sixty-four sequences against itself at one
+sequence, with no drafting anywhere, differs at temperature 0.7 with top-p
+0.9 at every position (chi-square 257, 217 and 179; p below 1e-23, position
+0 included) and agrees at temperature 1.0 at every position (p 0.12 to
+0.79). The speculative engine's one failing position is a smaller version
+of the target's own disagreement with itself across the single-row and
+batched paths; the verifier and the adaptive mode add nothing to it, and
+the gate's own control column is the way to read such a result.
+

@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measured cost model and causal prefix planner for adaptive DSpark (M6).
 
-The cost artifact holds step costs measured on the real pair and this
-machine at a grid of active decode requests ``R`` and drafted widths ``k``:
-the target forward that verifies ``R * (k + 1)`` rows (with sampling), the
-batched draft backbone for ``R`` rows, and the host bookkeeping. The model
-interpolates the target cost piecewise-linearly in the number of verify rows
-between the two profiled request counts that bracket ``R`` (after making
-each level's curve non-decreasing in rows, since verifying more rows never
-costs less), the draft and host costs in ``R``, and reports whether a query
-lies inside the profiled bounds; outside them the planner refuses to draft
+The cost artifact holds step costs measured through the real serving path
+(``tools/dspark_cost_profile.py``) at a grid of active decode requests
+``R``, drafted widths ``k`` and decode context lengths: the whole step a
+client observes between two streamed chunks while every request of the
+batch is decoding, and, from the in-process profiler, the drafter's own
+work (the batched draft backbone and the host bookkeeping) at each request
+level. A width-0 cell is the bypass step of the same speculative server
+(features still captured, drafting skipped), which is the alternative the
+planner weighs drafting against. The model interpolates the target cost
+piecewise-linearly in the number of verify rows between the two profiled
+request levels that bracket ``R`` (after making each level's curve
+non-decreasing in rows, since verifying more rows never costs less), then
+between the two profiled context levels that bracket the batch's context,
+and the draft and host costs in ``R``; it reports whether a query lies
+inside the profiled bounds, and outside them the planner refuses to draft
 rather than extrapolate.
 
 The planner maximizes expected useful emitted tokens per step time for the
@@ -40,30 +46,46 @@ from typing import Any
 
 from vllm_metal.v1.dspark.calibration import CalibrationManifest
 
-COST_SCHEMA = "dspark-cost/1"
+COST_SCHEMA = "dspark-cost/2"
 
 
 @dataclass(frozen=True, slots=True)
 class CostSample:
-    """Median step costs at one profiled (requests, width) cell."""
+    """Median step costs at one profiled (requests, width, context) cell.
+
+    ``step_ms`` is the measured whole step; ``target_ms`` is that step less
+    the drafter's own work for drafted cells and the whole (bypass) step for
+    width 0, so ``target + draft + host`` reproduces the drafted step.
+    """
 
     requests: int
     width: int
     rows: int
+    context: int
+    step_ms: float
     target_ms: float
     draft_ms: float
     host_ms: float
     steps: int
-    target_p95_ms: float
+    step_p95_ms: float
 
     def __post_init__(self) -> None:
         if (
             self.requests < 1
             or self.width < 0
+            or self.context < 1
             or self.rows != self.requests * (self.width + 1)
         ):
-            raise ValueError("a cost sample needs rows = requests * (width + 1)")
-        for value in (self.target_ms, self.draft_ms, self.host_ms, self.target_p95_ms):
+            raise ValueError(
+                "a cost sample needs rows = requests * (width + 1) and a context"
+            )
+        for value in (
+            self.step_ms,
+            self.target_ms,
+            self.draft_ms,
+            self.host_ms,
+            self.step_p95_ms,
+        ):
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError("cost samples must be finite and non-negative")
 
@@ -82,111 +104,159 @@ def _interpolate(points: Sequence[tuple[float, float]], x: float) -> float:
     return points[-1][1]
 
 
-@dataclass(slots=True)
-class CostModel:
-    manifest: CalibrationManifest
-    samples: list[CostSample]
-    machine: dict[str, Any] = field(default_factory=dict)
-    context_tokens: int = 0
-    schema: str = COST_SCHEMA
+def _bracket(levels: Sequence[int], value: float) -> tuple[int, int]:
+    lower = max((v for v in levels if v <= value), default=levels[0])
+    upper = min((v for v in levels if v >= value), default=levels[-1])
+    return lower, upper
 
-    def __post_init__(self) -> None:
-        if not self.samples:
-            raise ValueError("cost model needs at least one sample")
-        cells = {(sample.requests, sample.width) for sample in self.samples}
-        if len(cells) != len(self.samples):
-            raise ValueError("cost model has a duplicate (requests, width) cell")
-        self._by_requests = {}
-        for sample in sorted(self.samples, key=lambda item: (item.requests, item.rows)):
-            self._by_requests.setdefault(sample.requests, []).append(sample)
-        self._request_levels = sorted(self._by_requests)
-        # The bypass decision needs the undrafted cost at every profiled R.
-        for level in self._request_levels:
-            if all(item.width != 0 for item in self._by_requests[level]):
+
+class _Level:
+    """The (requests, rows) surface of one context level."""
+
+    def __init__(self, samples: Sequence[CostSample]) -> None:
+        self.by_requests: dict[int, list[CostSample]] = {}
+        for sample in sorted(samples, key=lambda item: (item.requests, item.rows)):
+            self.by_requests.setdefault(sample.requests, []).append(sample)
+        self.request_levels = sorted(self.by_requests)
+        for level in self.request_levels:
+            if all(item.width != 0 for item in self.by_requests[level]):
                 raise ValueError(
                     f"cost model lacks the width-0 cell for {level} requests"
                 )
 
-    _by_requests: dict[int, list[CostSample]] = field(default_factory=dict, repr=False)
-    _request_levels: list[int] = field(default_factory=list, repr=False)
-
-    @property
-    def max_requests(self) -> int:
-        return self._request_levels[-1]
-
     def max_rows(self, requests: int) -> int:
-        """Largest profiled row count at or below ``requests`` requests."""
-        level = max((r for r in self._request_levels if r <= requests), default=None)
+        level = max((r for r in self.request_levels if r <= requests), default=None)
         if level is None:
             return 0
-        return max(item.rows for item in self._by_requests[level])
+        return max(item.rows for item in self.by_requests[level])
 
-    def within_bounds(self, requests: int, rows: int) -> bool:
-        if requests < 1 or requests > self.max_requests:
-            return False
-        return requests <= rows <= self._rows_bound(requests)
-
-    def _rows_bound(self, requests: int) -> int:
-        lower, upper = self._bracket(requests)
-        # The rows-per-request envelope at both brackets, scaled to ``requests``.
+    def rows_bound(self, requests: int) -> int:
+        lower, upper = _bracket(self.request_levels, requests)
         per_request = min(
-            max(item.rows for item in self._by_requests[level]) / level
+            max(item.rows for item in self.by_requests[level]) / level
             for level in {lower, upper}
         )
         return int(math.floor(per_request * requests + 1e-9))
 
-    def _bracket(self, requests: int) -> tuple[int, int]:
-        levels = self._request_levels
-        lower = max((r for r in levels if r <= requests), default=levels[0])
-        upper = min((r for r in levels if r >= requests), default=levels[-1])
-        return lower, upper
-
-    def _target_at_level(self, level: int, rows: float) -> float:
+    def target_at(self, level: int, rows: float) -> float:
         # Verifying more rows never costs less: a measured dip between two
         # cells is noise or a kernel-path artifact, so the curve is made
         # non-decreasing by a running maximum before interpolation.
         points = []
         running = 0.0
-        for item in self._by_requests[level]:
+        for item in self.by_requests[level]:
             running = max(running, item.target_ms)
             points.append((float(item.rows), running))
         return _interpolate(points, rows)
 
     def target_ms(self, requests: int, rows: int) -> float:
-        """Target forward with verification for ``rows`` rows over ``requests``."""
-        lower, upper = self._bracket(requests)
-        # Interpolate in rows per request so the shape, not the absolute row
-        # count, carries across request levels.
+        lower, upper = _bracket(self.request_levels, requests)
         per_request = rows / requests
-        low = self._target_at_level(lower, per_request * lower)
+        low = self.target_at(lower, per_request * lower)
         if upper == lower:
             return low
-        high = self._target_at_level(upper, per_request * upper)
+        high = self.target_at(upper, per_request * upper)
         return low + (high - low) * (requests - lower) / (upper - lower)
 
-    def _level_cost(self, requests: int, attribute: str) -> float:
-        points = [
-            (float(level), getattr(self._by_requests[level][0], attribute))
-            for level in self._request_levels
-        ]
-        for level in self._request_levels:
-            values = [getattr(item, attribute) for item in self._by_requests[level]]
-            points[self._request_levels.index(level)] = (
-                float(level),
-                sum(values) / len(values),
-            )
+    def level_cost(self, requests: int, attribute: str) -> float:
+        points = []
+        for level in self.request_levels:
+            values = [
+                getattr(item, attribute)
+                for item in self.by_requests[level]
+                if item.width > 0
+            ] or [getattr(item, attribute) for item in self.by_requests[level]]
+            points.append((float(level), sum(values) / len(values)))
         return _interpolate(points, float(requests))
 
-    def draft_ms(self, requests: int) -> float:
-        return self._level_cost(requests, "draft_ms")
 
-    def host_ms(self, requests: int) -> float:
-        return self._level_cost(requests, "host_ms")
+@dataclass(slots=True)
+class CostModel:
+    manifest: CalibrationManifest
+    samples: list[CostSample]
+    machine: dict[str, Any] = field(default_factory=dict)
+    schema: str = COST_SCHEMA
+    _levels: dict[int, _Level] = field(default_factory=dict, repr=False)
+    _context_levels: list[int] = field(default_factory=list, repr=False)
 
-    def step_ms(self, requests: int, rows: int, *, drafted: bool) -> float:
-        total = self.target_ms(requests, rows)
+    def __post_init__(self) -> None:
+        if not self.samples:
+            raise ValueError("cost model needs at least one sample")
+        cells = {(s.requests, s.width, s.context) for s in self.samples}
+        if len(cells) != len(self.samples):
+            raise ValueError(
+                "cost model has a duplicate (requests, width, context) cell"
+            )
+        grouped: dict[int, list[CostSample]] = {}
+        for sample in self.samples:
+            grouped.setdefault(sample.context, []).append(sample)
+        self._context_levels = sorted(grouped)
+        self._levels = {context: _Level(items) for context, items in grouped.items()}
+        first = self._levels[self._context_levels[0]]
+        for context in self._context_levels[1:]:
+            if self._levels[context].request_levels != first.request_levels:
+                raise ValueError(
+                    "every context level must profile the same request levels"
+                )
+
+    @property
+    def request_levels(self) -> list[int]:
+        return list(self._levels[self._context_levels[0]].request_levels)
+
+    @property
+    def context_levels(self) -> list[int]:
+        return list(self._context_levels)
+
+    @property
+    def max_requests(self) -> int:
+        return self.request_levels[-1]
+
+    @property
+    def max_context(self) -> int:
+        return self._context_levels[-1]
+
+    def max_rows(self, requests: int) -> int:
+        """Largest profiled row count at or below ``requests`` requests (any context)."""
+        return min(level.max_rows(requests) for level in self._levels.values())
+
+    def within_bounds(self, requests: int, rows: int, context: int) -> bool:
+        if requests < 1 or requests > self.max_requests:
+            return False
+        if context < 1 or context > self.max_context:
+            return False
+        bound = min(level.rows_bound(requests) for level in self._levels.values())
+        return requests <= rows <= bound
+
+    def _across_contexts(self, context: int, value) -> float:
+        lower, upper = _bracket(self._context_levels, context)
+        low = value(self._levels[lower])
+        if upper == lower:
+            return low
+        high = value(self._levels[upper])
+        return low + (high - low) * (context - lower) / (upper - lower)
+
+    def target_ms(self, requests: int, rows: int, context: int) -> float:
+        """Step cost less the drafter's work for ``rows`` rows over ``requests``."""
+        return self._across_contexts(
+            context, lambda level: level.target_ms(requests, rows)
+        )
+
+    def draft_ms(self, requests: int, context: int) -> float:
+        return self._across_contexts(
+            context, lambda level: level.level_cost(requests, "draft_ms")
+        )
+
+    def host_ms(self, requests: int, context: int) -> float:
+        return self._across_contexts(
+            context, lambda level: level.level_cost(requests, "host_ms")
+        )
+
+    def step_ms(
+        self, requests: int, rows: int, context: int, *, drafted: bool
+    ) -> float:
+        total = self.target_ms(requests, rows, context)
         if drafted:
-            total += self.draft_ms(requests) + self.host_ms(requests)
+            total += self.draft_ms(requests, context) + self.host_ms(requests, context)
         return total
 
     def to_json(self) -> str:
@@ -194,7 +264,6 @@ class CostModel:
             "schema": self.schema,
             "manifest": self.manifest.to_dict(),
             "machine": self.machine,
-            "context_tokens": self.context_tokens,
             "samples": [asdict(sample) for sample in self.samples],
         }
         return json.dumps(payload, indent=2) + "\n"
@@ -210,7 +279,6 @@ class CostModel:
             manifest=CalibrationManifest.from_dict(payload["manifest"]),
             samples=[CostSample(**item) for item in payload["samples"]],
             machine=dict(payload.get("machine", {})),
-            context_tokens=int(payload.get("context_tokens", 0)),
         )
 
     @classmethod
@@ -243,6 +311,7 @@ def plan_prefixes(
     survival: Sequence[Sequence[float]],
     cost: CostModel,
     *,
+    context: int,
     max_rows: int | None = None,
     caps: Sequence[int] | None = None,
 ) -> Plan:
@@ -250,8 +319,9 @@ def plan_prefixes(
 
     ``survival[r][j]`` is the calibrated probability that request ``r``'s
     prefix through drafted position ``j`` is accepted; ``caps[r]`` bounds the
-    positions request ``r`` may use (its output/model budget). ``max_rows``
-    is a hard cap on the batch's verify rows.
+    positions request ``r`` may use (its output/model budget); ``context`` is
+    the batch's mean decode context in tokens; ``max_rows`` is a hard cap on
+    the batch's verify rows.
     """
     requests = len(survival)
     if requests == 0:
@@ -264,34 +334,31 @@ def plan_prefixes(
         for value in row:
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError("survival probabilities must lie in [0, 1]")
-    bound = cost.max_rows(requests) if max_rows is None else max_rows
-    bound = min(bound, cost.max_rows(requests)) if cost.max_rows(requests) else bound
+    profiled = cost.max_rows(requests)
+    bound = profiled if max_rows is None else min(max_rows, profiled or max_rows)
     lengths = [0] * requests
     rows = requests
     tokens = float(requests)
-    target_only_ms = cost.step_ms(requests, requests, drafted=False)
+    target_only_ms = cost.step_ms(requests, requests, context, drafted=False)
     target_only_ratio = requests / target_only_ms if target_only_ms > 0 else math.inf
-    step_ms = cost.step_ms(requests, rows, drafted=True)
+    step_ms = cost.step_ms(requests, rows, context, drafted=True)
     ratio = tokens / step_ms if step_ms > 0 else math.inf
     candidates = sorted(
-        (
-            (-survival[index][position], position, index)
-            for index in range(requests)
-            for position in range(limits[index])
-        ),
+        (-survival[index][position], position, index)
+        for index in range(requests)
+        for position in range(limits[index])
     )
     admitted: list[tuple[int, int]] = []
     stopped_by = "exhausted"
     for negative, position, index in candidates:
         if lengths[index] != position:
-            # A skipped earlier position of this request already stopped it.
             continue
         if rows + 1 > bound:
             stopped_by = "row-cap"
             break
         score = -negative
         next_tokens = tokens + score
-        next_ms = cost.step_ms(requests, rows + 1, drafted=True)
+        next_ms = cost.step_ms(requests, rows + 1, context, drafted=True)
         next_ratio = next_tokens / next_ms if next_ms > 0 else math.inf
         if not next_ratio > ratio:
             stopped_by = "no-improvement"
@@ -325,6 +392,7 @@ def should_draft(
     expected_survival: Sequence[Sequence[float]],
     cost: CostModel,
     *,
+    context: int,
     caps: Sequence[int] | None = None,
 ) -> DraftDecision:
     """Decide before the backbone runs whether drafting this batch pays.
@@ -332,15 +400,15 @@ def should_draft(
     ``expected_survival`` is what is known before sampling this block: the
     survival the previous block predicted for each request, or the
     calibration prior for a request without history. Drafting is admitted
-    only when the planned ratio strictly exceeds the target-only ratio and
-    the batch lies inside the profiled cost bounds.
+    only when the planned ratio strictly exceeds the bypass ratio and the
+    batch lies inside the profiled cost bounds.
     """
     requests = len(expected_survival)
     if requests == 0:
         return DraftDecision(False, "no-requests")
-    if not cost.within_bounds(requests, requests):
+    if not cost.within_bounds(requests, requests, context):
         return DraftDecision(False, "outside-cost-bounds")
-    plan = plan_prefixes(expected_survival, cost, caps=caps)
+    plan = plan_prefixes(expected_survival, cost, context=context, caps=caps)
     if plan.rows == requests:
         return DraftDecision(False, "planner-empty", plan)
     if not plan.ratio > plan.target_only_ratio:
