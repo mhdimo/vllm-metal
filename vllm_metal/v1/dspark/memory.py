@@ -24,10 +24,17 @@ class DSparkMemoryPlan:
     kv_bytes_per_token: int
     capture_bytes: int
     workspace_bytes: int
+    # Scratch positions per context slot for the drafted block's own K/V
+    # (the arena stores them right after the committed context).
+    block_size: int = 0
 
     @property
     def context_bytes(self) -> int:
-        return self.max_contexts * self.max_context_tokens * self.kv_bytes_per_token
+        return (
+            self.max_contexts
+            * (self.max_context_tokens + self.block_size)
+            * self.kv_bytes_per_token
+        )
 
     @property
     def reserve_bytes(self) -> int:
@@ -108,4 +115,5 @@ class DSparkMemoryPlan:
             + logits
             + proposals
             + KERNEL_RESERVE_BYTES,
+            block,
         )

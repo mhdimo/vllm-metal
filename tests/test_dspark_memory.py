@@ -14,7 +14,7 @@ from tests.test_dspark_proposer import _features, _proposer, _seed, _state
 from tests.test_v1_worker import TestPagedAttentionPlanDiagnostics as PlanDiagnostics
 from vllm_metal.v1.dspark.loader import load_drafter
 from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
-from vllm_metal.v1.dspark.model import CtxCache
+from vllm_metal.v1.dspark.model import ContextArena, CtxCache
 
 
 def test_append_reuses_chunks_and_rollback_hides_old_suffix(monkeypatch):
@@ -69,15 +69,26 @@ def test_memory_plan_matches_actual_full_context_storage(dtype):
         proposer._drafter.update_context(features, 0, row)
         mx.eval([(cache.k, cache.v) for cache in row])
         assert all(cache.k.dtype == cache.v.dtype == dtype for cache in row)
-    assert (
-        sum(cache.allocated_bytes for row in caches for cache in row)
-        == plan.context_bytes
-    )
+    # The arena the proposer allocates for this plan is exactly the reserved
+    # context bytes: every slot at full capacity plus the block's scratch.
+    config = proposer._config
+    arenas = [
+        ContextArena(
+            slots=plan.max_contexts,
+            kv_heads=config.n_kv_heads,
+            capacity=plan.max_context_tokens,
+            block_size=config.block_size,
+            head_dim=config.attn_head_dim,
+            dtype=dtype,
+        )
+        for _ in proposer._drafter.layers
+    ]
+    assert sum(arena.nbytes for arena in arenas) == plan.context_bytes
+    assert plan.block_size == config.block_size
 
 
 def test_context_slot_exhaustion_releases_and_recovers():
-    proposer = _proposer()
-    proposer.memory_plan = replace(proposer.memory_plan, max_contexts=1)
+    proposer = _proposer(max_num_seqs=1)
     first, second = _state([1, 2, 3]), _state([4, 5, 6])
     assert _seed(proposer, first, "a") is not None
     assert _seed(proposer, second, "b") is None
@@ -93,19 +104,23 @@ def test_memory_pressure_rejects_before_allocation_then_recovers(monkeypatch):
     proposer = _proposer()
     current = 1234
     monkeypatch.setattr(mx, "get_active_memory", lambda: current)
-    one_chunk = 256 * proposer.memory_plan.kv_bytes_per_token
-    budget = current + proposer.memory_plan.workspace_bytes + one_chunk
+    # Context slots are reserved up front in the arena, so the live check
+    # that admission applies is the workspace the draft step will need.
+    budget = current + proposer.memory_plan.workspace_bytes
     proposer._memory_budget_bytes = budget - 1
     owner = _state([1, 2, 3])
     assert _seed(proposer, owner) is None
     assert proposer._contexts["r"].disabled_reason == "context memory budget exhausted"
     assert not proposer._contexts["r"].caches
+    assert proposer._arena[0].free_slots == proposer.memory_plan.max_contexts
     proposer._memory_budget_bytes = budget
     assert _seed(proposer, owner) is not None
+    slot_bytes = proposer.memory_plan.context_bytes // proposer.memory_plan.max_contexts
     assert (
         sum(cache.allocated_bytes for cache in proposer._contexts["r"].caches)
-        == one_chunk
+        == slot_bytes
     )
+    assert proposer._arena[0].free_slots == proposer.memory_plan.max_contexts - 1
 
 
 @pytest.mark.parametrize(
@@ -203,10 +218,12 @@ def test_memory_plan_honors_configured_context_cap():
         == 8
     )
     assert build(proposer._config, max_num_seqs=64, **common).max_contexts == 32
+    # Each slot holds the full context plus the drafted block's scratch K/V.
+    block = proposer._config.block_size
     assert (
         build(proposer._config, max_num_seqs=8, max_contexts=2, **common).context_bytes
         == 2
-        * 256
+        * (256 + block)
         * build(proposer._config, max_num_seqs=8, **common).kv_bytes_per_token
     )
     with pytest.raises(ValueError, match="at least one"):

@@ -15,7 +15,7 @@ from tests.test_dspark_contracts import draft_hf_config
 from vllm_metal.v1.dspark.calibration import ConfidenceRecorder
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import DSparkMemoryPlan
-from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
+from vllm_metal.v1.dspark.model import ArenaCache, CtxCache, DSparkDrafter
 from vllm_metal.v1.dspark.sampling import (
     RequestRandomStreams,
     SamplingTransforms,
@@ -27,21 +27,29 @@ from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import PagedDecodeSegment, SpeculativeDecodeController
 
 
-def _proposer():
+def _proposer(**plan_overrides):
     config = DSparkConfig.from_dict(draft_hf_config().to_dict())
+    plan = {
+        "max_num_seqs": 32,
+        "max_model_len": 2048,
+        "max_num_batched_tokens": 8192,
+        **plan_overrides,
+    }
     return DSparkProposer(
         drafter=DSparkDrafter(config),
         config=config,
         runner=make_stub_runner(),
         controller=SpeculativeDecodeController(),
-        memory_plan=DSparkMemoryPlan.build(
-            config,
-            itemsize=4,
-            max_num_seqs=32,
-            max_model_len=2048,
-            max_num_batched_tokens=8192,
-        ),
+        memory_plan=DSparkMemoryPlan.build(config, itemsize=4, **plan),
     )
+
+
+def _arena_caches(proposer):
+    """Acquire one context slot in every layer's arena (as the proposer does)."""
+    slot = proposer._arena[0].acquire()
+    for layer in proposer._arena[1:]:
+        assert layer.acquire() == slot
+    return [ArenaCache(layer, slot) for layer in proposer._arena]
 
 
 def _state(tokens, *, prompt_len=None, **params):
@@ -247,6 +255,92 @@ def test_mixed_spans_and_admission_skip_still_ingest_every_request():
     _assert_context(proposer, "b", list(range(5)))
 
 
+def test_decode_spans_of_one_step_ingest_in_one_batched_pass(monkeypatch):
+    proposer = _proposer()
+    a, b, c = _state([1, 2, 3]), _state([10, 11, 12, 13, 14]), _state([30, 31, 32, 33])
+    for req_id, state in (("a", a), ("b", b), ("c", c)):
+        _seed(proposer, state, req_id, k=0)
+    a.token_ids.extend([20, 21])
+    b.token_ids.append(15)
+    c.token_ids.extend([40, 41, 42])
+    for state, count in ((a, 2), (b, 1), (c, 3)):
+        state.generated_tokens += count
+    real_spans = proposer._drafter.update_context_spans
+    real_single = proposer._drafter.update_context
+    calls: list = []
+    monkeypatch.setattr(
+        proposer._drafter,
+        "update_context_spans",
+        lambda hidden, spans, arenas: (
+            calls.append(spans),
+            real_spans(hidden, spans, arenas),
+        ),
+    )
+    monkeypatch.setattr(
+        proposer._drafter,
+        "update_context",
+        lambda *args, **kwargs: (calls.append("single"), real_single(*args, **kwargs)),
+    )
+    result = proposer.propose(
+        _context(
+            decode=[
+                ("a", a, 2, [3, 20, 30], [20, 21]),
+                ("b", b, 4, [14, 50, 51], [15]),
+                ("c", c, 3, [33, 40, 41, 50], [40, 41, 42]),
+            ]
+        )
+    )
+    assert result.req_ids == ["a", "b", "c"]
+    # One batched write for the three spans (counts 2, 1 and 3), no single-row writes.
+    assert len(calls) == 1 and [span[2] for span in calls[0]] == [2, 1, 3]
+    _assert_context(proposer, "a", list(range(4)))
+    _assert_context(proposer, "b", list(range(5)))
+    _assert_context(proposer, "c", list(range(6)))
+    # The padded columns of the shorter spans never became context.
+    for req_id, length in (("a", 4), ("b", 5), ("c", 6)):
+        assert all(
+            cache.length == length for cache in proposer._contexts[req_id].caches
+        )
+
+
+def test_write_spans_pads_past_the_committed_length_only():
+    proposer = _proposer()
+    short, long = _arena_caches(proposer), _arena_caches(proposer)
+    hidden = _features([0, 0, 1, 2])
+    proposer._drafter.update_context_spans(
+        hidden,
+        [(0, 0, 1, short[0].slot), (1, 0, 3, long[0].slot)],
+        proposer._arena,
+    )
+    for caches, length in ((short, 1), (long, 3)):
+        for cache in caches:
+            cache.extend_to(length)
+        expected = proposer._drafter.make_ctx_cache()
+        proposer._drafter.update_context(
+            _features(list(range(length)))[None], 0, expected
+        )
+        for actual, reference in zip(caches, expected, strict=True):
+            assert actual.k.shape[2] == length
+            assert bool(mx.allclose(actual.k, reference.k, atol=2e-5, rtol=2e-5).item())
+            assert bool(mx.allclose(actual.v, reference.v, atol=2e-5, rtol=2e-5).item())
+    # A later single-row append lands right after the committed length.
+    proposer._drafter.update_context(_features([1])[None], 1, short)
+    expected = proposer._drafter.make_ctx_cache()
+    proposer._drafter.update_context(_features([0, 1])[None], 0, expected)
+    assert bool(mx.allclose(short[0].k, expected[0].k, atol=2e-5, rtol=2e-5).item())
+    arena = proposer._arena[0]
+    with pytest.raises(ValueError, match="exceeds reserved capacity"):
+        arena.write_spans(
+            [short[0].slot],
+            [arena.capacity - 1],
+            [2],
+            mx.zeros((1, arena.keys.shape[1], 2, arena.keys.shape[-1])),
+            mx.zeros((1, arena.keys.shape[1], 2, arena.keys.shape[-1])),
+        )
+    with pytest.raises(ValueError, match="within reserved capacity"):
+        short[0].extend_to(0)
+
+
 @pytest.mark.parametrize(
     "params",
     [
@@ -333,7 +427,7 @@ def test_mixed_greedy_and_stochastic_rows_match_independent_rows():
                 if seed
                 else _state([2] * (length + 1))
             )
-            caches = proposer._drafter.make_ctx_cache()
+            caches = _arena_caches(proposer)
             if length:
                 proposer._drafter.update_context(
                     _features(list(range(length)))[None], 0, caches
@@ -497,7 +591,7 @@ def test_ragged_and_empty_context_drafts_match_independent_rows(order, caps):
     plans, expected = [], []
     for length, cap in zip(order, caps, strict=True):
         owner = _state([2] * (length + 1))
-        caches = proposer._drafter.make_ctx_cache()
+        caches = _arena_caches(proposer)
         if length:
             proposer._drafter.update_context(
                 _features(list(range(length)))[None], 0, caches
@@ -505,17 +599,24 @@ def test_ragged_and_empty_context_drafts_match_independent_rows(order, caps):
         plan = _DraftPlan(str(length), 2, _RequestContext(owner, caches, length), cap)
         plans.append(plan)
         expected.append(proposer._batch_draft([plan])[1][0])
-    before = [
-        [(cache._keys, cache._values) for cache in plan.context.caches]
-        for plan in plans
-    ]
+
+    def snapshot(plan):
+        return [
+            (cache.length, None if cache.k is None else mx.array(cache.k))
+            for cache in plan.context.caches
+        ]
+
+    before = [snapshot(plan) for plan in plans]
     batched = proposer._batch_draft(plans)[1]
     assert batched == expected
     assert [len(row) for row in batched] == list(caps)
-    # Draft block/scratch positions must never enter persistent context.
+    # Draft block/scratch positions must never enter persistent context: the
+    # committed length and every committed position are unchanged.
     for plan, original in zip(plans, before, strict=True):
-        for cache, (key, value) in zip(plan.context.caches, original, strict=True):
-            assert cache._keys is key and cache._values is value
+        for cache, (length, keys) in zip(plan.context.caches, original, strict=True):
+            assert cache.length == length
+            if keys is not None:
+                assert bool(mx.array_equal(cache.k, keys).item())
 
 
 @pytest.mark.parametrize("remaining,expected", [(1, 0), (2, 1), (4, 3)])

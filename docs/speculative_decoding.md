@@ -212,8 +212,10 @@ trajectory and the spec-decode counters.
   token from the target distribution, all from the request's own random
   streams (seeded requests reproduce). The emitted distribution equals the
   target's; the tokens at a given seed differ from target-only serving.
-- **Batched drafting.** The backbone runs across selected requests with padded
-  per-request contexts. Memory is reserved for up to
+- **Batched drafting.** The backbone runs across selected requests, each row
+  attending to its own slot of a per-layer context arena (no padding, gather or
+  mask), and a step's accepted rows are ingested in one batched pass per layer.
+  Memory is reserved for up to
   `min(max_num_seqs, VLLM_METAL_DSPARK_MAX_CONTEXTS)` complete contexts
   (default 32); a request scheduled while every slot is held uses target-only
   generation, and slots are reused as requests finish.
@@ -230,8 +232,9 @@ trajectory and the spec-decode counters.
 - **Incomplete DSpark features.** Calibrated confidence scheduling and
   production serving qualification remain roadmap work.
 - **Bounded context and workspace.** The planner subtracts the draft context,
-  capture and execution reservation before sizing target KV. Context buffers
-  grow in reusable chunks up to the planned model length. Insufficient startup
+  capture and execution reservation before sizing target KV. The context arena
+  is allocated once at load: every slot holds the planned model length plus
+  the block's scratch positions. Insufficient startup
   capacity fails explicitly; request admission and recoverable draft allocation
   failures fall back to the target. Lower context, sequence and batch-token
   limits to reduce the reservation. The earlier `0.12` memory-fraction example
