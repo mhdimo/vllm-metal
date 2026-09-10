@@ -25,6 +25,100 @@ from pathlib import Path
 from tools.dspark_lifecycle_check import PROMPTS
 
 
+def top_logit_rows(
+    paged_state, round_index: int | None, forward_index: int, top_k: int = 8
+) -> list[dict]:
+    """Top-``top_k`` target logits for every row the runner is about to sample.
+
+    Rows are identified by the runner's own DTOs: decode/verification segments
+    carry ``start_row``/``cache_start_pos`` and the request state, prefill
+    entries carry ``start_pos``. ``pos`` is the absolute token index the row
+    predicts. ``top[0]`` is ``mx.argmax`` of the row, i.e. the greedy token the
+    verifier or sampler emits; the remaining entries are sorted descending.
+    """
+    import mlx.core as mx
+
+    specs: list[tuple] = []
+    for (req_id, state), segment in zip(
+        paged_state.decode_reqs, paged_state.decode_segments, strict=True
+    ):
+        kind = "verify" if segment.draft_token_ids else "decode"
+        for i in range(segment.num_query_tokens):
+            draft = (
+                segment.draft_token_ids[i] if i < len(segment.draft_token_ids) else None
+            )
+            specs.append(
+                (
+                    segment.start_row + i,
+                    req_id,
+                    len(state.token_ids) + i,
+                    segment.num_query_tokens,
+                    kind,
+                    draft,
+                    segment.cache_start_pos,
+                    len(state.token_ids),
+                )
+            )
+    boundaries = list(paged_state.logits_cu_seqlens)
+    num_decode = len(paged_state.decode_segments)
+    for j, prefill in enumerate(paged_state.prefill_reqs):
+        if prefill.prompt_len is None:
+            continue  # intermediate chunk: nothing is sampled
+        specs.append(
+            (
+                boundaries[num_decode + j + 1] - 1,
+                prefill.req_id,
+                prefill.start_pos + len(prefill.token_ids),
+                len(prefill.token_ids),
+                "prefill",
+                None,
+                prefill.start_pos,
+                prefill.prompt_len,
+            )
+        )
+    if not specs:
+        return []
+    logits = paged_state.logits[0]
+    selected = logits[mx.array([spec[0] for spec in specs])].astype(mx.float32)
+    top1 = mx.argmax(selected, axis=-1)
+    top1_values = mx.take_along_axis(selected, top1[:, None], axis=-1)[:, 0]
+    vocab = mx.arange(selected.shape[-1])[None, :]
+    masked = mx.where(vocab == top1[:, None], -mx.inf, selected)
+    rest = mx.argpartition(-masked, kth=top_k - 2, axis=-1)[:, : top_k - 1]
+    rest_values = mx.take_along_axis(selected, rest, axis=-1)
+    order = mx.argsort(-rest_values, axis=-1)
+    rest = mx.take_along_axis(rest, order, axis=-1)
+    rest_values = mx.take_along_axis(rest_values, order, axis=-1)
+    mx.eval(top1, top1_values, rest, rest_values)
+    rows = []
+    for index, (row, req_id, pos, count, kind, draft, cache_start, length) in enumerate(
+        specs
+    ):
+        top = [[int(top1[index].item()), float(top1_values[index].item())]]
+        top.extend(
+            [int(token), float(value)]
+            for token, value in zip(
+                rest[index].tolist(), rest_values[index].tolist(), strict=True
+            )
+        )
+        rows.append(
+            {
+                "round": round_index,
+                "forward": forward_index,
+                "req": req_id,
+                "row": int(row),
+                "pos": int(pos),
+                "rows": int(count),
+                "kind": kind,
+                "draft": draft,
+                "cache_start_pos": int(cache_start),
+                "state_len": int(length),
+                "top": top,
+            }
+        )
+    return rows
+
+
 def full_capacity_probe(proposer) -> dict:
     """Exercise the full reservation with synthetic features and resident target KV.
 
@@ -105,6 +199,32 @@ def worker(config: dict, output: Path) -> None:
     counts = collections.Counter()
     fallbacks = collections.Counter()
     active_samples, total_samples = [], []
+    trace_rows: list[dict] = []
+    current_round = {"value": None}
+    forward_counter = {"value": 0}
+    logits_dtype = {"value": None}
+    if config.get("trace_logits"):
+        # Read the stashed forward state before the runner consumes it, for
+        # every engine (baseline included). Identity comes from runner DTOs.
+        real_sample_batch = runner._sample_paged_batch
+
+        def traced_sample_batch(*args, **kwargs):
+            paged_state = runner._execute_model_state
+            if (
+                paged_state is not None
+                and paged_state.logits is not None
+                and not paged_state.intermediate_only
+            ):
+                logits_dtype["value"] = str(paged_state.logits.dtype)
+                trace_rows.extend(
+                    top_logit_rows(
+                        paged_state, current_round["value"], forward_counter["value"]
+                    )
+                )
+                forward_counter["value"] += 1
+            return real_sample_batch(*args, **kwargs)
+
+        runner._sample_paged_batch = traced_sample_batch
     budget = int(
         mx.device_info()["max_recommended_working_set_size"]
         * float(config["memory_fraction"])
@@ -237,6 +357,7 @@ def worker(config: dict, output: Path) -> None:
                     )
 
                 proposer._drafter.update_context = fail_after_write
+        current_round["value"] = cycle
         try:
             outputs = llm.generate(prompts, params, use_tqdm=False)
         finally:
@@ -278,6 +399,7 @@ def worker(config: dict, output: Path) -> None:
                 counts["normal_rounds_with_drafts"] += 1
 
         if width and cycle % 8 == 7:
+            current_round["value"] = -1
             public_id = "dspark-memory-reuse"
             internal_id = engine.add_request(public_id, prompts[-1], params)
             engine.step()
@@ -356,6 +478,19 @@ def worker(config: dict, output: Path) -> None:
         },
     }
     output.write_text(json.dumps(result, indent=2) + "\n")
+    if config.get("trace_logits"):
+        output.with_suffix(".logits.json").write_text(
+            json.dumps(
+                {
+                    "config": result["config"],
+                    "prompt_token_ids": tokenized,
+                    "logits_dtype": logits_dtype["value"],
+                    "rows": trace_rows,
+                },
+                indent=None,
+            )
+            + "\n"
+        )
     assert not mismatched_rounds, f"greedy mismatch in rounds {mismatched_rounds}"
 
 
@@ -379,6 +514,12 @@ def main() -> None:
     parser.add_argument("--faults", action="store_true")
     parser.add_argument("--capacity-probe", action="store_true")
     parser.add_argument("--diagnose-mismatch", action="store_true")
+    parser.add_argument(
+        "--trace-logits",
+        action="store_true",
+        help="record top-8 target logits for every sampled row of both engines "
+        "(kN.result.logits.json) for tools.dspark_divergence_classify",
+    )
     parser.add_argument("--worker-config", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.worker_config:
@@ -427,6 +568,7 @@ def main() -> None:
             "faults": args.faults,
             "capacity_probe": args.capacity_probe,
             "diagnose_mismatch": args.diagnose_mismatch,
+            "trace_logits": args.trace_logits,
             "expected_tokens": expected,
         }
         path = args.output_dir / f"k{width}.json"
