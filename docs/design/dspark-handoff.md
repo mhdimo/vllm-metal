@@ -506,6 +506,30 @@ diagnosing output. With `--diagnose-mismatch`, the checker stops at the first
 verifier disagreement and writes `kN.result.trace.json`; rerun into a new output
 directory if that trace is needed. Early diagnostic exits are not drain proofs.
 
+Record both engines' logits first. `--trace-logits` makes the memory checker
+store the top-8 target logits of every sampled row (baseline and speculative)
+with the runner's own request identity, absolute position, row count of the
+forward and the drafted token; `tools.dspark_divergence_classify` then labels
+each first divergence from those records:
+
+```bash
+python -m tools.dspark_memory_check --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" \
+  --rounds 1 --warmup-rounds 0 --width 7 --prompt-set ragged --trace-logits \
+  --max-model-len 1024 --output-length 900 --memory-fraction 0.22 --output-dir "$DSPARK_RUN/long-output-trace"
+python -m tools.dspark_target_replay --target "$DSPARK_TARGET" \
+  --failure "$DSPARK_RUN/long-output-trace/k7.result.failure.json" --output "$DSPARK_RUN/long-output-trace/replay.json"
+python -m tools.dspark_divergence_classify --run-dir "$DSPARK_RUN/long-output-trace" --width 7 \
+  --replay "$DSPARK_RUN/long-output-trace/replay.json" --output "$DSPARK_RUN/long-output-trace/classified.json"
+```
+
+A `tie` means both engines rank the two tokens first and second within two
+bfloat16 ULPs of each other (the criterion upstream's draft-model e2e adopted
+in #524): summation order between one-row and multi-row forwards split it and
+no state is wrong. An `engine-disagreement` means the engines assigned
+materially different logits to the same committed prefix, which is invalid
+state in at least one of them; the native replay names the engine that agrees
+with mlx-lm. Identical prompts are also compared within one engine.
+
 Next investigate the first differing target logits at an identical committed
 prefix: token/position/slot maps, selected-logit row ownership, target KV contents
 and valid lengths, masks, prefill/decode/verify/recompute chunk shape, quantized

@@ -319,3 +319,23 @@ differences between one-row and eight-row matmuls are unaffected by the switch
 and are intrinsic kernel behavior; they explain near-tie token flips between
 single-row decode and multi-row verification. See the
 [handoff numerics section](dspark-handoff.md#m5-max-numerics-tf32-is-the-fp32-gemm-default).
+
+
+## M4a: divergence diagnostics (tooling)
+
+`tools/dspark_memory_check.py --trace-logits` records, for both the target-only
+and the speculative engine, the top-8 logits of every sampled row together with
+the runner's request identity, the absolute position the row predicts, the
+number of query rows in that forward, the forward sequence number and the
+drafted token. `tools/dspark_divergence_classify.py` replays those records into
+each engine's committed stream (verification windows commit through the first
+draft mismatch; recomputes overwrite), matches traced requests to prompts by
+their token streams so identical prompts stay unambiguous, and labels every
+first divergence as a `tie` (both engines rank the two tokens first and second
+within two bfloat16 ULPs, upstream #524's criterion) or an
+`engine-disagreement` (materially different logits for the same prefix, which
+is invalid state). Identical prompts are compared within one engine the same
+way. Unit tests cover row identity, window replay, stream-based assignment and
+both labels. The M5 Max reproduction of the two M3 failures with this tooling
+is recorded in the following section once complete.
+\n
