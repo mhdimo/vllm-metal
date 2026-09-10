@@ -6,11 +6,15 @@ width 0 the same speculative server runs in the bypass mode (drafter loaded,
 features captured, no drafts): that is the step the adaptive planner weighs
 drafting against. Each server is driven, for every profiled request count
 and decode context, by that many concurrent streaming requests of exactly
-the context's input length with ``ignore_eos`` and a fixed output budget;
-after one warmup batch the measured batch records every streamed chunk's
-arrival time per request, and the step cost of the cell is the median gap
-between consecutive chunks of one request inside the window where every
-request of the batch is decoding (its p95 is the uncertainty record). The
+the context's input length with ``ignore_eos`` and an output budget that grows
+with the batch's prefill work and the width, so the requests admitted first
+are still decoding when the last prompt finishes prefilling; after one
+warmup batch the measured batch records every streamed chunk's arrival time
+per request, and the step cost of the cell is the median gap between
+consecutive chunks of one request inside the window where every request of
+the batch is decoding (its p95 is the uncertainty record). Prefill chunks
+are larger than in serving (``--batch-tokens`` 2048) so that window exists;
+decode steps are unaffected while the verify rows stay below the budget. The
 drafter's own work per step (batched backbone and host bookkeeping) comes
 from the in-process step profiler at one width per request level and is
 subtracted from the drafted cells' step to give the planner's target cost.
@@ -148,7 +152,7 @@ def main() -> None:
     parser.add_argument("--in-process-width", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--max-num-seqs", type=int, default=16)
-    parser.add_argument("--batch-tokens", type=int, default=512)
+    parser.add_argument("--batch-tokens", type=int, default=2048)
     parser.add_argument("--memory-fraction", default="0.2")
     parser.add_argument("--startup-timeout", type=float, default=900)
     args = parser.parse_args()
@@ -160,8 +164,20 @@ def main() -> None:
         parser.error("--widths must include 0")
     if max(requests) > args.max_num_seqs:
         parser.error("--requests must not exceed --max-num-seqs")
-    if max(contexts) + args.output_length > args.max_model_len:
-        parser.error("the longest context plus the output must fit --max-model-len")
+
+    def output_budget(count: int, context: int, width: int) -> int:
+        """Tokens per request so the first admitted request outlives the batch's prefill."""
+        prefill_steps = -(-count * context // args.batch_tokens)
+        return args.output_length + 2 * prefill_steps * (width + 1)
+
+    longest = max(
+        context + output_budget(count, context, width)
+        for context in contexts
+        for count in requests
+        for width in widths
+    )
+    if longest > args.max_model_len:
+        parser.error(f"the longest cell needs {longest} tokens; raise --max-model-len")
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.target))
@@ -218,12 +234,9 @@ def main() -> None:
             for context in contexts:
                 for count in requests:
                     batch = prompts[(context, count)]
-                    asyncio.run(
-                        timed_batch(server.base, batch, args.output_length)
-                    )  # warmup
-                    arrivals = asyncio.run(
-                        timed_batch(server.base, batch, args.output_length)
-                    )
+                    budget = output_budget(count, context, width)
+                    asyncio.run(timed_batch(server.base, batch, budget))  # warmup
+                    arrivals = asyncio.run(timed_batch(server.base, batch, budget))
                     gaps = step_gaps(arrivals)
                     if len(gaps) < 8:
                         raise RuntimeError(
@@ -276,6 +289,7 @@ def main() -> None:
             "device": inprocess.get("device"),
             "memory_fraction": str(args.memory_fraction),
             "output_length": args.output_length,
+            "batch_tokens": args.batch_tokens,
             "contexts": contexts,
             "in_process_width": args.in_process_width,
             "served_widths": widths,

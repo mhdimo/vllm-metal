@@ -598,8 +598,9 @@ python -m tools.dspark_confidence_calibrate record --target "$DSPARK_TARGET" --d
   --repo . --mode stochastic --output "$DSPARK_RUN/calibration/stochastic.json"
 python -m tools.dspark_confidence_calibrate fit --records "$DSPARK_RUN/calibration/greedy.json" \
   "$DSPARK_RUN/calibration/stochastic.json" --output "$DSPARK_RUN/calibration/calibration.json"
-python -m tools.dspark_cost_profile --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" \
-  --requests 1,2,4,8,16 --widths 0,1,2,3,4,5,7 --output-dir "$DSPARK_RUN/cost"
+python -m tools.dspark_cost_profile --target "$DSPARK_TARGET" --draft "$DSPARK_DRAFT" --repo . \
+  --requests 1,2,4,8,16 --widths 0,1,2,4,7 --contexts 128,640,1280 --memory-fraction 0.4 \
+  --output-dir "$DSPARK_RUN/cost"
 ```
 
 The serving harness exits nonzero on any failure and prints `GATE PASS`
@@ -615,8 +616,10 @@ seeded-reproducibility repeat, and with `--control-max-num-seqs` also reports
 the target-only-versus-target-only statistics at another batch size as the
 numerics floor. The calibration tool records confidence outcomes in one
 sampling mode per run and fits the temperatures with reliability metrics on
-the holdout split; the cost profiler must run alone on an idle machine (about
-25 minutes for the default grid) and writes `cost.json`. The tools bind the
+the holdout split; the cost profiler drives real `vllm serve` processes (a
+fixed-mode server per width and the bypass-mode server for width 0) over
+request counts and decode contexts, must run alone on an idle machine (about
+50 minutes for the default grid) and writes `cost.json`. The tools bind the
 default `VLLM_USE_V2_MODEL_RUNNER=0`, source-built kernels and offline
 Hugging Face access themselves.
 
