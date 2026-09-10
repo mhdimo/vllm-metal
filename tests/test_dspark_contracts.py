@@ -235,3 +235,43 @@ def test_loader_resolves_requested_revision(monkeypatch, tmp_path):
     download.reset_mock()
     assert loader._resolve(str(tmp_path), revision="b" * 40) == str(tmp_path)
     download.assert_not_called()
+
+
+def _loadable_runner(dspark_config, monkeypatch):
+    validate_dspark_config(dspark_config, use_paged_attention=True)
+    runner = make_stub_runner(tokenizer=object())
+    runner.vllm_config = dspark_config
+    cfg = DSparkConfig.from_dict(draft_hf_config().to_dict())
+    load = Mock(return_value=(DSparkDrafter(cfg), cfg))
+    runner.model = Mock(parameters=Mock(return_value={}))
+    runner.scheduler_config = SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=32)
+    runner.cache_config.gpu_memory_utilization = 0.5
+    from vllm_metal.config import MetalConfig
+
+    runner.metal_config = MetalConfig(
+        memory_fraction=0.5, mlx_device="gpu", use_paged_attention=True
+    )
+    monkeypatch.setattr(
+        mx, "device_info", lambda: {"max_recommended_working_set_size": 10_000_000_000}
+    )
+    monkeypatch.setattr(mx, "get_active_memory", lambda: 1000)
+    monkeypatch.setattr("vllm_metal.v1.model_runner.load_drafter", load)
+    return runner
+
+
+def test_admission_environment_reaches_plan_and_proposer(dspark_config, monkeypatch):
+    runner = _loadable_runner(dspark_config, monkeypatch)
+    runner._load_dspark_drafter()
+    assert runner._dspark_memory_plan.max_contexts == 4  # min(max_num_seqs, 32)
+    assert runner._drafter._max_drafts_per_step == 4
+    monkeypatch.setenv("VLLM_METAL_DSPARK_MAX_CONTEXTS", "2")
+    monkeypatch.setenv("VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP", "1")
+    runner = _loadable_runner(dspark_config, monkeypatch)
+    runner._load_dspark_drafter()
+    assert runner._dspark_memory_plan.max_contexts == 2
+    assert runner._drafter._max_drafts_per_step == 1
+    monkeypatch.setenv("VLLM_METAL_DSPARK_MAX_CONTEXTS", "0")
+    runner = _loadable_runner(dspark_config, monkeypatch)
+    with pytest.raises(ValueError, match="MAX_CONTEXTS"):
+        runner._load_dspark_drafter()
+    assert runner._drafter is None

@@ -700,12 +700,20 @@ class MetalModelRunner:
             memory_budget_bytes=budget - mx.get_active_memory(),
             expected_config=DSparkConfig.from_dict(draft.hf_config.to_dict()),
         )
+        max_contexts = envs.VLLM_METAL_DSPARK_MAX_CONTEXTS
+        max_drafts_per_step = envs.VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP
+        if max_contexts < 1 or max_drafts_per_step < 0:
+            raise ValueError(
+                "VLLM_METAL_DSPARK_MAX_CONTEXTS must be at least 1 and "
+                "VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP at least 0"
+            )
         plan = DSparkMemoryPlan.build(
             config,
             itemsize=model.hidden_norm.weight.itemsize,
             max_num_seqs=self.scheduler_config.max_num_seqs,
             max_model_len=self.model_config.max_model_len,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_contexts=max_contexts,
         )
         # Reject an impossible reservation before the target profiling forward
         # allocates activations. Allow FP32 storage for its full-logits output;
@@ -720,18 +728,21 @@ class MetalModelRunner:
                 "or --max-num-batched-tokens, or increase VLLM_METAL_MEMORY_FRACTION."
             )
         self._dspark_memory_plan = plan
-        self._drafter = DSparkProposer(
+        proposer = DSparkProposer(
             drafter=model,
             config=config,
             runner=self,
             controller=self._spec_decode_controller,
             memory_plan=plan,
             memory_budget_bytes=budget,
+            max_drafts_per_step=max_drafts_per_step or None,
         )
+        self._drafter = proposer
         logger.info(
             "DSpark drafter loaded for speculative decoding: %s "
             "(block_size=%d, target_layer_ids=%s); reserved context=%.2f MB, "
-            "capture=%.2f MB, workspace=%.2f MB, context_slots=%d",
+            "capture=%.2f MB, workspace=%.2f MB, context_slots=%d, "
+            "drafts_per_step=%d",
             draft.model,
             config.block_size,
             config.target_layer_ids,
@@ -739,6 +750,7 @@ class MetalModelRunner:
             plan.capture_bytes / 1e6,
             plan.workspace_bytes / 1e6,
             plan.max_contexts,
+            proposer._max_drafts_per_step,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

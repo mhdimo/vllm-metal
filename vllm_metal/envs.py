@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_SPEC_INGEST_CHUNK: int = 1024
+    VLLM_METAL_DSPARK_MAX_CONTEXTS: int = 32
+    VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP: int = 0
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
     VLLM_METAL_RING_BASE_PORT: int = 32323
@@ -116,6 +118,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # single-forward behavior.
     "VLLM_METAL_SPEC_INGEST_CHUNK": lambda: int(
         os.getenv("VLLM_METAL_SPEC_INGEST_CHUNK", "1024")
+    ),
+    # Upper bound on concurrent DSpark draft contexts. The memory plan reserves
+    # min(--max-num-seqs, this) complete contexts before target KV allocation
+    # (20 KiB per context token per request for the Qwen3-4B drafter), so a
+    # larger value costs target KV capacity. Requests that arrive while every
+    # slot is held use target-only generation for their lifetime, because a
+    # context needs the target features of every earlier position. Default 32.
+    "VLLM_METAL_DSPARK_MAX_CONTEXTS": lambda: int(
+        os.getenv("VLLM_METAL_DSPARK_MAX_CONTEXTS", "32")
+    ),
+    # Maximum requests drafted per scheduler step, to bound the verification
+    # rows one step adds. 0 (default) drafts every eligible request. When the
+    # cap binds, requests rotate least-recently-drafted first, so none starves.
+    "VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP": lambda: int(
+        os.getenv("VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP", "0")
     ),
     # When set, compile the native _paged_ops extension from source at runtime
     # instead of loading the prebuilt artifact shipped in the wheel. Intended

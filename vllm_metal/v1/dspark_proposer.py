@@ -76,6 +76,7 @@ class DSparkProposer:
         controller: SpeculativeDecodeController,
         memory_plan: DSparkMemoryPlan,
         memory_budget_bytes: int | None = None,
+        max_drafts_per_step: int | None = None,
     ) -> None:
         self._drafter = drafter
         self._config = config
@@ -87,7 +88,16 @@ class DSparkProposer:
         self._contexts: dict[str, _RequestContext] = {}
         self.memory_plan = memory_plan
         self._memory_budget_bytes = memory_budget_bytes
-        self._max_drafts_per_step = memory_plan.max_contexts
+        limit = memory_plan.max_contexts
+        if max_drafts_per_step is not None:
+            if max_drafts_per_step < 1:
+                raise ValueError("DSpark max_drafts_per_step must be positive")
+            limit = min(limit, max_drafts_per_step)
+        self._max_drafts_per_step = limit
+        # Per-step admission bookkeeping: the step a request was last drafted
+        # in, so a binding cap rotates least-recently-drafted requests first.
+        self._last_drafted: dict[str, int] = {}
+        self._draft_step = 0
 
     def needs_target_hidden_states(
         self,
@@ -101,6 +111,7 @@ class DSparkProposer:
     def release_requests(self, req_ids: set[str]) -> None:
         for req_id in req_ids:
             self._contexts.pop(req_id, None)
+            self._last_drafted.pop(req_id, None)
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         scheduled = {seg.req_id for seg in ctx.decode_segments}
@@ -147,7 +158,7 @@ class DSparkProposer:
             if not self._memory_available():
                 logger.debug("DSpark draft skipped: workspace memory budget exhausted")
                 return None
-            req_ids, rows = self._batch_draft(plans[: self._max_drafts_per_step])
+            req_ids, rows = self._batch_draft(self._select_plans(plans))
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
         except Exception as error:
             # A partially written layer set cannot survive an ingest/draft
@@ -174,6 +185,31 @@ class DSparkProposer:
                 )
                 return None
             raise
+
+    def _select_plans(self, plans: list[_DraftPlan]) -> list[_DraftPlan]:
+        """Apply the per-step draft cap fairly.
+
+        When more requests are eligible than the cap allows, the ones drafted
+        least recently go first (never-drafted requests before all others),
+        ties broken by their position in the packed batch. The selected plans
+        keep their batch order. Every request's context was already ingested
+        this step, so a request that waits loses nothing but this step's draft.
+        """
+        self._draft_step += 1
+        if len(plans) > self._max_drafts_per_step:
+            ranked = sorted(
+                range(len(plans)),
+                key=lambda index: (
+                    self._last_drafted.get(plans[index].req_id, -1),
+                    index,
+                ),
+            )
+            plans = [
+                plans[index] for index in sorted(ranked[: self._max_drafts_per_step])
+            ]
+        for plan in plans:
+            self._last_drafted[plan.req_id] = self._draft_step
+        return plans
 
     def _memory_available(self, extra_bytes: int = 0) -> bool:
         return self._memory_budget_bytes is None or (

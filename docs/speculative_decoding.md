@@ -170,8 +170,12 @@ Draft acceptance rate` reflects the live acceptance.
 
 - **Greedy only**, like every Metal spec-decode method.
 - **Batched drafting.** The backbone runs across selected requests with padded
-  per-request contexts. Memory is reserved for up to `min(max_num_seqs, 32)`
-  complete contexts; excess requests use target-only generation.
+  per-request contexts. Memory is reserved for up to
+  `min(max_num_seqs, VLLM_METAL_DSPARK_MAX_CONTEXTS)` complete contexts
+  (default 32); a request scheduled while every slot is held uses target-only
+  generation, and slots are reused as requests finish.
+  `VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP` bounds the requests drafted per step
+  with least-recently-drafted rotation; see [configuration](configuration.md).
 - **Contiguous context.** Every prefill chunk contributes features, including
   no-sample steps. Missing features on a target prefix-cache hit use target-only
   generation; the proposer does not replay full prompts or share private KV.

@@ -323,18 +323,25 @@ def test_inconsistent_handoff_fails_closed(fault):
     assert "r" not in proposer._contexts
 
 
-@pytest.mark.parametrize("order", [(0, 2, 6), (6, 0, 2)])
-def test_ragged_and_empty_context_drafts_match_independent_rows(order):
+@pytest.mark.parametrize(
+    "order,caps",
+    [
+        ((0, 2, 6), (1, 2, 3)),
+        ((6, 0, 2), (1, 2, 3)),
+        ((0, 2, 6), (7, 1, 3)),
+        ((6, 0, 2), (3, 7, 1)),
+    ],
+)
+def test_ragged_and_empty_context_drafts_match_independent_rows(order, caps):
     proposer = _proposer()
     plans, expected = [], []
-    for index, length in enumerate(order):
+    for length, cap in zip(order, caps, strict=True):
         owner = _state([2] * (length + 1))
         caches = proposer._drafter.make_ctx_cache()
         if length:
             proposer._drafter.update_context(
                 _features(list(range(length)))[None], 0, caches
             )
-        cap = index + 1
         plan = _DraftPlan(str(length), 2, _RequestContext(owner, caches, length), cap)
         plans.append(plan)
         expected.append(proposer._batch_draft([plan])[1][0])
@@ -342,7 +349,9 @@ def test_ragged_and_empty_context_drafts_match_independent_rows(order):
         [(cache._keys, cache._values) for cache in plan.context.caches]
         for plan in plans
     ]
-    assert proposer._batch_draft(plans)[1] == expected
+    batched = proposer._batch_draft(plans)[1]
+    assert batched == expected
+    assert [len(row) for row in batched] == list(caps)
     # Draft block/scratch positions must never enter persistent context.
     for plan, original in zip(plans, before, strict=True):
         for cache, (key, value) in zip(plan.context.caches, original, strict=True):
@@ -404,3 +413,58 @@ def test_context_checks_both_keys_and_values():
     cache._values = cache._values[:, :, :2]
     with pytest.raises(RuntimeError, match="K/V coverage disagrees"):
         cache.trim_to(1)
+
+
+def test_per_step_cap_rotates_least_recently_drafted():
+    proposer = _proposer()
+    proposer._max_drafts_per_step = 1
+    states = {}
+    for req_id, tokens in (("a", [1, 2, 3]), ("b", [4, 5, 6]), ("c", [7, 8, 9])):
+        states[req_id] = _state(tokens)
+        _seed(proposer, states[req_id], req_id, k=0)
+    drafted = []
+    for step in range(6):
+        decode = []
+        for req_id, state in states.items():
+            previous = state.token_ids[-1]
+            start = len(state.token_ids) - 1
+            state.token_ids.append(20 + step)
+            state.generated_tokens += 1
+            decode.append((req_id, state, start, [previous], [20 + step]))
+        result = proposer.propose(_context(decode=decode, k=2))
+        drafted.append(tuple(result.req_ids))
+        # Requests that wait for the cap still have their context advanced.
+        for req_id, state in states.items():
+            record = proposer._contexts[req_id]
+            assert record.disabled_reason is None
+            assert record.covered_end == len(state.token_ids) - 1
+    assert drafted == [("a",), ("b",), ("c",), ("a",), ("b",), ("c",)]
+    proposer.release_requests({"b"})
+    assert "b" not in proposer._last_drafted
+    with pytest.raises(ValueError, match="positive"):
+        DSparkProposer(
+            drafter=proposer._drafter,
+            config=proposer._config,
+            runner=proposer._runner,
+            controller=proposer._controller,
+            memory_plan=proposer.memory_plan,
+            max_drafts_per_step=0,
+        )
+
+
+def test_per_step_cap_above_eligible_drafts_everyone_in_batch_order():
+    proposer = _proposer()
+    proposer._max_drafts_per_step = 2
+    states = {
+        req_id: _state(tokens) for req_id, tokens in (("x", [1, 2]), ("y", [3, 4]))
+    }
+    for req_id, state in states.items():
+        _seed(proposer, state, req_id, k=0)
+    decode = []
+    for req_id, state in states.items():
+        previous = state.token_ids[-1]
+        start = len(state.token_ids) - 1
+        state.token_ids.append(9)
+        state.generated_tokens += 1
+        decode.append((req_id, state, start, [previous], [9]))
+    assert proposer.propose(_context(decode=decode, k=2)).req_ids == ["x", "y"]

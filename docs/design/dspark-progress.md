@@ -16,7 +16,7 @@ documentation only; M4-M8 remain open and the destination machine is untested.
 | M1: Target capture | [Complete: #2](https://github.com/mhdimo/vllm-metal/pull/2) | Native Qwen3 capture, selected logits and complete prefill feature spans. |
 | M2: Context lifecycle | [Complete: #3](https://github.com/mhdimo/vllm-metal/pull/3) | Exact per-request ingest, physical rollback, lifecycle invalidation and safe prefix-hit behavior. |
 | M3: Loading and memory | Complete for the named 4B memory envelope | Deterministic incremental loading, bounded resource planning, precision and recovery checks; [evidence and remaining parity failure](dspark-m3-validation.md). |
-| M4: Fixed-greedy serving | M4a parity contract established on M5 Max ([record](dspark-m4-parity.md)); admission, HTTP semantics and fixed-K performance still open | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; fair admission, HTTP harness and fixed-K measurements follow. |
+| M4: Fixed-greedy serving | M4a parity contract ([record](dspark-m4-parity.md)) and M4b admission fairness done on M5 Max; HTTP semantics and fixed-K performance still open | Both extended parity failures are ties or target-unstable prefixes under the recorded contract; fair admission, HTTP harness and fixed-K measurements follow. |
 | M5: Stochastic verification | Planned | Exact proposal-distribution ownership, rejection/bonus sampling and distribution tests. |
 | M6: Calibrated adaptive planning | Planned | Recipe-specific confidence calibration, measured cost curves and causal admission/planning. |
 | M7: Production qualification | Planned | Profiled serving benefit, packaged deployment and the one-hour/10,000-request HTTP soak. |
@@ -372,3 +372,42 @@ Acceptance there is 1,352 of 4,732 drafted tokens at K=7 (28.6%) and 1,100 of
 M3 failures pass the gate (long output: 3 ties, 1 target-unstable; preemption:
 3 target-unstable). Validation on M5 Max at `02f3b2d`: 2,324 non-slow tests
 passed, ruff, mypy and the strict docs build clean.
+
+## M4b: fixed-K admission (M5 Max, `8196d12`)
+
+Admission has two caps. The context cap, previously the constant 32, is
+`VLLM_METAL_DSPARK_MAX_CONTEXTS` (default 32): the planner reserves
+`min(max_num_seqs, cap)` complete contexts before target KV allocation, and a
+request scheduled while every slot is held uses target-only generation for
+its lifetime because a context needs every earlier target feature; slots are
+reused as requests finish. The per-step draft cap,
+`VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP` (default 0, unlimited), replaces the
+first-N truncation of the draft batch with least-recently-drafted rotation,
+ties broken by batch order; contexts of waiting requests still advance. Each
+row keeps its own output/context/scheduler cap; the batched-versus-independent
+regression now also covers mixed caps (7/1/3 and 3/7/1) and asserts each row's
+length. Unit tests cover the rotation, bookkeeping release, the configured
+plan cap and the runner's environment plumbing.
+
+`tools/dspark_admission_check.py` runs distinct natural prompts through a real
+engine and records, per request, the steps it held a complete context, the
+steps it was drafted and any fallback. Results with the pinned 4B pair, K=7,
+128-token outputs, model length 512, 256 batch tokens (peak MLX active bytes in
+the last column):
+
+| Requests / `--max-num-seqs` | Context cap | Per-step cap | Peak concurrent requests / contexts | Context holders | Target-only | Drafted share of eligible steps (min / median / max) | Peak bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 48 / 48 | 32 (default) | none | 19 / 19 | 48 | 0 | 0.91 / 0.97 / 0.98 | 6.74 GB |
+| 48 / 48 | 48 | none | 19 / 19 | 48 | 0 | 0.91 / 0.97 / 0.98 | 5.84 GB |
+| 48 / 48 | 8 | none | 19 / 8 | 26 | 22 (`context capacity exhausted`) | 0.92 / 0.97 / 0.98 | recorded |
+| 16 / 16 | 16 | 4 (binding) | 16 / 16 | 16 | 0 | 0.25 / 0.26 / 0.38 | 7.50 GB |
+
+With this scheduler budget the engine ran at most 19 requests concurrently,
+so the default cap excluded nobody; the 8-slot run shows the exclusion path
+and slot reuse (26 holders over the run, 8 at a time, 22 requests target-only
+and counted). Under the binding per-step cap every holder was drafted in about
+a quarter of its eligible steps; the spread comes from requests that finished
+early. Every context holder drafted at least once in every run and no context
+remained after drain. Validation on M5 Max: 2,330 non-slow tests passed, ruff,
+mypy and the strict docs build clean.
+
