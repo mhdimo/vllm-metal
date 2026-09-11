@@ -55,6 +55,8 @@ class DSparkCounters:
     planner_lengths: Counter = field(default_factory=Counter)
     planner_predicted_ratio: float = 0.0
     planner_target_only_ratio: float = 0.0
+    lapse_entries: int = 0
+    lapse_exits: int = 0
 
     def observe_outcome(self, scheduled: int, accepted: int) -> None:
         self.scheduled_tokens += scheduled
@@ -81,6 +83,8 @@ class DSparkCounters:
             "planner_lengths": dict(sorted(self.planner_lengths.items())),
             "planner_predicted_ratio": self.planner_predicted_ratio,
             "planner_target_only_ratio": self.planner_target_only_ratio,
+            "lapse_entries": self.lapse_entries,
+            "lapse_exits": self.lapse_exits,
         }
 
 

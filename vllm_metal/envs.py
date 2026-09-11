@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     VLLM_METAL_DSPARK_MAX_CONTEXTS: int = 32
     VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP: int = 0
     VLLM_METAL_DSPARK_MODE: str = "fixed"
+    VLLM_METAL_DSPARK_LAPSE: bool = True
     VLLM_METAL_DSPARK_DRAFT_PRECISION: str = "quantized"
     VLLM_METAL_DSPARK_CALIBRATION: str = ""
     VLLM_METAL_DSPARK_COST_MODEL: str = ""
@@ -138,6 +139,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP": lambda: int(
         os.getenv("VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP", "0")
     ),
+    # Load regime of the adaptive and bypass modes (default on): when the
+    # planner would decline a batch of the step's size on 32 consecutive
+    # steps, the proposer stops capturing and ingesting target features and
+    # releases its draft contexts, so a server that cannot profit from
+    # drafting costs what target-only serving costs; it primes new requests
+    # again after the planner would draft on 4 consecutive steps. Set to "0"
+    # to keep every context current at all loads (the M9 behaviour).
+    "VLLM_METAL_DSPARK_LAPSE": lambda: os.getenv("VLLM_METAL_DSPARK_LAPSE", "1") == "1",
     # DSpark serving mode: "fixed" verifies the configured width; "adaptive"
     # plans each request's draft prefix (and whether to draft at all) from the
     # calibrated confidence and the measured cost model, and needs both

@@ -770,6 +770,7 @@ class MetalModelRunner:
             )
         elif mode == "bypass":
             proposer.bypass_only = True
+            proposer.lapse_for_bypass()
         logger.info(
             "DSpark drafter loaded for speculative decoding: %s "
             "(block_size=%d, target_layer_ids=%s); reserved context=%.2f MB, "

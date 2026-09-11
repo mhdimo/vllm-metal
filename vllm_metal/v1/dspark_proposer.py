@@ -18,6 +18,7 @@ import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
+from vllm_metal import envs
 from vllm_metal.v1.dspark.adaptive import AdaptivePlanner, DSparkCounters
 from vllm_metal.v1.dspark.calibration import ConfidenceRecorder
 from vllm_metal.v1.dspark.config import DSparkConfig
@@ -51,6 +52,15 @@ logger = init_logger(__name__)
 
 # One informational counters snapshot per this many drafting steps.
 COUNTER_LOG_EVERY = 2000
+
+# Load regime. When the planner would decline to draft a batch of the step's
+# size on this many consecutive steps, the proposer lapses: it stops capturing
+# and ingesting target features and releases every context, so the server
+# costs what target-only serving costs while drafting cannot pay; it resumes
+# priming new requests after the planner would draft on this many consecutive
+# steps again. Requests that ran through a lapse keep target-only generation.
+LAPSE_ENTER_STEPS = 32
+LAPSE_EXIT_STEPS = 4
 
 
 @dataclass
@@ -163,6 +173,10 @@ class DSparkProposer:
         # request is drafted (the planner's alternative step, made explicit).
         self.bypass_only = False
         self.counters = DSparkCounters()
+        self.lapse_enabled = envs.VLLM_METAL_DSPARK_LAPSE
+        self._lapsed = False
+        self._decline_streak = 0
+        self._draft_streak = 0
 
     @property
     def proposals(self) -> Mapping[str, DSparkProposal]:
@@ -216,8 +230,9 @@ class DSparkProposer:
         *,
         has_final_prefill: bool,
     ) -> bool:
-        # Context must advance even for intermediate chunks and K=0 steps.
-        return True
+        # Context must advance even for intermediate chunks and K=0 steps,
+        # except in a lapse, where no context is kept at all.
+        return not self._lapsed
 
     def release_requests(self, req_ids: set[str]) -> None:
         for req_id in req_ids:
@@ -265,7 +280,7 @@ class DSparkProposer:
         after sampling as well; the fixed mode drafts every eligible request
         and always keeps the sync.
         """
-        if num_speculative_tokens <= 0 or self.bypass_only:
+        if num_speculative_tokens <= 0 or self.bypass_only or self._lapsed:
             return True
         if self.adaptive is None:
             return False
@@ -315,6 +330,11 @@ class DSparkProposer:
         self._observe_outcomes(ctx)
         for req_id in scheduled:
             self._proposals.pop(req_id, None)
+        if self._lapsed:
+            self.counters.bypass_reasons["lapse"] += 1
+            self._forget_idle(scheduled, ())
+            self._regime_step(ctx, drafted=False)
+            return
         try:
             self._ingest_step(ctx)
             mx.async_eval([(arena.keys, arena.values) for arena in self._arena])
@@ -322,10 +342,28 @@ class DSparkProposer:
             self._recover(error, scheduled)
             return
         self._forget_idle(scheduled, ())
+        self._regime_step(ctx, drafted=False)
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         self.counters.steps += 1
         scheduled = self._scheduled(ctx)
+        if self._lapsed:
+            # No feature was captured for this step and no context is kept:
+            # spend the records, count the step and re-evaluate the regime.
+            self._observe_outcomes(ctx)
+            for req_id in scheduled:
+                self._proposals.pop(req_id, None)
+            self.counters.bypass_reasons["lapse"] += 1
+            self._forget_idle(scheduled, ())
+            self._regime_step(ctx, drafted=False)
+            return None
+        result = self._propose_synchronous(ctx, scheduled)
+        self._regime_step(ctx, drafted=result is not None and bool(result.req_ids))
+        return result
+
+    def _propose_synchronous(
+        self, ctx: ProposeContext, scheduled: set[str]
+    ) -> DraftTokenIds | None:
         # The scheduler consumes a request's drafts the next time it schedules
         # the request (verified this step, clipped, or dropped for a prefill
         # chunk), so a record of a scheduled request is spent either way.
@@ -431,6 +469,84 @@ class DSparkProposer:
         except Exception as error:
             self._recover(error, scheduled)
             return None
+
+    def _would_draft(self, ctx: ProposeContext) -> bool:
+        """The planner's verdict for a batch of this step's size with prior expectations.
+
+        Every draftable decode request is offered at its full cap whether or
+        not it holds a context, so the verdict follows the load (request
+        count and context) rather than the contexts a lapse released.
+        """
+        if self.adaptive is None or ctx.num_speculative_tokens <= 0:
+            return False
+        candidates: list[tuple[str, Any, str, int]] = []
+        lengths: list[int] = []
+        for req_id, state in ctx.decode_reqs:
+            lengths.append(len(state.token_ids))
+            mode = self._controller.draft_mode(state)
+            if mode is None:
+                continue
+            cap = self._draft_cap(state, ctx.num_speculative_tokens)
+            if cap <= 0:
+                continue
+            candidates.append((req_id, state, mode, cap))
+        if not candidates:
+            return False
+        decision = self.adaptive.decide(
+            candidates,
+            active_requests=len(ctx.decode_reqs),
+            context=max(1, round(sum(lengths) / len(lengths))),
+        )
+        return bool(decision.draft)
+
+    def _regime_step(self, ctx: ProposeContext, *, drafted: bool) -> None:
+        """Enter or leave the lapse from this step's load; fixed mode never lapses."""
+        if drafted:
+            self._decline_streak = 0
+        if not self.lapse_enabled or self.adaptive is None or self.bypass_only:
+            return
+        if not ctx.decode_reqs:
+            return
+        would_draft = drafted or self._would_draft(ctx)
+        if self._lapsed:
+            self._draft_streak = self._draft_streak + 1 if would_draft else 0
+            if self._draft_streak >= LAPSE_EXIT_STEPS:
+                self._lapsed = False
+                self._draft_streak = 0
+                self._decline_streak = 0
+                self.counters.lapse_exits += 1
+                logger.info(
+                    "DSpark: load regime resumed drafting at %d requests "
+                    "(new requests are primed again)",
+                    len(ctx.decode_reqs),
+                )
+            return
+        self._decline_streak = 0 if would_draft else self._decline_streak + 1
+        if self._decline_streak >= LAPSE_ENTER_STEPS:
+            self._enter_lapse(len(ctx.decode_reqs))
+
+    def lapse_for_bypass(self) -> None:
+        """The bypass mode never drafts: lapse from the start (no capture, no context)."""
+        if self.lapse_enabled and not self._lapsed:
+            self._lapsed = True
+            logger.info(
+                "DSpark: bypass mode keeps no draft context; target features are not captured"
+            )
+
+    def _enter_lapse(self, active: int) -> None:
+        self._lapsed = True
+        self._decline_streak = 0
+        self._draft_streak = 0
+        self.counters.lapse_entries += 1
+        released = len(self._contexts)
+        self.release_requests(set(self._contexts))
+        logger.info(
+            "DSpark: load regime lapse at %d requests after %d declined steps; "
+            "%d draft contexts released, features no longer captured",
+            active,
+            LAPSE_ENTER_STEPS,
+            released,
+        )
 
     def _recover(self, error: Exception, scheduled: set[str]) -> None:
         """Release the step's contexts; swallow allocation failures, re-raise the rest."""

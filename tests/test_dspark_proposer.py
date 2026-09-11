@@ -868,3 +868,161 @@ def test_stochastic_outcomes_record_the_sampling_mode():
     (sample,) = proposer.recorder.samples
     assert sample.mode == "stochastic" and sample.temperature == 0.8
     assert sample.accepted == 1 and sample.scheduled == 2
+
+
+# ---- load regime (lapse) ------------------------------------------------------
+
+
+class _Planner:
+    def __init__(self, draft: bool) -> None:
+        self.draft = draft
+        self.calls = 0
+
+    def decide(self, candidates, *, active_requests, context):
+        from vllm_metal.v1.dspark.planner import DraftDecision
+
+        self.calls += 1
+        return DraftDecision(draft=self.draft, reason="stub")
+
+    def forget(self, req_ids):
+        pass
+
+    def forget_idle(self, scheduled, drafted):
+        pass
+
+
+def _deferred_ctx(state, req_id="r", k=2):
+    """A deferred step after the placeholder append: the query row is the previous anchor."""
+    anchor = len(state.token_ids) - 2
+    return replace(
+        _context(decode=[(req_id, state, anchor, [state.token_ids[anchor]], [])], k=k),
+        decode_token_ids=[()],
+    )
+
+
+def test_lapse_enters_after_sustained_declines_and_resumes(monkeypatch, caplog):
+    from vllm_metal.v1 import dspark_proposer as module
+
+    proposer = _proposer()
+    proposer.adaptive = _Planner(draft=False)
+    state = _state([1, 2, 3])
+    _seed(proposer, state, k=0)
+    assert proposer.needs_target_hidden_states((), has_final_prefill=False) is True
+    assert "r" in proposer._contexts
+    with caplog.at_level("INFO", logger="vllm_metal.v1.dspark_proposer"):
+        for _ in range(module.LAPSE_ENTER_STEPS - 1):
+            state.token_ids.append(-1)
+            proposer.ingest_deferred_step(_deferred_ctx(state))
+            state.token_ids[-1] = 7
+        assert proposer._lapsed is False
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    assert proposer._lapsed is True
+    assert proposer._contexts == {}  # every context released with its slot
+    assert proposer._arena[0].free_slots == proposer._arena[0].slots
+    assert proposer.counters.lapse_entries == 1
+    assert any("load regime lapse" in r.message for r in caplog.records)
+    assert proposer.needs_target_hidden_states((), has_final_prefill=True) is False
+    assert proposer.deferred_step_allowed([("r", state)], 2) is True
+    # Lapsed steps neither ingest nor draft; the planner's verdict is still asked.
+    calls = proposer.adaptive.calls
+    result = proposer.propose(
+        _context(
+            decode=[("r", state, len(state.token_ids) - 1, [7], [7])], hidden=False
+        )
+    )
+    assert result is None and proposer._contexts == {}
+    assert proposer.counters.bypass_reasons["lapse"] >= 1
+    assert proposer.adaptive.calls == calls + 1
+    # A prefill during the lapse creates no context either.
+    fresh = _state([4, 5, 6, 7])
+    proposer.propose(_context(prefill=[("p", fresh, 0, 3, True)], hidden=False))
+    assert "p" not in proposer._contexts
+    # The planner would draft again: after LAPSE_EXIT_STEPS steps the regime resumes.
+    proposer.adaptive = _Planner(draft=True)
+    for _ in range(module.LAPSE_EXIT_STEPS):
+        assert proposer._lapsed is True
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    assert proposer._lapsed is False
+    assert proposer.counters.lapse_exits == 1
+    assert proposer.needs_target_hidden_states((), has_final_prefill=False) is True
+    # New requests are primed again on the synchronous path.
+    later = _state([4, 5, 6, 7])
+    proposer.propose(_context(prefill=[("q", later, 0, 3, True)], k=0))
+    assert "q" in proposer._contexts
+
+
+def test_drafting_resets_the_decline_streak(monkeypatch):
+    from vllm_metal.v1 import dspark_proposer as module
+
+    proposer = _proposer()
+    proposer.adaptive = _Planner(draft=False)
+    state = _state([1, 2, 3])
+    _seed(proposer, state, k=0)
+    for _ in range(module.LAPSE_ENTER_STEPS - 1):
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    assert proposer._decline_streak == module.LAPSE_ENTER_STEPS - 1
+    # A synchronous step that drafts (fixed-style planner verdict) resets the streak.
+    proposer.adaptive = None
+    result = proposer.propose(
+        _context(decode=[("r", state, len(state.token_ids) - 1, [7], [7])])
+    )
+    assert result is not None and result.req_ids == ["r"]
+    proposer.adaptive = _Planner(draft=False)
+    state.token_ids.append(-1)
+    proposer.ingest_deferred_step(_deferred_ctx(state))
+    assert proposer._decline_streak == 1 and proposer._lapsed is False
+
+
+def test_fixed_mode_and_disabled_knob_never_lapse(monkeypatch):
+    from vllm_metal.v1 import dspark_proposer as module
+
+    proposer = _proposer()  # fixed mode: no planner
+    state = _state([1, 2, 3])
+    _seed(proposer, state, k=0)
+    for _ in range(module.LAPSE_ENTER_STEPS + 1):
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state, k=0))
+        state.token_ids[-1] = 7
+    assert proposer._lapsed is False and "r" in proposer._contexts
+    disabled = _proposer()
+    disabled.lapse_enabled = False
+    disabled.adaptive = _Planner(draft=False)
+    other = _state([1, 2, 3])
+    _seed(disabled, other, k=0)
+    for _ in range(module.LAPSE_ENTER_STEPS + 1):
+        other.token_ids.append(-1)
+        disabled.ingest_deferred_step(_deferred_ctx(other))
+        other.token_ids[-1] = 7
+    assert disabled._lapsed is False and "r" in disabled._contexts
+    disabled.bypass_only = True
+    disabled.lapse_for_bypass()
+    assert disabled._lapsed is False
+
+
+def test_bypass_mode_lapses_from_the_start(caplog):
+    proposer = _proposer()
+    proposer.bypass_only = True
+    with caplog.at_level("INFO", logger="vllm_metal.v1.dspark_proposer"):
+        proposer.lapse_for_bypass()
+    assert proposer._lapsed is True
+    assert proposer.needs_target_hidden_states((), has_final_prefill=True) is False
+    fresh = _state([4, 5, 6, 7])
+    assert (
+        proposer.propose(_context(prefill=[("p", fresh, 0, 3, True)], hidden=False))
+        is None
+    )
+    assert proposer._contexts == {}
+    assert proposer.counters.bypass_reasons["lapse"] == 1
+    # never resumes
+    state = _state([1, 2, 3])
+    for _ in range(10):
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    assert proposer._lapsed is True
