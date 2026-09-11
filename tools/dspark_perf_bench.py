@@ -5,7 +5,8 @@ Workload buckets (input tokens x output tokens) and client concurrencies are
 declared up front. For every speculative width the target-only server and the
 speculative server are both alive (only one receives requests at a time);
 after one warmup repetition per server the bucket is measured in at least
-five paired repetitions with alternating order. Every request is streamed
+five paired repetitions with alternating order (a pair taken while another
+process loaded the machine is discarded and repeated; see ``--max-load``). Every request is streamed
 and records time to first token, end-to-end latency, time per output token
 and the inter-arrival gaps between streamed chunks (a speculative burst is
 one arrival, so gaps are what a reader perceives). Per repetition: output
@@ -28,9 +29,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
+import re
 import statistics
+import subprocess
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -194,6 +200,79 @@ def paired_summary(reference: list[dict], candidate: list[dict]) -> dict:
     return summary
 
 
+HEAVY_CPU_PERCENT = 40.0
+# The run's own processes (servers, this client) and the desktop's daemons are
+# not outside load; anything else above HEAVY_CPU_PERCENT is.
+_OWN_PROCESS = re.compile(r"VLLM|vllm|python|/zsh|\bzsh\b|\bps\b")
+_SYSTEM_PATHS = ("/System", "/Applications", "/Library", "/usr/libexec", "/usr/sbin")
+
+
+def heavy_other_processes(ps_lines: list[str]) -> int:
+    """Count user-land processes above HEAVY_CPU_PERCENT in ``ps -Ao pcpu,command`` output."""
+    count = 0
+    for line in ps_lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            cpu = float(parts[0])
+        except ValueError:
+            continue
+        command = parts[1]
+        if cpu <= HEAVY_CPU_PERCENT or _OWN_PROCESS.search(command):
+            continue
+        if command.startswith(_SYSTEM_PATHS):
+            continue
+        count += 1
+    return count
+
+
+class LoadSampler:
+    """Sample the 1-minute load average and outside heavy processes while a pair runs."""
+
+    def __init__(self, interval_s: float = 2.0) -> None:
+        self.interval_s = interval_s
+        self.samples: list[dict] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _sample(self) -> dict:
+        try:
+            lines = subprocess.run(
+                ["ps", "-Ao", "pcpu,command", "-r"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.splitlines()[1:]
+        except OSError:
+            lines = []
+        return {
+            "t": time.time(),
+            "load1": os.getloadavg()[0],
+            "heavy_other": heavy_other_processes(lines),
+        }
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self.samples.append(self._sample())
+            self._stop.wait(self.interval_s)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> dict:
+        self._stop.set()
+        self._thread.join()
+        self.samples.append(self._sample())
+        return {
+            "samples": len(self.samples),
+            "load1_max": max(s["load1"] for s in self.samples),
+            "load1_mean": sum(s["load1"] for s in self.samples) / len(self.samples),
+            "heavy_other_max": max(s["heavy_other"] for s in self.samples),
+            "heavy_other_samples": sum(1 for s in self.samples if s["heavy_other"]),
+        }
+
+
 def measure_bucket(
     servers: dict[str, Server],
     order: list[str],
@@ -201,18 +280,58 @@ def measure_bucket(
     output: int,
     repetitions: int,
     slo: dict,
-) -> dict[str, list[dict]]:
-    """Warm each server once, then alternate the order every repetition."""
+    *,
+    max_load: float = 4.0,
+    max_retries: int = 5,
+    sampler_factory: Callable[[], LoadSampler] = LoadSampler,
+) -> tuple[dict[str, list[dict]], list[dict]]:
+    """Warm each server once, then measure paired repetitions with alternating order.
+
+    A pair (one run of each server) during which another process ran above
+    HEAVY_CPU_PERCENT or the 1-minute load average exceeded ``max_load`` is
+    outside load, not a measurement: it is discarded and the pair repeated, up
+    to ``max_retries`` extra pairs per bucket; when the retries are spent the
+    pair is kept and flagged. Every attempt is returned with its load record.
+    """
     for name in order:
         asyncio.run(run_repetition(servers[name].base, prompts, output, slo))
     measured: dict[str, list[dict]] = {name: [] for name in order}
-    for repetition in range(repetitions):
-        sequence = order if repetition % 2 == 0 else list(reversed(order))
-        for name in sequence:
-            measured[name].append(
-                asyncio.run(run_repetition(servers[name].base, prompts, output, slo))
+    attempts: list[dict] = []
+    retries = 0
+    while len(measured[order[0]]) < repetitions:
+        kept = len(measured[order[0]])
+        sequence = order if kept % 2 == 0 else list(reversed(order))
+        sampler = sampler_factory()
+        sampler.start()
+        results = {
+            name: asyncio.run(run_repetition(servers[name].base, prompts, output, slo))
+            for name in sequence
+        }
+        load = sampler.stop()
+        contaminated = load["heavy_other_max"] > 0 or load["load1_max"] > max_load
+        discard = contaminated and retries < max_retries
+        attempts.append(
+            {
+                "order": sequence,
+                "load": load,
+                "contaminated": contaminated,
+                "kept": not discard,
+            }
+        )
+        if discard:
+            retries += 1
+            print(
+                f"  discarded a pair under outside load (heavy processes "
+                f"{load['heavy_other_max']}, load1 max {load['load1_max']:.1f}); "
+                f"retry {retries}/{max_retries}",
+                flush=True,
             )
-    return measured
+            continue
+        for name in order:
+            measured[name].append(
+                dict(results[name], load=load, contaminated=contaminated)
+            )
+    return measured, attempts
 
 
 def main() -> None:
@@ -225,6 +344,19 @@ def main() -> None:
     parser.add_argument("--buckets", default="128x128,1024x128,128x512")
     parser.add_argument("--concurrency", default="1,4")
     parser.add_argument("--repetitions", type=int, default=5)
+    parser.add_argument(
+        "--max-load",
+        type=float,
+        default=4.0,
+        help="a paired repetition during which the 1-minute load average exceeded this "
+        "(or another user-land process ran above 40%% CPU) is discarded and repeated",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="extra paired repetitions allowed per bucket to replace contaminated ones",
+    )
     parser.add_argument("--slo-ttft", type=float, default=1.0)
     parser.add_argument("--slo-gap-p95", type=float, default=0.1)
     parser.add_argument("--max-model-len", type=int, default=2048)
@@ -323,18 +455,21 @@ def main() -> None:
                         )
                         key = f"{candidate.name}/{input_length}x{output}/c{concurrency}"
                         before = metrics(candidate.base)
-                        measured = measure_bucket(
+                        measured, attempts = measure_bucket(
                             {"k0": reference, "k": candidate},
                             ["k0", "k"],
                             prompts,
                             output,
                             args.repetitions,
                             slo,
+                            max_load=args.max_load,
+                            max_retries=args.max_retries,
                         )
                         after = metrics(candidate.base)
                         entry = {
                             "reference_reps": measured["k0"],
                             "candidate_reps": measured["k"],
+                            "attempts": attempts,
                             "paired": paired_summary(measured["k0"], measured["k"]),
                             "spec_metrics_delta": {
                                 name: after.get(name, 0.0) - before.get(name, 0.0)
@@ -373,17 +508,20 @@ def main() -> None:
                             tokenizer, args.repo, input_length, concurrency
                         )
                         key = f"k0-async/{input_length}x{output}/c{concurrency}"
-                        measured = measure_bucket(
+                        measured, attempts = measure_bucket(
                             {"k0": reference, "async": asynchronous},
                             ["k0", "async"],
                             prompts,
                             output,
                             args.repetitions,
                             slo,
+                            max_load=args.max_load,
+                            max_retries=args.max_retries,
                         )
                         report["results"][key] = {
                             "reference_reps": measured["k0"],
                             "candidate_reps": measured["async"],
+                            "attempts": attempts,
                             "paired": paired_summary(measured["k0"], measured["async"]),
                         }
                         (args.output_dir / "results.json").write_text(
