@@ -1856,3 +1856,150 @@ cost-04 table under the asynchronous scheduler.
   server on long prompts at high load that is not the lapse's and is
   recorded as open.
 - Soak, adaptive mode, eight clients, ten minutes, the lapse on: PASS (`soak-adaptive-2`, `--expect-no-drafts`): 1,507 requests (1,394 completed, 113 cancelled at the deadline), zero errors, 184.7 output tokens per second, end-to-end p50/p95 1.69/11.30 s, first token p95 0.31 s, resident set flat (4.45 GB peak, 4.43 GB at the end), one lapse entry at eight clients and one exit as the load drained. (A first run of the same soak read the same numbers, 1,507 requests and zero errors, and failed only the tool's draft-work criteria, which are the fixed mode's; `--expect-no-drafts` is the tool's new switch for a load the planner declines.)
+
+## M9c: the small-M quantized matmul, measured and not adopted (M5 Max, on `b640247`)
+
+### The knee
+
+The M9 cost profile (`results/m5max-m9-final-01/cost-04`) and the M7 matmul
+probe put a number on the machine-side half of the parity gap. At one
+request and 160 tokens of decode context the target's step costs 7.25 ms
+with one row, 8.90 ms with five (K=4, 1.23x), 12.78 ms with six (K=5,
+1.76x) and 15.81 ms with eight (K=7, 2.18x); per layer, the MLP's three
+affine-4 projections cost 0.230 ms at one row, 0.263 at four, 0.416 at
+eight and 0.536 at sixteen. `mx.quantized_matmul` streams the weights once
+on its GEMV path up to five rows, so the rows share the read, and from six
+rows switches to a GEMM tiling that below about sixteen rows is mostly
+idle: eight rows cost nearly as much as sixteen. Speculative verification
+lives exactly there (`num_speculative_tokens + 1` rows per request), and so
+does the drafter's block backbone (seven rows per request). The consequence
+in the M9 benches: a fixed K=7 round at one client costs 19.4 ms against
+7.25 ms per target-only token, so it needs 2.7 accepted tokens per round to
+break even, loses on the 1,024-token prompts (accepted length 2.54, -14%)
+and gains +42% (fixed) to +52% (adaptive) on the short ones where the
+official runners report +60-85%; the adaptive planner, reading the measured
+table, chose narrower widths and bypassed at eight clients because eight
+verification rows per request did cost the target twice a decode.
+
+mlx-dspark met the same knee on M4-class machines and answered it with
+avlp12's `qmm_mma4` (MIT): one 8x8 `simdgroup_matrix` tile per threadgroup,
+each weight group dequantized once and applied to every row, K split across
+the eight simdgroups; 1.56-1.70x at eight rows on an M4 Pro, flat in M.
+They gate it off on M5-class GPUs after a stall report on an M5 Pro that
+was never tied to the kernel (their issue #19 is a DFlash-mode report).
+
+### What was built
+
+`vllm_metal/quant/small_m.py` (on the branch) carries that structure with a multi-tile
+form (`ceil(M / 8)` tiles, up to four for 32 rows) and a dispatch that
+measures before it routes:
+
+- `SmallMQuantizedLinear` and `SmallMQuantizedEmbedding` (the tied
+  `lm_head`) replace the classes of eligible leaves in place (affine mode
+  with biases, 4 bits, group 64, input width a multiple of 512); parameters
+  and `isinstance` checks are untouched and `uninstall` restores them.
+  Calls with 6 to 32 bfloat16 rows go to the kernel when the shape's
+  verdict enables that tile count; one-row decode never pays for the
+  dispatch.
+- At install every distinct eligible weight shape is checked against the
+  stock kernel at 6, 7, 8, 16, 24 and 32 rows (differences within 2% of
+  the largest output, the bf16-ULP class) and raced on a dependent chain
+  with the weights rotated across the model's same-shape layers at 8, 16,
+  24 and 32 rows; a tile count is enabled where the kernel wins by 10% or
+  more. Verdicts are cached per GPU architecture, MLX version and kernel
+  version. `VLLM_METAL_SMALL_M_QMM=auto|off|on`.
+- Installed on the target in `ModelLifecycle.install_decode_dispatch`
+  (LoRA and pooling serves keep the stock kernel) and on the quantized
+  drafter after `load_drafter`. The kernel also serves plain decode at 6 to
+  32 concurrent requests, so a target-only server gains where the race
+  said so.
+
+Numerics: fp32 accumulation in another order than the stock kernel, so
+outputs differ from it at the bfloat16 ULP level, the same class as the
+stock kernel's own difference between its GEMV and GEMM paths and the class
+the M4a parity contract records as ties.
+
+### Measurements
+
+The kernel was first measured on synthetic weights of the target's six
+linear shapes (`results/m5max-m9c-smallm-01/probe.log`: eight rotated copies
+per shape, dependent chains, GPU idle). The stock kernel's cost rises with
+the row count exactly as the model-level numbers said, and the MMA kernel is
+flat in the row count but pays a fixed price for its staging: at one row it
+streams the weights at 55-65% of the stock GEMV's rate (gate/up 0.080 ms
+against 0.052, down 0.083 against 0.050, the tied head 0.74 against 0.40),
+so at eight rows, where the stock kernel costs 1.6-2.1x its one-row time on
+those shapes, the gain is 1.07x on gate/up, 1.13x on down and 1.15x on the
+head, and 1.6-1.9x on the small attention projections whose calls sit at
+the dispatch floor either way. Two- to four-tile calls (9-32 rows) lose on
+the large shapes. A short exploration during the M9b serving gates
+(`dev/probe2-*.log`, contended, ratios only) bounded what a different layout
+could recover: a register-accumulating GEMV-style kernel (eight features by
+eight rows per lane) is three times slower than the stock kernel, bfloat16
+dequantization arithmetic is slower than fp32, and a variant that stages the
+raw nibbles without any arithmetic (an upper bound with the dequantization
+nearly free) still reaches only about 70% of the stock rate at one row: the
+staging structure, not the arithmetic, is the ceiling of this design on this
+GPU and MLX version. Of the layouts measured, 32 columns per threadgroup (one
+column per lane, one quantization group per 16-byte load, four simdgroups
+splitting K) is the best all-round one and the one the module carries:
+on a quiet GPU (`window/variants.log`) it gains, at eight rows, 1.01x on
+gate/up, 0.90x on down, 1.21x on the tied head, 1.46x on q_proj and 0.82x
+on o_proj on the dependent chain (1.23x, 0.96x, 1.91x, 1.07x and 1.07x in
+a throughput loop of independent calls), and at sixteen rows 1.28x on down
+and 1.36x on o_proj; every layout costs 1.6 to 1.8 times the stock kernel at
+one row.
+
+The in-model probe settles it (`window/model-probe.log`,
+`tools/dspark_matmul_rows_probe.py --small-m`, the kernel forced on for
+every eligible layer and tile count, the target's own layers timed whole):
+at eight rows the MLP block runs at 1.03x its stock time, the attention
+projections at 1.00x, o_proj at 0.95x and the tied head at 1.16x; at
+sixteen rows the MLP at 1.10x and the head at 1.00x; at 24 and 32 rows the
+kernel loses (the MLP 0.79x, the head 0.59x). The stock MLP at eight rows
+costs 1.46x its one-row time in that run (0.363 against 0.248 ms), and the
+kernel's flat cost sits at that same level, so there is no step-level gain
+to be had from it on this machine: the race would enable it for the tied
+head at one tile, about one percent of a step. The module, its tests and
+the two probes stay on the branch `dspark-m9c-small-m` as the record of
+the investigation; the runner does not carry them.
+
+One lead survives the investigation. MLX 0.32.2 (the tree pins 0.32.1)
+"uses a 32-row block in `qmm_t_nax` when one block covers all of M", the
+quantized GEMM path M5-class GPUs run for six to 32 rows. The stock kernel
+measured under both versions on the same shapes and protocol, gated
+(`results/m5max-m9c-smallm-01/mlx0322`, the `-b` pair): 0.32.2 is 1.28x
+to 1.42x faster on gate/up and 1.4x to 1.6x faster on the tied head at 16
+to 32 rows, unchanged within 5% at twelve rows and below on the MLP shapes
+and on the attention projections at every row count. That is the regime of
+two to four drafting requests at K=7 (16 to 32 verification rows) and of
+the head at any width. A served trial of the pin bump on the merged tree
+(`results/m5max-mlx0322-01`, a copy of the environment with MLX 0.32.2;
+the first attempt silently ran 0.32.1 because the copied environment's
+activation script kept its original path, and was discarded) has so far
+passed the full test suite, the fixed serving gate, the natural-prompt
+parity gate and the stochastic gate with the same statistics as 0.32.1,
+and found one thing to fix before any bump: the target-only memory worker
+lands within 0.4 MB of the paged-attention allowance under both versions
+(the cache policy sizes the KV to the fraction with no margin) and once
+overshot it under 0.32.2, so the policy needs an explicit margin first.
+Its cost profile ran under outside load and is not a measurement; the
+benches, the adaptive and bypass gates and the soak are still to run. The
+pin stays at 0.32.1 until they do; the decision rule is every gate passing
+and the 16-to-32-row cells improving in the served profile.
+
+No served evidence run was spent on the kernel: the in-model verdict above
+made the cost profile, benches and soak that were queued for it a
+measurement of nothing, and they were cancelled in favour of the M8 pairs.
+
+### Where this leaves the port
+
+The knee is real and it is the machine's, not the port's: the stock
+quantized matmul on this GPU streams weights faster at one row than any
+MMA layout can at eight, so the port cannot buy back the verification rows
+with a kernel of its own, and the honest statement of the parity gap stays
+as the M9 record put it. What can still move it on Apple silicon is a newer
+quantized GEMM path in MLX itself (the 0.32.2 lead above, worth 1.3x to
+1.6x exactly where two to four requests draft at K=7) and, on the runner's
+side, keeping verification on the device so the drafting step joins the
+asynchronous pipeline. Both are recorded as the next steps in the handoff.
