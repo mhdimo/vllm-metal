@@ -986,7 +986,10 @@ class MetalModelRunner:
             return cached[1], cached[2]
         controller = self._spec_decode_controller
         runner_invalid: dict[str, int] = {}
-        if self.use_async_scheduling:
+        # Placeholder slots exist only when a drafter runs under the
+        # asynchronous scheduler; without a drafter the scheduler's own
+        # (empty) handoff is the answer, whatever the scheduling mode.
+        if self.use_async_scheduling and self._drafter is not None:
             resolved, runner_invalid = controller.substitute_retained_drafts(
                 scheduler_output, self._retained_drafts
             )
