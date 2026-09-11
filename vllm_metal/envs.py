@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     VLLM_METAL_DSPARK_MAX_CONTEXTS: int = 32
     VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP: int = 0
     VLLM_METAL_DSPARK_MODE: str = "fixed"
+    VLLM_METAL_DSPARK_LAPSE: bool = True
+    VLLM_METAL_DSPARK_DRAFT_PRECISION: str = "quantized"
     VLLM_METAL_DSPARK_CALIBRATION: str = ""
     VLLM_METAL_DSPARK_COST_MODEL: str = ""
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
@@ -137,6 +139,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP": lambda: int(
         os.getenv("VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP", "0")
     ),
+    # Load regime of the adaptive and bypass modes (default on): when the
+    # planner would decline a batch of the step's size on 32 consecutive
+    # steps, the proposer stops capturing and ingesting target features and
+    # releases its draft contexts, so a server that cannot profit from
+    # drafting costs what target-only serving costs; it primes new requests
+    # again once the load has dropped below the count it lapsed at and the
+    # planner would draft, on 8 consecutive steps. Set to "0"
+    # to keep every context current at all loads (the M9 behaviour).
+    "VLLM_METAL_DSPARK_LAPSE": lambda: os.getenv("VLLM_METAL_DSPARK_LAPSE", "1") == "1",
     # DSpark serving mode: "fixed" verifies the configured width; "adaptive"
     # plans each request's draft prefix (and whether to draft at all) from the
     # calibrated confidence and the measured cost model, and needs both
@@ -145,6 +156,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # and A/B serving).
     "VLLM_METAL_DSPARK_MODE": lambda: os.getenv(
         "VLLM_METAL_DSPARK_MODE", "fixed"
+    ).lower(),
+    # DSpark drafter weights: "quantized" converts the drafter to the target's
+    # affine 4-bit recipe at load (the qualified default); "source" keeps the
+    # checkpoint's own precision (bfloat16 for the released drafters), more
+    # memory and a different cost profile, for acceptance and speed A/Bs.
+    "VLLM_METAL_DSPARK_DRAFT_PRECISION": lambda: os.getenv(
+        "VLLM_METAL_DSPARK_DRAFT_PRECISION", "quantized"
     ).lower(),
     "VLLM_METAL_DSPARK_CALIBRATION": lambda: os.getenv(
         "VLLM_METAL_DSPARK_CALIBRATION", ""

@@ -91,6 +91,8 @@ def make_stub_runner(
         "_pending_output": None,
         "_intermediate_forward_supported": True,
         "_draft_token_ids": None,
+        "_retained_drafts": {},
+        "_step_spec_tokens": None,
         "_execute_model_state": None,
         "_selective_logits_supported": False,
         "pp": None,

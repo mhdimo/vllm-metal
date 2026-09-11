@@ -220,7 +220,9 @@ async def soak(
     report["elapsed_s"] = time.perf_counter() - started
 
 
-def summarize(report: dict, base: str) -> tuple[dict, list[str]]:
+def summarize(
+    report: dict, base: str, *, expect_no_drafts: bool = False
+) -> tuple[dict, list[str]]:
     results = report["results"]
     failures = []
     errors = [r for r in results if r["error"]]
@@ -247,10 +249,14 @@ def summarize(report: dict, base: str) -> tuple[dict, list[str]]:
         failures.append("server still has running or waiting requests after the soak")
     drafts = final.get("vllm:spec_decode_num_draft_tokens_total", 0.0)
     accepted = final.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
-    if drafts <= 0 or accepted <= 0:
+    if expect_no_drafts:
+        # A load the planner declines (or the bypass mode): the server must
+        # stay healthy without drafting; draft work is not a criterion.
+        pass
+    elif drafts <= 0 or accepted <= 0:
         failures.append("no draft work reported during the soak")
     # Draft work must keep flowing: the last quarter of samples adds drafts.
-    if len(samples) >= 8:
+    elif len(samples) >= 8:
         quarter = samples[-len(samples) // 4]
         if samples[-1]["drafts"] <= quarter["drafts"]:
             failures.append("draft work stalled in the last quarter of the soak")
@@ -300,6 +306,17 @@ def main() -> None:
     parser.add_argument("--batch-tokens", type=int, default=512)
     parser.add_argument("--memory-fraction", default="0.2")
     parser.add_argument("--startup-timeout", type=float, default=900)
+    parser.add_argument(
+        "--expect-no-drafts",
+        action="store_true",
+        help="the soak runs at a load the planner declines (or in the bypass mode): "
+        "judge stability only, not draft work",
+    )
+    parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="start the server with --async-scheduling (DSpark supports it since M9b)",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     from transformers import AutoTokenizer
@@ -315,7 +332,12 @@ def main() -> None:
         memory_fraction=args.memory_fraction,
     )
     server = Server(
-        server_args, args.width, False, args.output_dir, name=f"k{args.width}-soak"
+        server_args,
+        args.width,
+        False,
+        args.output_dir,
+        name=f"k{args.width}-soak",
+        async_scheduling=args.async_scheduling,
     )
     report: dict = {
         "config": vars(args)
@@ -332,7 +354,9 @@ def main() -> None:
             k: v for k, v in os.environ.items() if k.startswith("VLLM_METAL_DSPARK")
         }
         asyncio.run(soak(server.base, prompts, args, server.process, report))
-        summary, failures = summarize(report, server.base)
+        summary, failures = summarize(
+            report, server.base, expect_no_drafts=args.expect_no_drafts
+        )
     finally:
         server.stop()
     summary["failures"] = failures

@@ -60,6 +60,9 @@ class RunnerCapabilities:
     is_pooling: bool
     pp_active: bool
     hybrid_without_lazy_gdn: bool
+    # Speculative decoding with a proposer that cannot consume a deferred
+    # step (``DeferredStepProposer``); such a proposer needs every step's
+    # token values on the host.
     spec_decode_configured: bool
     uniproc_executor: bool
 
@@ -103,6 +106,10 @@ class SchedulerStepShape:
     # against its pending rows (a cached request can re-enter after being
     # absent from the previous step and then has no pending row).
     decode_req_ids: tuple[str, ...]
+    # A deferred-step-capable drafter (``DeferredStepProposer``) that would
+    # draft at the end of this step needs the sampled token values on the
+    # host, so the step keeps the synchronous path.
+    drafter_needs_sync: bool = False
 
     def block_reason(self) -> str | None:
         """First step-shape fact that rules the pipeline out, or ``None``."""
@@ -113,6 +120,7 @@ class SchedulerStepShape:
             (self.has_preempted_requests, "preempted requests"),
             (self.has_encoder_inputs, "encoder inputs scheduled"),
             (self.has_spec_tokens, "speculative decode"),
+            (self.drafter_needs_sync, "drafter may draft"),
             (self.has_structured_output, "structured output"),
             (self.has_mm_decode, "multimodal decode state"),
         )

@@ -155,6 +155,11 @@ def main() -> None:
     parser.add_argument("--batch-tokens", type=int, default=2048)
     parser.add_argument("--memory-fraction", default="0.2")
     parser.add_argument("--startup-timeout", type=float, default=900)
+    parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="start every server with --async-scheduling (DSpark supports it since M9b)",
+    )
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     requests = [int(v) for v in args.requests.split(",") if v]
@@ -224,6 +229,7 @@ def main() -> None:
             False,
             args.output_dir,
             name=f"k{width}" if width else "bypass",
+            async_scheduling=args.async_scheduling,
             env=mode_env,
             expect_in_log="mode=bypass" if width == 0 else "mode=fixed",
         )

@@ -1099,3 +1099,760 @@ compiler, which this machine does not have; the source-built kernels
 (`VLLM_METAL_BUILD_FROM_SOURCE=1`) served every run in this record. Packaging
 validation stays deferred to a machine with Xcode and is listed as such in the
 handoff.
+
+## M9: performance parity work (M5 Max, `fe09b88`)
+
+The official DSpark runners (vLLM's GPU speculator and SGLang's) keep the
+drafter's context K/V in a paged pool that the attention kernel reads through
+block tables, so a drafting step touches each request's context once and pays
+nothing for the other rows of the batch; their planners (vLLM's adaptive
+verification manager, SGLang's planner) choose the drafted prefix per request
+from confidences against measured draft and verify cost curves, the objective
+being emitted tokens per unit of step cost. The Metal port had the second
+half (M6) but not the first: every draft context was a private buffer, and a
+batched drafting step padded every request's context to the longest one and
+concatenated the copies, per layer, per step (two operations per request and
+layer), and the per-step feature ingest ran the fuse, projection, RoPE and
+two writes per request and layer. The M4d and M6 profiles recorded the result:
+the draft phase grew from 2.6 ms at one request to 14 ms at sixteen, and the
+ingest and context evaluation with it. This milestone removes those costs and
+measures what remains between this port and a speculative server that never
+loses to target-only serving.
+
+### Context arena and per-row attention
+
+`vllm_metal/v1/dspark/model.py` now holds one `ContextArena` per drafter layer:
+a `[slots, kv_heads, capacity + block, head_dim]` K and V pair reserved once
+at load for `max_contexts` slots (the memory plan's `context_bytes` now counts
+the block's scratch positions). A request's context is an `ArenaCache` over one
+slot; appends write in place, and the slot returns to the free list when the
+request finishes, is preempted or loses its prefix. On a drafting step the
+block's own keys and values go to the scratch positions right after each
+row's context (one scatter per tensor and layer for the whole batch), and each
+row attends to a strided view of its own slot, `[0, length + block)`, with no
+gather, padding or mask: a batch costs the sum of its rows and a short context
+never pays for the longest one. Measured in process on the real 4B pair
+with synthetic contexts, all draft phases in one evaluation, the old and the
+new path back to back on an idle GPU (`results/m5max-m9-ab-02`,
+`draft-breakdown-old` and `draft-breakdown-q4`), the drafting step goes
+from 3.74 to 3.29 ms at one request, 6.43 to 5.52 ms at four, 11.70 to
+10.06 ms at sixteen requests with 300 tokens of context and 20.62 to
+13.51 ms at sixteen requests with 1,300 tokens: the 4.3 ms of padding and
+concatenation at the long context are gone and the backbone itself is
+faster because every row reads only its own length. A third design, one
+gather of the batch's rows into a padded buffer with a length mask, was
+measured on the way and rejected: it lost what it saved because MLX
+materializes a `keys[rows, :, :width]` index as a full-slot gather, while
+`scaled_dot_product_attention` over a strided prefix view costs the same as
+over a contiguous copy (0.36 versus 0.39 ms for sixteen rows at 307 keys),
+so per-row attention needs no copy at all.
+
+### Batched feature ingest
+
+Every decode span of a step (at most `K + 1` accepted rows per request) is
+now written by one pass per layer: the spans' feature rows are gathered from
+the packed hidden states into `[rows, width, features]` (each span padded by
+repeating its last row), fused and projected once, roped with a per-row start
+position (`mx.fast.rope` takes an offset array), and scattered into the arena
+at each row's positions. The padding columns land past the row's committed
+length, where the next append or the block write overwrites them and no
+reader looks before then; the arena rejects a span that would leave its slot.
+Prefill chunks keep the per-request path (they are few per step and long).
+In process at sixteen requests with 79 accepted rows the ingest drops from
+8.6 to 2.2 ms per step (4.5 to 1.9 ms at eight, 2.3 to 1.2 ms at four); one
+request keeps the single-row path. The batched projection is the multi-row
+arithmetic path of the M4a numerics contract: against the sequential writes
+the context differs by one to three bfloat16 ULPs on the real drafter, and
+the FP32 unit test (`MLX_ENABLE_TF32=0`) asserts equality to 2e-5.
+
+Through the serving path, with the M6 cost protocol at the same cells as
+the M6b cost model (`results/m5max-m9-ab-02/cost-window-off` against
+`results/m5max-m6-cost-03`; K=7, memory fraction 0.4, 64-token outputs),
+the two changes take 14% to 21% off the drafting step at 160 tokens of
+decode context (four requests 35.2 to 28.9 ms, eight 54.4 to 43.2 ms,
+sixteen 68.8 to 57.4 ms) and 9% to 16% at 1,312 tokens (four 50.2 to
+43.2 ms, eight 82.8 to 74.9 ms, sixteen 137.6 to 116.1 ms), with the p95
+step now within 2% to 5% of the median where it had been 5% to 15% above
+it; the bypass step, which ingests but never drafts, is 2% to 6% cheaper.
+The in-process drafter work behind those cells went from 14.3 to 9.0 ms
+at sixteen requests (9.5 to 7.7 ms at eight, 5.7 to 5.3 ms at four) and
+its host bookkeeping from 3.8 to 1.8 ms.
+
+### The verification kernel's window mode
+
+The target's paged-attention kernel has a window mode
+(`VLLM_METAL_SPEC_VERIFY_WINDOW=1`, opt-in and off by default because its
+win is chip- and shape-dependent) in which the `K+1` verification rows of a
+request share each KV block load instead of re-reading the context per row;
+its outputs are bitwise identical to the expanded per-row layout. Measured
+through the serving path with the M6 cost protocol at K=7 (`results/m5max-m9-ab-02`,
+`cost-window-off3` and `cost-window-on3`; four, eight and sixteen requests
+at 160 and 1,312 tokens of decode context, memory fraction 0.4, 64-token
+outputs, the bypass server of each run as the control that the flag cannot
+affect):
+
+| Decode context | Requests | Bypass step ms, off / on (control) | K=7 step ms, window off (p95) | K=7 step ms, window on (p95) | Window effect |
+| --- | --- | --- | --- | --- | --- |
+| 160 | 4 | 9.3 / 9.1 | 29.6 (30.1) | 30.8 (31.2) | +4% |
+| 160 | 8 | 13.6 / 13.5 | 44.4 (45.0) | 46.2 (47.2) | +4% |
+| 160 | 16 | 22.6 / 22.6 | 59.4 (62.5) | 61.5 (66.8) | +3% |
+| 1312 | 4 | 12.2 / 12.3 | 44.5 (45.3) | 46.4 (48.0) | +4% |
+| 1312 | 8 | 19.9 / 19.7 | 75.4 (78.3) | 78.2 (80.3) | +4% |
+| 1312 | 16 | 31.5 / 32.7 | 116.8 (122.4) | 116.4 (121.9) | -0% |
+
+The window mode costs 3% to 4% at four and eight requests on both contexts
+and nothing at sixteen requests with 1,312 tokens, with the control within
+1% to 4% between the two runs, so it stays off for DSpark on this machine:
+the documented wins are at concurrency sixteen to thirty-two with 8k
+contexts on Ultra chips, and these shapes are not that. Two earlier pairs
+in the same directory (`cost-window-off`/`-on` and `-on2`/`-off2`) are kept
+but not read: the second run of the first pair was uniformly slower,
+control included, and the second pair ran while another session's test
+suite loaded the machine (load average above thirty), which is what made
+the quiet-machine gate (`bin/wait-quiet.sh`) a precondition of every timing
+phase after it.
+
+### The decode pipeline on non-drafting steps
+
+The M6b bypass floor had two parts: with speculative decoding configured the
+runner's one-step-ahead decode pipeline (`decode_pipeline.py`) was off for
+the server's life, and every step captured and ingested target features.
+The second part is the drafter's contract (a context that falls behind
+cannot be rebuilt without replaying the prompt), and after the batched
+ingest it costs about 2 ms at sixteen requests. The first part is now a
+per-step decision. A proposer that can consume a step whose sampled tokens
+stay on the device implements the `DeferredStepProposer` seam
+(`vllm_metal/v1/proposer.py`): `deferred_step_allowed` says whether the
+proposer will draft at the end of a pure-decode step, and
+`ingest_deferred_step` receives such a step's features and segments without
+token values. The DSpark proposer answers from its mode: the bypass mode and
+a step without speculative tokens never draft; the fixed mode always drafts;
+the adaptive mode runs the same draft-or-not decision `propose` takes, with
+every draftable request at its full cap and the step's request count and
+context, so a batch the planner declines at the gate it declines after
+sampling too. The runner's gate (`_evaluate_pipeline_gate`) treats such a
+proposer per step ("drafter may draft" blocks the step) instead of for the
+server's life, and the deferred sample path hands the step to the proposer
+after the placeholders are appended, so the feature rows end at each
+request's pending anchor exactly as on the synchronous path; the proposer
+spends the scheduled requests' proposal records, ingests the features and
+queues the arenas for evaluation behind the step's own work. A verification
+step, a new or resumed request and a drafting step keep the synchronous
+path, and the synchronous path always resolves the pending step before it
+mutates request state, so a drafting step never sees a placeholder anchor.
+The seam is complete and unit-tested at every layer (the proposer's
+decision per mode, the ingest without token values, the runner's gate and
+its deferred submit); whether a served DSpark server can reach it is a
+question the evaluation below answers, and the answer is not yet.
+
+The decomposition of the floor, through the M4d serving protocol at four and
+eight clients (`results/m5max-m9-ab-02/bench-pipeline-off`: the adaptive
+server, which bypasses at these concurrencies, against a target-only server
+started with `VLLM_METAL_DECODE_PIPELINE=0`, five paired repetitions):
+
+| Server | Bucket | C | Target-only tok/s | Candidate tok/s | Tokens/s benefit (median, 95% CI) | TPOT ms | Gap p95 ms | Goodput req/s | Accepted / drafted |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| k7-adaptive | 128x128 | 4 | 316.6 | 292.7 | -7.6% [-9.7, -3.3] | 11.3 → 12.1 | 12 → 13 | 2.47 → 2.29 | 0 / 12 |
+| k7-adaptive | 128x128 | 8 | 393.9 | 373.6 | -4.8% [-5.8, -0.3] | 18.6 → 19.3 | 19 → 20 | 3.08 → 2.92 | 0 / 12 |
+| k7-adaptive | 1024x128 | 4 | 174.8 | 124.3 | -29.0% [-30.3, -26.1] | 15.5 → 12.6 | 14 → 13 | 0.68 → 0.49 | 24 / 30 |
+| k7-adaptive | 1024x128 | 8 | 200.8 | 126.7 | -36.4% [-39.7, -34.0] | 27.6 → 12.6 | 60 → 13 | 0.00 → 0.25 | 74 / 122 |
+
+On the 128-token bucket the adaptive server's bypass steps run 7.6% (four
+clients) and 4.8% (eight) below a target-only server that also has the
+pipeline off, against 11.0% and 6.4% below one that has it on (M6b): the
+pipeline is three and two points of the floor, the rest is the capture and
+ingest of target features and the proposer's per-step bookkeeping. The
+1,024-token bucket told a different story: 29% and 36% below target-only,
+with a *better* time per output token (12.6 versus 15.5 and 27.6 ms) and a
+time to first token of 1.6 and 3.5 s against 0.9 and 1.5 s. The speculative
+server's engine log had the cause: "Running: 2 reqs, Waiting: 6 reqs". Its
+target KV cache had 153 blocks (2,448 tokens, 1.2 sequences of the model
+length) where the target-only server had 2,154, because the paged-attention
+planner subtracted the drafter's whole reservation (context, capture,
+workspace: 3.26 GB at these limits) from a budget measured after the context
+arena had already been allocated, so the arena's 0.67 GB was counted twice,
+and because the workspace itself reserved three full copies of the context
+for the padded batch that the arena no longer builds (2.0 of its 2.5 GB).
+The M6b evaluation had the same arithmetic without the arena (438 blocks,
+7,008 tokens) and its 20% loss at eight clients on the 1,024-token bucket
+was this starvation, not verification cost: eight requests of 1,150 tokens
+need more cache than that. The planner now subtracts only the capture and
+workspace once the arena exists (`planning_reserve_bytes`), and the
+workspace reserves one transient copy of the arena instead of three; at
+the bench's limits the speculative server's cache goes from 153 to
+1,006 blocks.
+
+The same protocol on the tree with every change of this milestone, against
+the production target-only server, at one, four and eight clients, five
+paired repetitions per cell (`results/m5max-m9-pipeline-01/bench-adaptive`):
+
+| Server | Bucket | C | Target-only tok/s | Candidate tok/s | Tokens/s benefit (median, 95% CI) | TPOT ms | Gap p95 ms | Goodput req/s | Accepted / drafted |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| k7-adaptive | 128x128 | 1 | 141.4 | 226.2 | +60.1% [+59.6, +61.4] ✓ | 6.8 → 4.1 | 7 → 15 | 1.11 → 1.77 | 510 / 690 |
+| k7-adaptive | 128x128 | 4 | 379.4 | 360.9 | -6.7% [-9.4, -1.7] | 9.5 → 10.1 | 10 → 10 | 2.96 → 2.82 | 0 / 12 |
+| k7-adaptive | 128x128 | 8 | 455.2 | 437.7 | -4.5% [-6.2, -2.1] | 16.0 → 16.6 | 16 → 17 | 3.56 → 3.42 | 0 / 12 |
+| k7-adaptive | 1024x128 | 1 | 107.0 | 110.6 | +3.3% [-0.9, +8.8] | 7.7 → 7.1 | 8 → 18 | 0.84 → 0.86 | 360 / 576 |
+| k7-adaptive | 1024x128 | 4 | 207.2 | 193.2 | -7.7% [-8.4, -4.7] | 13.6 → 14.6 | 12 → 13 | 1.61 → 1.13 | 6 / 12 |
+| k7-adaptive | 1024x128 | 8 | 234.1 | 215.5 | -7.5% [-8.6, -5.5] | 24.5 → 26.7 | 56 → 126 | 0.00 → 0.00 | 8 / 26 |
+| k7-adaptive | 128x512 | 1 | 130.2 | 173.9 | +33.5% [+31.9, +42.4] ✓ | 7.5 → 5.6 | 8 → 22 | 0.25 → 0.34 | 2040 / 2964 |
+| k7-adaptive | 128x512 | 4 | 330.3 | 316.7 | -3.6% [-4.5, -3.5] | 11.8 → 12.3 | 13 → 13 | 0.65 → 0.62 | 0 / 12 |
+| k7-adaptive | 128x512 | 8 | 408.8 | 391.6 | -4.1% [-4.2, -3.9] | 19.1 → 19.9 | 21 → 22 | 0.80 → 0.76 | 0 / 12 |
+
+Against M6b (`results/m5max-m6b-adaptive-03`) the one-request gain on the
+128-token bucket goes from +40.5% to +60.1% and the long-prompt bucket at
+eight clients from -20.1% to -7.5%; the four- and eight-client cells on the
+short buckets move from -11.0%/-6.4% to -6.7%/-4.5% (128 outputs) and from
+-7.1%/-6.4% to -3.6%/-4.1% (512 outputs). The serving gate passes in the
+bypass mode (every scenario equal or a tie, no draft token reported) and in
+the adaptive mode (22 equal and 7 ties; 13 and 18 with prefix caching), so
+the seam and the budget change alter no output.
+
+What the seam did not deliver, and why, is part of this record. The
+speculative server's log never showed the deferred-step line: the Metal
+platform forces synchronous scheduling whenever speculative decoding is
+configured (`vllm_metal/platform.py`, every Metal proposer hands its drafts
+back through `take_draft_token_ids`, which vLLM's asynchronous engine loop
+never calls), and the decode pipeline's own gate requires asynchronous
+scheduling, so no DSpark server can reach the deferred path today. The
+bypass floor that remains (4% to 8% at four and eight clients) is therefore
+the feature capture and ingest, the proposer's bookkeeping, and the absent
+pipeline; and the true production gap is larger than that floor, because a
+target-only server with asynchronous scheduling (`--async-scheduling`, the
+M4d `k0-async` reference) is itself 5% to 12% faster than the synchronous one
+these tables compare against. vLLM's own answer, which the upstream GPU
+runner uses for every drafter under asynchronous scheduling, is to let the
+scheduler reserve `num_speculative_tokens` placeholder slots per running
+request and to substitute the worker's drafts at execution time; the Metal
+runner's speculative-decode contract is scheduler-driven and rejects
+placeholder sentinels. Bringing DSpark under asynchronous scheduling on
+Metal is the next piece of this work (M9b): it removes the platform's
+synchronous downgrade for DSpark, admits the placeholder contract in the
+runner's segment building and verification, and only then can the
+deferred-step seam recorded above engage.
+
+### Drafter precision
+
+The released drafters are bfloat16 checkpoints; the port converts them to
+the target's affine 4-bit recipe at load, and `VLLM_METAL_DSPARK_DRAFT_PRECISION=source`
+now keeps the source precision instead. Measured back to back in process on
+an idle GPU (`results/m5max-m9-ab-01`, `draft-breakdown-q4` and
+`draft-breakdown-bf16`), the quantized drafter is faster at every batch
+size: the drafting step takes 3.29 versus 5.10 ms at one request, 5.52
+versus 7.82 ms at four, 10.06 versus 11.14 ms at sixteen requests with 300
+tokens of context and 13.51 versus 14.43 ms at 1,300 tokens; at one request
+the drafter is bound by its weight reads (1.2 GB in bfloat16 against 0.35 GB
+quantized) and at sixteen the sequential head and the language-model head
+still read their weights once per position. The accepted length does not pay for the
+quantization either: on the official prompt sets at the paper's temperature
+1.0 (below) the quantized drafter reaches 6.12, 5.69, 5.11, 4.81, 3.54 and
+3.40 on gsm8k, math500, humaneval, mbpp, mt-bench and alpaca, the source
+drafter 6.03, 5.71, 5.30, 4.93, 3.57 and 3.46 (`results/m5max-m9-accept-01`,
+`t1-quantized` and `t1-source`, 64 prompts per set), differences within the
+sampling noise of 64 prompts and in neither direction consistently; under
+greedy decoding the source drafter is 0.02 to 0.12 higher on every set
+(6.21 against 6.15 on gsm8k, 5.97 against 5.87 on math500), a real but
+small cost of the 4-bit conversion. The quantized drafter stays the
+default: it is faster at every batch size and the operator can trade the
+memory for that fraction of a draft token with the knob.
+
+### Accepted length against the paper
+
+`tools/dspark_acceptance_eval.py` runs the DeepSpec evaluation prompt
+sets (first turn, the target's chat template without thinking; 64 prompts
+per set, 512-token outputs, eight concurrent requests in process, fixed
+mode at K=7) and reports the accepted length per drafting round, the
+drafted tokens accepted plus the bonus or correction token, the paper's
+Table 1 quantity. The paper samples at temperature 1.0 with standard
+rejection-sampling verification over the full sets with 2,048-token
+outputs and bfloat16 weights; here the target is the qualified 4-bit
+conversion and the drafter either quantized or in source precision
+(`results/m5max-m9-accept-01`):
+
+| Data set | Paper (bf16, full set, T=1.0) | T=1.0, quantized | T=1.0, source | greedy, quantized | greedy, source |
+| --- | --- | --- | --- | --- | --- |
+| gsm8k | 6.11 | 6.12 | 6.03 | 6.15 | 6.21 |
+| math500 | 5.70 | 5.69 | 5.71 | 5.87 | 5.97 |
+| humaneval | 5.38 | 5.11 | 5.30 | 5.25 | 5.37 |
+| mbpp | 5.13 | 4.81 | 4.93 | 4.98 | 5.09 |
+| mt-bench | 3.64 | 3.54 | 3.57 | 3.65 | 3.67 |
+| alpaca | 3.54 | 3.40 | 3.46 | 3.44 | 3.47 |
+
+At the paper's temperature the port lands within 0.1 of the paper on
+gsm8k, math500, mt-bench and alpaca and within 0.3 on humaneval and mbpp
+(the two code sets, where the 4-bit target's own answers differ most from
+the bfloat16 target the drafter was trained against); greedy decoding is
+0.1 to 0.2 higher on every set. The port's drafter therefore keeps the
+official drafter's strength: the accepted lengths that give DSpark its
+advantage over Eagle3 and DFlash in Table 1 (30.9% and 16.3% higher on the
+4B target) are reproduced here with quantized weights and exact
+verification; the source drafter is consistently 0.02 to 0.12 higher
+under greedy decoding and indistinguishable at temperature 1.0. Throughput in this offline
+setting (eight requests, 512-token outputs, one engine in process) was
+458 to 909 output tokens per second depending on the set, the code and
+math sets fastest because their longer accepted prefixes make each
+verification step worth more tokens.
+
+### Cost model and serving results after the changes
+
+The serving-path cost model was re-profiled on the optimized tree with the
+M6 protocol (`results/m5max-m9-final-01/cost-04`: one to sixteen requests,
+widths 0 to 7, decode contexts 160, 672 and 1,312 tokens, memory fraction
+0.4) and the adaptive mode was evaluated with it through the M4d serving
+protocol against the production target-only server at one, four, eight and
+sixteen clients, five paired repetitions per cell
+(`results/m5max-m9-final-01/bench-adaptive`), with the fixed mode at K=2
+and K=7 at one and eight clients for comparison (`bench-fixed`):
+
+Served step cost in milliseconds (median) per cell, the M6b profile
+(`m5max-m6-cost-03`) against this one (`cost-04`), the drafted widths shown
+for K=2, 4 and 7 of the seven profiled, and the in-process drafter work
+the profile attributes at K=7:
+
+| Decode context | Requests | Bypass (M6b -> M9) | K=2 | K=4 | K=7 | Draft ms (in process) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 160 | 1 | 7.4 -> 7.2 | 11.2 -> 11.0 | 14.3 -> 12.5 | 19.4 -> 19.4 | 3.4 |
+| 160 | 2 | 8.2 -> 7.9 | 20.3 -> 15.9 | 25.9 -> 25.8 | 31.5 -> 30.9 | 4.6 |
+| 160 | 4 | 9.5 -> 9.2 | 30.3 -> 24.0 | 40.8 -> 35.0 | 35.2 -> 34.1 | 5.7 |
+| 160 | 8 | 14.5 -> 13.6 | 41.4 -> 35.7 | 56.1 -> 52.2 | 54.4 -> 50.7 | 8.2 |
+| 160 | 16 | 24.5 -> 22.4 | 60.6 -> 51.9 | 87.2 -> 77.2 | 68.8 -> 62.5 | 10.7 |
+| 672 | 1 | 8.1 -> 8.0 | 13.8 -> 13.0 | 17.2 -> 16.7 | 24.3 -> 22.6 | 3.4 |
+| 672 | 2 | 8.9 -> 8.8 | 22.8 -> 20.4 | 28.8 -> 27.5 | 34.9 -> 33.6 | 4.6 |
+| 672 | 4 | 12.0 -> 11.5 | 33.7 -> 31.4 | 41.1 -> 38.5 | 43.0 -> 39.5 | 5.7 |
+| 672 | 8 | 18.8 -> 18.1 | 48.2 -> 43.5 | 64.2 -> 59.1 | 66.8 -> 60.3 | 8.2 |
+| 672 | 16 | 28.5 -> 27.6 | 74.9 -> 63.9 | 102.5 -> 89.4 | 94.7 -> 83.4 | 10.7 |
+| 1312 | 1 | 8.3 -> 8.0 | 16.7 -> 15.0 | 19.4 -> 18.4 | 26.0 -> 25.0 | 3.4 |
+| 1312 | 2 | 10.4 -> 9.6 | 25.7 -> 22.9 | 32.2 -> 29.7 | 39.3 -> 37.0 | 4.6 |
+| 1312 | 4 | 12.7 -> 12.1 | 42.0 -> 34.1 | 47.1 -> 43.4 | 50.2 -> 46.2 | 5.7 |
+| 1312 | 8 | 20.7 -> 19.7 | 64.1 -> 50.7 | 76.5 -> 68.1 | 82.8 -> 73.9 | 8.2 |
+| 1312 | 16 | 34.4 -> 32.0 | 98.3 -> 80.7 | 132.4 -> 112.8 | 137.6 -> 115.8 | 10.7 |
+
+Every drafted step is cheaper on the optimized tree, by 5% to 20%, most at
+sixteen requests and the long context (K=7 137.6 to 115.8 ms, K=2 98.3 to
+80.7 ms); the bypass step by 2% to 9%. One shape of the target is worth
+naming because the planner's table now contains it: at eight and sixteen
+requests K=4 (five rows per request, 80 rows at sixteen) costs more than
+K=7 (128 rows), in both profiles, the affine-4 kernels' tiling favouring
+the wider batch; the cost model interpolates over the measured rows and the
+planner reads the measured surface, so it never picks the width by
+assumption.
+
+Adaptive mode (K<=7, the calibrated planner with the cost-04 table) against
+the production target-only server, output tokens per second, median of five
+paired repetitions with the bootstrap 95% interval of the relative benefit.
+Three runs are shown because the machine was shared: `final-01` (17:29,
+another session's bursts hit the cells marked contended), `pipeline-01`
+(16:44, the same tree before the KV-budget fix landed in the final tree;
+its 128x512 cells are the clean ones) and `final-02` (22:04, the
+contamination-aware protocol: a pair taken while another process ran above
+40% CPU or the load average exceeded 4 is discarded and repeated, up to five
+extra pairs per cell, then kept flagged; the last column records how many
+pairs each cell discarded and kept flagged and the highest load average
+among kept pairs). Under outside load both servers slow down together, so
+the relative benefit holds where the absolute rates do not:
+
+| Bucket | C | First run (final-01), sync | Pipeline-01, sync | Final-02 under outside load (protocol: discarded / flagged pairs) |
+| --- | --- | --- | --- | --- |
+| 128x128 | 1 | 141.2 → 213.7, +51.5% [+50.3, +52.1] | 141.4 → 226.2, +60.1% [+59.6, +61.4] | 131.5 → 194.5, +50.1% [+41.5, +57.0] (0 discarded, 0 flagged, load1 max 3.7) |
+| 128x128 | 4 | 380.9 → 356.6, -7.8% [-15.2, +3.9] (contended) | 379.4 → 360.9, -6.7% [-9.4, -1.7] | 344.9 → 332.0, -5.8% [-18.2, +13.0] (0 discarded, 0 flagged, load1 max 3.9) |
+| 128x128 | 8 | 440.0 → 434.9, -0.3% [-10.2, +0.9] | 455.2 → 437.7, -4.5% [-6.2, -2.1] | 383.9 → 361.2, -5.9% [-28.0, +38.0] (5 discarded, 2 flagged, load1 max 4.5) |
+| 128x128 | 16 | 586.4 → 562.5, -4.8% [-8.9, -1.6] | – | 490.6 → 455.2, -7.2% [-22.4, +14.1] (5 discarded, 1 flagged, load1 max 4.1) |
+| 1024x128 | 1 | 107.0 → 113.9, +9.3% [-7.0, +20.6] | 107.0 → 110.6, +3.3% [-0.9, +8.8] | 93.3 → 99.5, +6.2% [-27.3, +33.4] (5 discarded, 1 flagged, load1 max 6.1) |
+| 1024x128 | 4 | 202.3 → 187.8, -6.4% [-11.2, -2.3] | 207.2 → 193.2, -7.7% [-8.4, -4.7] | 166.9 → 160.9, -3.6% [-25.5, +27.1] (5 discarded, 5 flagged, load1 max 5.8) |
+| 1024x128 | 8 | 232.5 → 214.9, -7.6% [-9.9, -4.3] | 234.1 → 215.5, -7.5% [-8.6, -5.5] | 200.9 → 188.2, -6.3% [-20.6, +3.3] (5 discarded, 4 flagged, load1 max 4.7) |
+| 1024x128 | 16 | 198.6 → 183.2, -6.4% [-30.6, +23.1] (contended) | – | 221.2 → 199.8, -9.5% [-17.5, +1.8] (0 discarded, 0 flagged, load1 max 3.7) |
+| 128x512 | 1 | 56.6 → 67.8, +23.3% [-17.8, +97.7] (contended) | 130.2 → 173.9, +33.5% [+31.9, +42.4] | 123.2 → 160.7, +28.3% [+24.9, +47.6] (0 discarded, 0 flagged, load1 max 3.6) |
+| 128x512 | 4 | 182.2 → 170.6, -6.6% [-32.9, +27.2] (contended) | 330.3 → 316.7, -3.6% [-4.5, -3.5] | 299.9 → 318.5, +6.2% [-22.1, +12.4] (5 discarded, 5 flagged, load1 max 4.6) |
+| 128x512 | 8 | 268.2 → 258.0, -4.3% [-24.3, +22.0] (contended) | 408.8 → 391.6, -4.1% [-4.2, -3.9] | 421.4 → 419.0, -1.3% [-14.1, +7.3] (5 discarded, 3 flagged, load1 max 5.9) |
+| 128x512 | 16 | 477.3 → 482.0, +4.4% [-11.9, +10.0] (contended) | – | 532.5 → 517.5, -0.6% [-15.5, +4.9] (5 discarded, 5 flagged, load1 max 5.1) |
+
+Fixed mode, K=2 and K=7 at one and eight clients (`final-01/bench-fixed`,
+five paired repetitions, no contamination record in that run):
+
+| Server | Bucket | C | Target-only tok/s | Candidate tok/s | Tokens/s benefit (median, 95% CI) | TPOT ms | Gap p95 ms | Goodput req/s | Accepted / drafted |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| k2 | 128x128 | 1 | 138.4 | 203.3 | +49.7% [+45.6, +56.6] ✓ | 7.0 → 4.6 | 7 → 12 | 1.08 → 1.59 | 450 / 618 |
+| k2 | 128x128 | 8 | 459.8 | 436.8 | -8.8% [-13.1, +18.1] | 15.0 → 15.8 | 15 → 40 | 3.59 → 3.41 | 3560 / 5042 |
+| k2 | 1024x128 | 1 | 104.7 | 122.6 | +15.8% [-3.7, +19.9] | 7.9 → 6.2 | 8 → 16 | 0.82 → 0.96 | 438 / 630 |
+| k2 | 1024x128 | 8 | 227.2 | 194.2 | -14.5% [-27.1, +7.1] | 24.1 → 26.8 | 53 → 159 | 0.00 → 0.00 | 3296 / 5544 |
+| k7 | 128x128 | 1 | 137.5 | 194.2 | +41.8% [+35.5, +43.8] ✓ | 7.0 → 4.8 | 7 → 18 | 1.07 → 1.52 | 540 / 1524 |
+| k7 | 128x128 | 8 | 454.8 | 389.0 | -12.8% [-27.3, -6.0] | 15.1 → 16.5 | 16 → 50 | 3.55 → 3.04 | 4102 / 13651 |
+| k7 | 1024x128 | 1 | 106.1 | 90.5 | -14.4% [-26.3, -1.7] | 7.7 → 9.0 | 8 → 24 | 0.83 → 0.71 | 456 / 2070 |
+| k7 | 1024x128 | 8 | 238.6 | 173.2 | -27.6% [-28.9, -23.7] | 23.5 → 31.0 | 54 → 200 | 0.00 → 0.00 | 3866 / 15191 |
+
+The `final-02` fixed bench (23:15) ran entirely under outside load: every
+cell discarded five pairs and kept three to five flagged ones with load
+averages up to 5.7, and the outside work fell on the candidate more than
+on the reference (K=7 at one client on the short prompts read +5.7%
+against +41.8% in `final-01`). Its numbers are kept with their load record
+in `results/m5max-m9-final-02/bench-fixed` as the protocol's own evidence
+of contamination and are not used above.
+
+Read across the three runs, the picture is stable. At one client on the
+short prompts the adaptive server is 50% to 60% faster than target-only
+(M6b: +40.5%), on the 512-token outputs 28% to 34% (M6b: +33.3%), and on
+the 1,024-token prompts 3% to 9% with intervals that include zero. From four
+clients on the planner bypasses on nearly every step (the accepted/drafted
+column shows a few dozen draft tokens per cell) and the server runs 1% to 9%
+behind target-only, where M6b lost 6% to 20%; at eight clients on the long
+prompts the loss went from 20.1% to 6.3-7.6% because the KV starvation is
+gone, and the remaining floor is the per-step feature capture and ingest
+plus the synchronous scheduler the M9b record removes. In fixed mode K=2
+gains 49.7% at one client on the short prompts and 15.8% on the long ones
+and K=7 gains 41.8% on the short prompts, while forced K=7 loses 14.4% on
+the long prompts at one client and 12.8% to 27.6% at eight clients, the
+cost-04 rows above (a K=7 step at eight requests costs 3.7x a decode) made
+visible; the M4d fixed numbers were +13.7% and -15.3% at one client on the
+same two buckets, so the arena and ingest work is worth 28 points on the
+short prompts at K=7 and the long-prompt loss is unchanged because it is the
+target's verification cost, not the drafter's.
+
+Gates on the optimized tree: serving check in bypass mode
+(`results/m5max-m9-pipeline-01/serving-bypass`: every scenario equal or a
+tie against target-only, zero draft tokens reported, as `--expect-no-drafts`
+requires), in adaptive mode (`serving-adaptive` there and in
+`results/m5max-m9-final-01`: 22 equal and 7 ties on the direct server, 13
+equal and 18 ties on the prefix-cached one, 934 drafts / 2,760 draft tokens /
+1,554 accepted in the final run, zero failures) and in fixed mode
+(`serving-fixed`: 20 equal and 9 ties, 14 and 17 on the prefix server, 823
+drafts / 5,645 draft tokens / 1,723 accepted, zero failures); the stochastic
+gate in fixed mode (`stochastic-fixed`: all six distribution cells pass at
+4,000 samples, 3,943 drafted / 2,018 accepted at temperature 1.0 and 3,994 /
+2,870 at temperature 0.7 with top-p 0.9, greedy parity 3 equal and 4 ties,
+seeded runs reproducible). The adaptive stochastic check at one sequence
+(`stochastic-adaptive-1seq`) reproduces the M6b run histogram for histogram
+(4,000 drafted / 2,153 accepted at temperature 1.0, 4,000 / 3,029 at 0.7 with
+top-p 0.9), including the one cell that run already recorded as the target's
+own nucleus flip between its single-row and multi-row forward (temperature
+0.7, top-p 0.9, position 2, chi-square 129.2; the target-only control without
+drafting fails the same cell at every position), so the M9 changes moved no
+distribution.
+
+### Where this leaves the port against the official runners
+
+The official runners' advantage rests on three things: a drafter whose
+context costs nothing per step beyond its own rows, a verification budget
+chosen per step from calibrated confidences against a measured cost curve,
+and a target whose eight verification rows per request are nearly free
+because a datacenter GPU is memory-bound far past that batch size. The port
+now has the first two on Metal (the arena and the deferred-step seam close
+the drafter's per-step overheads and the bypass floor; M6 already chose the
+budget the way the vLLM runner does, by expected accepted tokens per unit of
+step cost over a profiled table), and its accepted length on the official
+prompt sets is within 0.1 of the paper's Table 1 on gsm8k, math500, mt-bench and alpaca and within 0.3 on the two code sets at the paper's temperature, with a 4-bit target and drafter. The third is where the remaining gap sits,
+and cost-04 locates it precisely: at one request the target's step costs
+1.23x a single-row decode with five rows (K=4) but 1.76x with six and 2.18x
+with eight (K=7). The M7 matmul probe shows the same knee in every affine-4
+projection (the MLP 1.14x at four rows, 1.8x at eight, 2.3x at sixteen):
+`mx.quantized_matmul` streams the weights once on its GEMV path up to five
+rows and from six switches to a GEMM tiling that is mostly idle below about
+sixteen rows, so eight verification rows cost the target about twice a
+decode. That is why the planner's gain on this machine is concentrated at
+low concurrency (+50% to +60% at one client on short prompts, +28% to +34% on 512-token outputs, +3% to +9% on 1,024-token prompts, and -1% to -9% at four to sixteen clients where the planner bypasses (M6b: -6% to -20%)), why fixed K=7 loses on the long prompts
+at one client (a 19.4 ms round needs 2.7 accepted tokens to break even),
+and why at high concurrency the right production behaviour is the one the
+adaptive mode now delivers: bypass at no measurable cost against target-only
+serving, drafting the moment the measured curve says a request would gain.
+Part of that knee is the kernel rather than the hardware: mlx-dspark closed
+it on M4-class machines with a small-M kernel that dequantizes each weight
+group once and applies it to every row, and M9c brings that path to the
+port, measured per weight shape at load. A larger target on the same machine
+also moves the crossover up, because its decode is more weight-bound per
+row; the M8 pairs measure that.
+
+### Against the other Apple-silicon runtime
+
+mlx-dspark (ARahim3, 0.19.0, MIT) is a standalone MLX server with its own
+DSpark runtime, cost-curve cap and small-M verify kernel. Its `benchmark`
+command and this repository's `tools/dspark_single_stream_bench.py` ran
+the same protocol on this machine (`results/m5max-m9-compare-mlx-dspark-01`:
+its three prompts, one stream, greedy, 200-token outputs, the median of
+three timed passes after a warm-up), each on its own runtime:
+
+| Runtime, target | Target-only tok/s | DSpark tok/s (accepted length) | Speedup |
+| --- | --- | --- | --- |
+| mlx-dspark, Qwen3-4B-8bit, auto cap | 106.5 | 168.4 (2.65) | 1.58x |
+| mlx-dspark, Qwen3-4B-8bit, cap 7 | 106.5 | 138.1 (3.24) | 1.30x |
+| mlx-dspark, Qwen3-4B-4bit, auto cap | 182.1 | 209.2 (2.59) | 1.15x |
+| mlx-dspark, Qwen3-4B-4bit, cap 7 | 182.1 | 153.6 (2.97) | 0.84x |
+| this port, 4-bit pair, K=4: chat / code / math | 142.8 / 142.3 / 138.5 | 217.6 (2.80) / 311.2 (4.42) / 317.0 (4.63) | 1.52x / 2.19x / 2.29x |
+| this port, K=7: chat / code / math | same | 175.5 (3.06) / 313.6 (6.42) / 335.9 (6.86) | 1.23x / 2.20x / 2.43x |
+| this port, adaptive: chat / code / math | same | 210.3 (2.81) / 295.6 (4.42) / 306.7 (4.63) | 1.47x / 2.08x / 2.21x |
+
+Two things follow. With the same 4-bit target on the same GPU the other
+runtime's DSpark is worth 15% at its measured cap and loses 16% at cap 7,
+the verification-row cost this record measures, while the port's is worth
+1.5x on the chat prompt and 2.1x to 2.4x on the code and math prompts
+(accepted lengths of 6.4 and 6.9 at K=7, the paper's regime); its 1.58x on
+the 8-bit target rests on a target-only floor of 106 tokens per second,
+where verification rows are cheap relative to the weight stream. And the
+other runtime decodes the target alone at 182 tokens per second where
+vLLM's engine with this plugin decodes it at 140: the per-step overhead of
+the serving stack at one stream is a target-only matter outside DSpark and
+worth its own measurement.
+
+### What the asynchronous scheduler changes (M9b, below)
+
+vLLM's asynchronous scheduler overlaps the scheduling of step `k+1` with
+the execution of step `k`, and the Metal decode pipeline builds on it; a
+target-only server gains 5% to 12% from it on this machine (M4d,
+`k0-async`). With speculative decoding configured the Metal platform forces
+synchronous scheduling because every Metal proposer hands its drafts to the
+engine through `take_draft_token_ids`, which the asynchronous engine loop
+never calls. Upstream's contract for drafters under asynchronous scheduling
+(the GPU runner uses it for every method, DSpark included) is different:
+the scheduler pads every running request with `num_speculative_tokens`
+placeholder slots (`-1`) and books their KV blocks, the worker substitutes
+the drafts it produced at the end of the previous step when it executes
+the batch, pads the unused slots as invalid (skipped by verification and
+reported as `num_invalid_spec_tokens`), and keeps its own optimistic
+`num_computed_tokens` corrected by the previous step's accepted counts.
+Bringing DSpark under that contract on Metal means: lifting the platform's
+synchronous downgrade for `dspark`; letting the spec-decode controller
+build verification segments from the runner's own retained drafts instead
+of the scheduler's (placeholder) tokens, with trailing invalid slots
+allowed; reconciling the runner's request bookkeeping with the scheduler's
+optimistic counts; and the adaptive planner's per-request prefix becoming
+the number of valid slots. The deferred-step seam recorded above then
+engages on its own (bypass steps become pipeline steps), and both the
+asynchronous scheduler's overlap and the pipeline's deferred sync apply to
+every non-drafting step. The M9b section below records that work and every gate,
+bench and soak repeated in that configuration.
+
+## M9b: DSpark under asynchronous scheduling (M5 Max, `b9f50ef`)
+
+The M9 record closed on a structural limit: the Metal platform forced
+synchronous scheduling whenever speculative decoding was configured, so a
+DSpark server ran 5% to 12% behind an asynchronous target-only server
+before any drafter cost, and the deferred-step seam that lets the decode
+pipeline run on non-drafting steps could not engage. The reason was the
+draft handoff. Every Metal proposer handed its drafts to the engine through
+`take_draft_token_ids`, which vLLM's asynchronous engine loop never calls:
+that loop schedules step `k+1` while step `k` executes, so the scheduler
+cannot wait for step `k`'s drafts, and upstream's answer (the GPU runner
+uses it for every drafter, DSpark included) is a different contract. The
+asynchronous scheduler books `num_speculative_tokens` placeholder slots
+(`-1`) for every running request and allocates their KV blocks; the worker
+keeps the drafts it produced at the end of the previous step and
+substitutes them into those slots when it executes the batch; the slots it
+does not fill are reported as invalid so the speculative-decode statistics
+count real drafts; and the scheduler rolls `num_computed_tokens` back by
+the rejected count exactly as it does under synchronous scheduling, so a
+request that fills no slot simply decodes one token.
+
+This milestone brings DSpark under that contract. The platform keeps
+vLLM's scheduling decision for `dspark` (asynchronous by default, as for
+target-only serving) and still downgrades the draft-model, MTP and n-gram
+proposers, which keep the synchronous handoff. The spec-decode controller
+gains `substitute_retained_drafts`, which resolves each placeholder list
+into the request's retained drafts cut to the slot count, passes a
+synchronous handoff through unchanged, and records the unused slots; its
+`validate_supported` accepts the runner's own resolution, in which a request
+may verify fewer rows than the slots it was scheduled with, while a
+scheduler-reported invalid count still fails closed. The runner retains
+each request's drafts after `propose` (`_retain_drafts`), resolves the
+step's drafts once per scheduler output (`_resolve_spec_tokens`, shared by
+the pipeline gate, the validation and the segment builder), spends a
+request's retained drafts at the first step that schedules it again
+(its anchor token changes there) and drops them on release, preemption and
+resume. A retained draft is anchored at the token the request's previous
+step sampled, and under asynchronous scheduling the runner's own request
+state, not the scheduler's `new_token_ids`, is the source of that token, so
+the anchor is exact. Deferred steps do not propose, so a step after a
+pipelined step verifies nothing; a drafting step keeps the synchronous
+sample the seam already required. The harness tools take
+`--async-scheduling` so every server of a comparison runs the production
+scheduler.
+
+### Evidence
+
+Every server of `results/m5max-m9b-async-01` ran with `--async-scheduling`.
+The proposer's one-time log line "first deferred step ingested; the decode
+pipeline is running on non-drafting steps" appears in every adaptive and
+bypass server of the run, so the seam the M9 record left inert is engaged.
+
+- Serving gates: fixed K=7 (`serving-fixed-async`, 19:41), adaptive
+  (`serving-adaptive-async`, 19:45) and bypass with `--expect-no-drafts`
+  (`serving-bypass-async`, 19:49) all pass, every scenario equal or a tie
+  against the asynchronous target-only server, zero failures.
+- Stochastic gate (`stochastic-fixed-async`, 4,000 samples per cell): five
+  of six distribution cells pass and the greedy parity scenarios are equal or
+  ties, but temperature 0.7 with top-p 0.9 at position 2 fails (chi-square
+  67.6 on 29 buckets, p = 4e-5; 3,993 drafted / 2,867 accepted) where the
+  synchronous run of the same check passed that cell an hour earlier
+  (chi-square 28.8). The cell is the one the M6b and M9 records already
+  identified as the target's own nucleus flip between its single-row and
+  multi-row forward, and the asynchronous scheduler changes the batch
+  shapes the requests meet; the same check re-run with a third,
+  target-only engine at one sequence as a control
+  (`results/m5max-m9c-smallm-01/window/stochastic-async-control`, every
+  engine asynchronous) reproduces the speculative comparison histogram for
+  histogram (seeded) and shows the target's own spread between its batch
+  shapes at that temperature and top-p: target-only at one sequence against
+  target-only at the default sequence count disagrees at every position of
+  the 0.7/0.9 cell with chi-square 258, 211 and 174 (p from 1e-54 to 1e-22),
+  and at temperature 1.0 position 1 with p = 0.015 where the speculative
+  comparison read p = 0.0019. The speculative server's 67.6 at position 2
+  sits well inside the target's own 174 there, so the cell measures the
+  target's nucleus boundary moving with the batch shape, as the M6b control
+  found under synchronous scheduling and as the same diagnostic repeated
+  under synchronous scheduling shows again (`window/stochastic-sync-control`:
+  the speculative comparison passes every cell, the target-only control
+  disagrees at the 0.7/0.9 cell with chi-square 257, 217 and 179), not the
+  verification. The gate is
+  reported as it stands; the M4a contract's tie class covers the mechanism.
+- Adaptive bench against the asynchronous target-only server, five paired
+  repetitions, load average 2.1 throughout (`bench-adaptive-async`):
+
+| Bucket | C | Target-only tok/s | Adaptive tok/s | Benefit (95% CI) | Synchronous run (final-01) |
+| --- | --- | --- | --- | --- | --- |
+| 128x128 | 1 | 159.5 | 208.9 | +31.4% [+29.5, +34.7] | +51.5% (141.2 -> 213.7) |
+| 128x128 | 4 | 420.1 | 412.0 | -2.5% [-4.9, +3.0] | -7.8% |
+| 128x128 | 8 | 474.3 | 463.3 | -3.6% [-4.2, -0.0] | -0.3% |
+| 1024x128 | 1 | 99.9 | 98.9 | -7.3% [-10.3, +15.7] | +9.3% [-7.0, +20.6] |
+| 1024x128 | 4 | 215.0 | 204.1 | -4.3% [-6.7, -3.0] | -6.4% |
+| 1024x128 | 8 | 245.8 | 235.7 | -4.3% [-6.1, -3.7] | -7.6% |
+| 128x512 | 1 | 152.0 | 175.0 | +14.9% [+13.4, +24.0] | contaminated |
+| 128x512 | 4 | 376.1 | 372.0 | -1.8% [-2.3, -0.1] | contaminated |
+| 128x512 | 8 | 448.8 | 460.4 | +2.7% [+2.1, +3.1] | contaminated |
+
+  The asynchronous target-only server is 13% faster than the synchronous one
+  at one client (159.5 against 141.2 tokens per second) and the DSpark
+  server is where it was (208.9 against 213.7), because a drafting step
+  still synchronizes: the pipeline covers the non-drafting steps only, and
+  at one client the adaptive planner drafts on nearly every step. The bypass
+  floor at four and eight clients moved from -7.8/-0.3 to -2.5/-3.6 points on
+  the short prompts and from -6.4/-7.6 to -4.3/-4.3 on the long ones, and the
+  long-output bucket at eight clients turned positive.
+- Fixed bench (`bench-fixed-async`, K=2 and K=7 at one and eight clients
+  against the asynchronous target-only server): K=2 128x128 C1 +31.6%
+  (138.2 -> 182.7), C8 -20.1%; 1024x128 C1 +4.4%, C8 -16.9%; K=7 128x128 C1
+  +19.5% (147.0 -> 176.8), C8 -17.3%; 1024x128 C1 -22.3%, C8 -27.8%. The
+  phase ran at a load average of 3.4 to 4.4 and its candidates read 9-10%
+  below the synchronous run's at one client (K=7 194.2, K=2 203.3 tokens per
+  second) while the adaptive phase at load 2.1 read its candidate unchanged;
+  a repeat on a quiet machine (`window/bench-fixed-async-2`): was itself contaminated (another session's
+  `bun` scan at 98% CPU during the phase, load average 3.1 to 5.0; K=7 128x128
+  C1 read 137.1 -> 130.1 with a 27 ms p95 gap), so the fixed-mode numbers
+  under asynchronous scheduling remain the first phase's, with their load
+  noted; K=2 128x128 C1 +31.5% (153.3 -> 202.0),
+  C8 -12.9%; 1024x128 C1 +12.3%, C8 -16.3%; K=7 128x128 C1 -1.9% (145.8 ->
+  142.6), C8 -20.2%; 1024x128 C1 -30.1% (109.6 -> 76.6), C8 -27.6% (no pair
+  discarded, load average at most 3.8). The K=2 server matches its
+  synchronous throughput (202.0 against 203.3) and the adaptive one nearly
+  (208.9 against 213.7), but the fixed K=7 server is 27% below its
+  synchronous self at one client (142.6 against 194.2) with the same 540
+  accepted of 1,524 drafted, so each K=7 round costs about a third more
+  under the asynchronous scheduler; two diagnostics settle what that is. The served step cost
+  under the asynchronous scheduler is not higher (`diag-cost-async`, one
+  request, 128-token context: 6.55 ms target-only, 11.25 ms at K=2, 16.76 ms
+  at K=7, against the synchronous profile's 7.25, 11.0 and 19.4 ms), and a
+  back-to-back bench of K=4 and K=7 at one client under both schedulers
+  (`k47-sync`, `k47-async`) shows K=4 unchanged (234.9 sync, 232.0 async)
+  while the K=7 server's five repetitions spread from 159 to 192 tokens per
+  second under the asynchronous scheduler and from 182 to 196 under the
+  synchronous one, with the same 540 of 1,524 accepted: a repetition-level
+  variance of the widest fixed width, not a per-step cost of the contract.
+  K=4 is the better fixed width at one client on this machine (+72% sync,
+  +52% async against the respective target-only servers), and the adaptive
+  server (208.9) sits between it and K=7.
+- Soak (`soak-fixed-async`, fixed K=7, eight clients, 20 minutes, load
+  average 4.3): PASS, 3,790 requests (3,510 completed, 280 cancelled at the
+  deadline as the protocol allows), zero errors, 238.5 output tokens per
+  second, end-to-end p50/p95/p99 1.72/8.17/10.07 s, first token p95 0.58 s,
+  183,339 accepted draft tokens, resident set flat (4.39 GB peak, 4.28 GB at
+  the end).
+
+### What the asynchronous scheduler does not give DSpark yet
+
+A drafting step ends with a host-side verification (`verify` walks the
+accepted prefix per request and the stochastic path samples the residual
+on the host) whose result decides the next step's input tokens and the
+drafter's ingest spans, so the runner synchronizes on every drafting step
+and the pipeline only covers the steps the proposer will not draft. That
+is why the asynchronous target-only server gained 13% at one client and
+the DSpark server did not: the gap is now the synchronization, not the
+scheduler. Closing it means keeping verification and the draft handoff
+GPU-resident (accepted counts and tokens as arrays, the arena's committed
+lengths advanced on the device, the host reading the outcome one step
+later the way the pipeline reads a deferred sample), which touches the
+proposer's bookkeeping end to end; it is recorded as the next lever after
+the small-M kernel (M9c) rather than done here.
+
+## M9e: the load regime (M5 Max, `e0de683`)
+
+The M9b benches left a floor of 2.5% to 4.3% at four to sixteen clients
+under the asynchronous scheduler: the planner declined to draft on nearly
+every step (a K=7 step costs 2.8x to 3.8x a decode at eight to sixteen
+requests on this machine, cost-04), yet the proposer still captured the
+target's features on every step and ingested them into every draft
+context, so the server paid for drafting it never did. The proposer now
+follows the load. When the planner would decline a batch of the step's
+size on 32 consecutive steps it lapses: it releases every context and its
+arena slot, answers the runner's capture query with no (the target forward
+runs exactly as it does for target-only serving), and spends each step on
+bookkeeping only; it primes new requests again after the planner would
+draft on 4 consecutive steps. The verdict is the planner's own
+(`AdaptivePlanner.decide` with every draftable decode request at its full
+cap and prior expectations), so it follows the request count and context
+rather than the contexts a lapse released. A request that ran through a
+lapse keeps target-only generation for its lifetime, as one that arrived
+while the slots were full always did; the bypass mode lapses from the
+start and the fixed mode never lapses. `VLLM_METAL_DSPARK_LAPSE=0` keeps
+every context current at all loads, and the counters record entries,
+exits and lapsed steps.
+
+### Evidence
+
+Every server of `results/m5max-m9e-lapse-01` ran the adaptive mode with the
+cost-04 table under the asynchronous scheduler.
+
+- Serving gates with the lapse on: adaptive (`serving-adaptive`, 01:22) and
+  bypass with `--expect-no-drafts` (`serving-bypass`, 01:28) pass, every
+  scenario equal or a tie against target-only, zero failures; the bypass
+  server captures no feature and keeps no context from its first step.
+- Adaptive bench at four, eight and sixteen clients, the lapse on against
+  off (`VLLM_METAL_DSPARK_LAPSE=0`), each five paired repetitions against
+  the asynchronous target-only server, back to back (00:30 and 00:45, no
+  pair discarded except two and four in two 128x512 cells):
+
+| Bucket | C | Lapse on | Lapse off |
+| --- | --- | --- | --- |
+| 128x128 | 4 | +5.5% [-15.2, +9.8] | -5.5% [-34, +5] |
+| 128x128 | 8 | -0.8% [-3.8, +7.8] | -4.2% [-7, +5] |
+| 128x128 | 16 | -1.8% [-10.7, +10.4] | -7.7% [-24, +16] |
+| 1024x128 | 4 | -3.4% [-17.0, +2.6] | -4.0% [-18, +2] |
+| 1024x128 | 8 | -14.5% [-20.2, +14.0] | -2.4% [-13, +0] |
+| 1024x128 | 16 | -12.4% [-15.8, +1.7] | -11.6% [-17, -1] |
+| 128x512 | 4 | +1.2% [-13.4, +9.6] | -9.5% [-18, +14] |
+| 128x512 | 8 | -1.8% [-13.5, +18.2] | +4.7% [-7, +7] |
+| 128x512 | 16 | +0.7% [-8.9, +8.2] | -4.0% [-8, +4] |
+
+  The lapse is better or equal in seven of nine cells and the floor on the
+  short prompts moves from -4.2/-7.7 to -0.8/-1.8 at eight and sixteen
+  clients. The 1024x128 cell at eight clients was the first exit rule's
+  fault: the server log shows eleven lapse entries and ten exits in fifteen
+  minutes at eight requests, because the planner's verdict for a batch of
+  that size flips between arrivals near its threshold and every exit primed
+  every new 1,024-token prompt through the drafter for nothing. The regime
+  now leaves only on a real drop in load (fewer requests than the lapse began
+  with) with the verdict to draft on eight consecutive steps; the bench repeated with that rule
+  (`bench-adaptive-lapse2`, 01:19, one lapse entry at four requests and no
+  exit for the run): 128x128 +0.9% / +0.2% / +1.1% at four, eight and
+  sixteen clients, 128x512 +2.9% / +3.1% / -0.5%, 1024x128 -4.7% / -13.4%
+  [-17, +10] / -12.3% [-19, +7]. Against the run without the lapse that is
+  better or equal in eight of nine cells, with the bypass floor on the
+  short and the long-output prompts now within 3 points of target-only in
+  either direction. The long-prompt cell at eight clients keeps its median
+  11 points below the no-lapse run in both lapse runs, from repetitions
+  that alternate with the pair order (candidate first 212-219, reference
+  first 177-193 tokens per second, first-token time 1.5 against 2.2-2.4 s)
+  where the no-lapse run's did not; the lapse does no per-step work there,
+  so the mechanism is the two servers' shared memory and cache state under
+  eight concurrent 1,024-token prefills rather than the regime, and it is
+  recorded as open with the stall below.
+- Both the 1024x128 candidates at eight and sixteen clients show a p95
+  inter-token gap near 125 ms with and without the lapse (the M9b run too),
+  against about 20 ms for target-only: a stall of the asynchronous adaptive
+  server on long prompts at high load that is not the lapse's and is
+  recorded as open.
+- Soak, adaptive mode, eight clients, ten minutes, the lapse on: PASS (`soak-adaptive-2`, `--expect-no-drafts`): 1,507 requests (1,394 completed, 113 cancelled at the deadline), zero errors, 184.7 output tokens per second, end-to-end p50/p95 1.69/11.30 s, first token p95 0.31 s, resident set flat (4.45 GB peak, 4.43 GB at the end), one lapse entry at eight clients and one exit as the load drained. (A first run of the same soak read the same numbers, 1,507 requests and zero errors, and failed only the tool's draft-work criteria, which are the fixed mode's; `--expect-no-drafts` is the tool's new switch for a load the planner declines.)

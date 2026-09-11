@@ -152,12 +152,19 @@ def full_capacity_probe(proposer) -> dict:
     import mlx.core as mx
     from vllm import SamplingParams
 
+    from vllm_metal.v1.dspark.model import ArenaCache
     from vllm_metal.v1.dspark_proposer import _DraftPlan, _RequestContext
     from vllm_metal.v1.model_runner import RequestState
 
     plan = proposer.memory_plan
     plans = []
+    # Every reserved slot at full capacity, drafted in one batch.
+    if proposer._arena[0].free_slots != plan.max_contexts:
+        raise RuntimeError("the capacity probe needs every context slot free")
     for index in range(plan.max_contexts):
+        slot = proposer._arena[0].acquire()
+        for layer in proposer._arena[1:]:
+            assert layer.acquire() == slot
         record = _RequestContext(
             owner=RequestState(
                 token_ids=[1] * (plan.max_context_tokens + 1),
@@ -165,7 +172,7 @@ def full_capacity_probe(proposer) -> dict:
                 cache=[],
                 sampling_params=SamplingParams(temperature=0.0),
             ),
-            caches=proposer._drafter.make_ctx_cache(plan.max_context_tokens),
+            caches=[ArenaCache(layer, slot) for layer in proposer._arena],
             covered_end=plan.max_context_tokens,
         )
         width = proposer._config.hidden_size * len(proposer.capture_layer_ids)
@@ -178,7 +185,7 @@ def full_capacity_probe(proposer) -> dict:
         plans.append(_DraftPlan(str(index), 1, record, proposer._block_size))
     allocated = sum(c.allocated_bytes for row in plans for c in row.context.caches)
     assert allocated == plan.context_bytes
-    _, tokens = proposer._batch_draft(plans)
+    _, tokens, _ = proposer._batch_draft(plans)
     assert len(tokens) == plan.max_contexts
     assert all(len(row) == proposer._block_size for row in tokens)
     mx.synchronize()

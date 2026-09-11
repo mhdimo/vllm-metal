@@ -245,7 +245,7 @@ class _PagedAttentionPlan:
             parts.append(self._hybrid_gdn_detail())
         if self.dspark_reservation_bytes:
             parts.append(
-                f"dspark_context_and_workspace={self.dspark_reservation_bytes / 1e9:.2f}GB"
+                f"dspark_capture_and_workspace={self.dspark_reservation_bytes / 1e9:.2f}GB"
             )
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
@@ -1323,7 +1323,9 @@ class WorkerCachePlanner:
                 raise RuntimeError(
                     "DSpark must be loaded and budgeted before target KV allocation"
                 )
-            dspark_bytes = dspark.reserve_bytes
+            # The context arena is already allocated (measured model memory);
+            # reserve the capture staging and the per-step workspace.
+            dspark_bytes = dspark.planning_reserve_bytes
         kv_budget = (
             base_kv_budget
             - reservation.total_bytes

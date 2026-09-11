@@ -146,6 +146,234 @@ class CtxCache:
         return self._length
 
 
+class ContextArena:
+    """One shared per-layer K/V buffer for every draft context slot.
+
+    ``keys``/``values`` are ``[slots, kv_heads, capacity + block_size,
+    head_dim]``: the first ``capacity`` positions of a slot hold the request's
+    committed context, the last ``block_size`` positions are scratch for the
+    drafted block's own keys and values, written every drafting step right
+    after the context (at ``[length, length + block_size)``) and never
+    exposed as context. Batched drafting attends every row to a strided view
+    of its own slot (:meth:`ArenaBatch.attend`), so no per-request padding,
+    gather or mask is built on the drafting step.
+    """
+
+    def __init__(
+        self,
+        *,
+        slots: int,
+        kv_heads: int,
+        capacity: int,
+        block_size: int,
+        head_dim: int,
+        dtype,
+    ) -> None:
+        if slots <= 0 or capacity <= 0 or block_size <= 0:
+            raise ValueError("ContextArena needs positive slots, capacity and block")
+        self.slots = slots
+        self.capacity = capacity
+        self.block_size = block_size
+        shape = (slots, kv_heads, capacity + block_size, head_dim)
+        self.keys = mx.zeros(shape, dtype=dtype)
+        self.values = mx.zeros(shape, dtype=dtype)
+        self._free = list(range(slots - 1, -1, -1))
+
+    @property
+    def nbytes(self) -> int:
+        return self.keys.nbytes + self.values.nbytes
+
+    @property
+    def free_slots(self) -> int:
+        return len(self._free)
+
+    def acquire(self) -> int:
+        if not self._free:
+            raise RuntimeError("no free DSpark context slot")
+        return self._free.pop()
+
+    def release(self, slot: int) -> None:
+        if slot in self._free or not 0 <= slot < self.slots:
+            raise ValueError("releasing a slot that is not held")
+        self._free.append(slot)
+
+    def write_spans(
+        self,
+        slots: list[int],
+        offsets: list[int],
+        counts: list[int],
+        k: mx.array,
+        v: mx.array,
+    ) -> None:
+        """Write several requests' new context K/V with one scatter per tensor.
+
+        ``k``/``v`` are ``[rows, kv_heads, width, head_dim]``; row ``r`` lands
+        at positions ``[offsets[r], offsets[r] + width)`` of ``slots[r]`` with
+        its natural positions. Only the first ``counts[r]`` columns are the
+        row's committed context; the padding columns of shorter spans carry
+        finite values that sit past the row's length, where the next append
+        or block write overwrites them and no reader looks before then.
+        """
+        rows = k.shape[0]
+        width = k.shape[2]
+        if (
+            v.shape != k.shape
+            or len(slots) != rows
+            or len(offsets) != rows
+            or len(counts) != rows
+            or rows == 0
+            or width == 0
+        ):
+            raise ValueError("context spans need matching rows, slots and offsets")
+        if k.shape[1] != self.keys.shape[1] or k.shape[-1] != self.keys.shape[-1]:
+            raise ValueError("DSpark context append changes geometry or dtype")
+        for offset, count in zip(offsets, counts, strict=True):
+            if not 1 <= count <= width or offset < 0 or offset + count > self.capacity:
+                raise ValueError("DSpark context span exceeds reserved capacity")
+            if offset + width > self.capacity + self.block_size:
+                raise ValueError("DSpark context span padding exceeds the arena")
+        row_index = mx.array(slots, dtype=mx.int32)[:, None]
+        columns = (
+            mx.array(offsets, dtype=mx.int32)[:, None]
+            + mx.arange(width, dtype=mx.int32)[None, :]
+        )
+        # Advanced indices on axes 0 and 2 land first in the result, so the
+        # tensors are stored as [rows, width, heads, dim].
+        self.keys[row_index, :, columns] = k.transpose(0, 2, 1, 3).astype(
+            self.keys.dtype
+        )
+        self.values[row_index, :, columns] = v.transpose(0, 2, 1, 3).astype(
+            self.values.dtype
+        )
+
+
+class ArenaCache(CtxCache):
+    """A :class:`CtxCache` backed by one slot of a :class:`ContextArena`."""
+
+    __slots__ = ("arena", "slot")
+
+    def __init__(self, arena: ContextArena, slot: int) -> None:
+        self.arena = arena
+        self.slot = slot
+        self._keys = None
+        self._values = None
+        self._length = 0
+        self.capacity = arena.capacity
+
+    @property
+    def k(self):
+        return (
+            None
+            if self._length == 0
+            else self.arena.keys[self.slot : self.slot + 1, :, : self._length]
+        )
+
+    @property
+    def v(self):
+        return (
+            None
+            if self._length == 0
+            else self.arena.values[self.slot : self.slot + 1, :, : self._length]
+        )
+
+    @property
+    def allocated_bytes(self) -> int:
+        return self.arena.nbytes // self.arena.slots
+
+    def append(self, k: mx.array, v: mx.array) -> None:
+        if k.ndim != 4 or v.ndim != 4 or k.shape[:3] != v.shape[:3] or k.shape[0] != 1:
+            raise ValueError(
+                "context K/V must cover matching batch, head and token axes"
+            )
+        start = self._length
+        end = start + k.shape[2]
+        if end > self.arena.capacity:
+            raise ValueError("DSpark context append exceeds reserved capacity")
+        if (
+            k.shape[1] != self.arena.keys.shape[1]
+            or k.shape[-1] != self.arena.keys.shape[-1]
+        ):
+            raise ValueError("DSpark context append changes geometry or dtype")
+        if end > start:
+            self.arena.keys[self.slot, :, start:end] = k[0].astype(
+                self.arena.keys.dtype
+            )
+            self.arena.values[self.slot, :, start:end] = v[0].astype(
+                self.arena.values.dtype
+            )
+        self._length = end
+
+    def trim_to(self, length: int) -> None:
+        if not 0 <= length <= self._length:
+            raise ValueError("context trim must retain an existing prefix")
+        self._length = length
+
+    def extend_to(self, length: int) -> None:
+        """Account for positions the arena wrote through :meth:`ContextArena.write_spans`."""
+        if not self._length <= length <= self.arena.capacity:
+            raise ValueError("context extension must stay within reserved capacity")
+        self._length = length
+
+    @property
+    def length(self) -> int:
+        return self._length
+
+
+class ArenaBatch:
+    """The rows of one drafting batch inside a :class:`ContextArena` (one layer)."""
+
+    __slots__ = ("arena", "slots", "lengths", "_slot_index", "_offsets")
+
+    def __init__(
+        self, arena: ContextArena, slots: list[int], lengths: list[int]
+    ) -> None:
+        if len(slots) != len(lengths) or not slots:
+            raise ValueError("an arena batch needs one length per slot")
+        if any(length + arena.block_size > arena.keys.shape[2] for length in lengths):
+            raise ValueError("an arena batch row exceeds its slot")
+        self.arena = arena
+        self.slots = slots
+        self.lengths = lengths
+        self._slot_index = mx.array(slots, dtype=mx.int32)
+        self._offsets = mx.array(lengths, dtype=mx.int32)
+
+    def write_block(self, k_blk: mx.array, v_blk: mx.array) -> None:
+        """Place each row's block K/V right after its context (scratch positions)."""
+        block = k_blk.shape[2]
+        rows = self._slot_index[:, None]
+        cols = self._offsets[:, None] + mx.arange(block, dtype=mx.int32)[None, :]
+        # Advanced indices on axes 0 and 2 land first in the result, so the
+        # block tensors are stored as [rows, block, heads, dim].
+        self.arena.keys[rows, :, cols] = k_blk.transpose(0, 2, 1, 3).astype(
+            self.arena.keys.dtype
+        )
+        self.arena.values[rows, :, cols] = v_blk.transpose(0, 2, 1, 3).astype(
+            self.arena.values.dtype
+        )
+
+    def attend(self, q: mx.array, scale: float) -> mx.array:
+        """Attend each block row to exactly its own context and block.
+
+        ``q`` is ``[rows, heads, block, head_dim]``. Every row reads a strided
+        view of its slot (positions ``[0, length + block)``) straight from the
+        arena: no gather, no padding and no mask, so a batch costs the sum of
+        its rows and short contexts never pay for the longest one.
+        """
+        block = self.arena.block_size
+        outputs = [
+            mx.fast.scaled_dot_product_attention(
+                q[row : row + 1],
+                self.arena.keys[slot : slot + 1, :, : length + block],
+                self.arena.values[slot : slot + 1, :, : length + block],
+                scale=scale,
+            )
+            for row, (slot, length) in enumerate(
+                zip(self.slots, self.lengths, strict=True)
+            )
+        ]
+        return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=0)
+
+
 class DSparkAttention(nn.Module):
     """Cross-attention: Q from the draft block, K/V from [target_context, block]."""
 
@@ -208,11 +436,26 @@ class DSparkAttention(nn.Module):
         k, v = self._kv(fused_new)
         cache.append(self.rope(k, offset=ctx_offset), v)  # V is not roped
 
+    def update_ctx_spans(
+        self,
+        fused_rows: mx.array,
+        arena: ContextArena,
+        slots: list[int],
+        offsets: list[int],
+        counts: list[int],
+    ) -> None:
+        """Batched :meth:`update_ctx`: ``fused_rows`` is ``[rows, width, hidden]``."""
+        k, v = self._kv(fused_rows)
+        # One RoPE launch with a per-row start position.
+        k = self.rope(k, offset=mx.array(offsets, dtype=mx.int32))
+        arena.write_spans(slots, offsets, counts, k, v)  # V is not roped
+
     def attend(self, hidden: mx.array, block_offset, cache, mask=None) -> mx.array:
         """``block_offset`` may be an int (single sequence) or a per-row ``[B]`` array (batched
-        drafting — rows sit at different context lengths). ``mask`` is None for the single-seq
-        path (block attends the whole context + all block positions) or a ``[B, 1, k, Lctx+k]``
-        boolean mask that hides each row's context padding when ``cache.k/v`` are a batched buffer."""
+        drafting — rows sit at different context lengths). The block attends the whole context
+        plus all block positions. An :class:`ArenaBatch` cache serves every row from its own
+        slot; a plain cache with a batched ``k/v`` buffer takes a ``[B, 1, k, Lctx+k]`` boolean
+        ``mask`` that hides each row's context padding."""
         batch_size, q_len, _ = hidden.shape
         q = self.q_proj(hidden).reshape(batch_size, q_len, self.n_heads, -1)
         gate = None
@@ -223,12 +466,20 @@ class DSparkAttention(nn.Module):
 
         k_blk, v_blk = self._kv(hidden)
         k_blk = self.rope(k_blk, offset=block_offset)
-        k = mx.concatenate([cache.k, k_blk], axis=2)
-        v = mx.concatenate([cache.v, v_blk], axis=2)
-
-        # SDPA broadcasts GQA/MQA heads internally; keep K/V at their native
-        # head count instead of copying the whole context to every query head.
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
+        if isinstance(cache, ArenaBatch):
+            # Block keys go to the scratch positions after each row's context
+            # (see ContextArena); every row then attends to its own slot.
+            cache.write_block(k_blk, v_blk)
+            out = cache.attend(q, self.scale)
+        else:
+            k = mx.concatenate([cache.k, k_blk], axis=2)
+            v = mx.concatenate([cache.v, v_blk], axis=2)
+            # SDPA broadcasts GQA/MQA heads internally; keep K/V at their
+            # native head count instead of copying the whole context to
+            # every query head.
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(batch_size, q_len, -1)
         if gate is not None:
             out = out * mx.sigmoid(gate)
@@ -400,6 +651,40 @@ class DSparkDrafter(nn.Module):
         )
         for layer, cache in zip(self.layers, ctx_caches, strict=True):
             layer.self_attn.update_ctx(fused, ctx_offset, cache)
+
+    def update_context_spans(
+        self,
+        target_hidden_cat: mx.array,
+        spans: list[tuple[int, int, int, int]],
+        arenas: list[ContextArena],
+    ) -> None:
+        """Ingest several requests' new features with one pass per layer.
+
+        ``spans`` are ``(start_row, ctx_offset, count, slot)``: rows
+        ``[start_row, start_row + count)`` of the packed ``target_hidden_cat``
+        become context positions ``[ctx_offset, ctx_offset + count)`` of
+        ``slot`` in every layer's arena. Spans are padded to the longest one
+        by repeating their last feature row; see
+        :meth:`ContextArena.write_spans` for where the padding lands.
+        """
+        if not spans:
+            return
+        width = max(count for _, _, count, _ in spans)
+        index = mx.array(
+            [
+                [start + min(column, count - 1) for column in range(width)]
+                for start, _, count, _ in spans
+            ],
+            dtype=mx.int32,
+        )
+        fused = self.fuse_target(
+            target_hidden_cat[index].astype(self.hidden_norm.weight.dtype)
+        )
+        offsets = [offset for _, offset, _, _ in spans]
+        counts = [count for _, _, count, _ in spans]
+        slots = [slot for _, _, _, slot in spans]
+        for layer, arena in zip(self.layers, arenas, strict=True):
+            layer.self_attn.update_ctx_spans(fused, arena, slots, offsets, counts)
 
     def backbone(
         self, noise_embedding, block_offset, ctx_caches, mask=None

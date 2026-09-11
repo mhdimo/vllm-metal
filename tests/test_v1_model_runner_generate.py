@@ -107,6 +107,77 @@ def test_gemma4_mtp_config_installs_gemma4_proposer() -> None:
     assert isinstance(runner._drafter, Gemma4MTPProposer)
 
 
+class TestAsyncSchedulingRetainedDrafts:
+    """Under asynchronous scheduling the runner fills the scheduler's slots."""
+
+    def _output(self, req_ids: list[str], slots: int) -> SchedulerOutput:
+        cached = CachedRequestData(
+            req_ids=list(req_ids),
+            resumed_req_ids=set(),
+            new_token_ids=[[] for _ in req_ids],
+            all_token_ids={},
+            new_block_ids=[None for _ in req_ids],
+            num_computed_tokens=[1 for _ in req_ids],
+            num_output_tokens=[1 for _ in req_ids],
+        )
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached,
+            num_scheduled_tokens=dict.fromkeys(req_ids, 1 + slots),
+            total_num_scheduled_tokens=(1 + slots) * len(req_ids),
+            scheduled_spec_decode_tokens={req_id: [-1] * slots for req_id in req_ids},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens=None,
+            num_spec_tokens_to_schedule=slots,
+        )
+
+    def test_retained_drafts_are_resolved_once_and_spent(self) -> None:
+        runner = make_stub_runner()
+        runner.use_async_scheduling = True
+        runner._draft_token_ids = DraftTokenIds(
+            req_ids=["r0", "r1"], draft_token_ids=[[4, 5], []]
+        )
+        runner._retain_drafts()
+        assert runner._retained_drafts == {"r0": [4, 5]}
+        output = self._output(["r0", "r1"], slots=3)
+        assert runner._active_spec_tokens(output) == {"r0": (4, 5)}
+        assert output.num_invalid_spec_tokens == {"r0": 1, "r1": 3}
+        # Spent by the step that scheduled the request; the same step resolves
+        # to the same answer without touching the retained drafts again.
+        assert runner._retained_drafts == {}
+        assert runner._active_spec_tokens(output) == {"r0": (4, 5)}
+        # The next step has nothing to verify.
+        following = self._output(["r0", "r1"], slots=3)
+        assert runner._active_spec_tokens(following) == {}
+        assert following.num_invalid_spec_tokens == {"r0": 3, "r1": 3}
+
+    def test_synchronous_scheduling_keeps_the_scheduler_handoff(self) -> None:
+        runner = make_stub_runner()
+        runner.use_async_scheduling = False
+        runner._draft_token_ids = DraftTokenIds(req_ids=["r0"], draft_token_ids=[[4]])
+        runner._retain_drafts()
+        assert runner._retained_drafts == {}
+        output = self._output(["r0"], slots=2)
+        # Placeholder padding from the synchronous scheduler carries no drafts.
+        assert runner._active_spec_tokens(output) == {}
+        assert output.num_invalid_spec_tokens is None
+
+    def test_lifecycle_release_drops_retained_drafts(self) -> None:
+        runner = make_stub_runner()
+        runner.use_async_scheduling = True
+        runner._retained_drafts = {"r0": [4], "r1": [5]}
+        runner._reconcile_request_lifecycle(
+            evicted_req_ids={"r0"},
+            preempted_req_ids=set(),
+            resumed_req_ids=set(),
+            materialize_runtime_state=False,
+        )
+        assert runner._retained_drafts == {"r1": [5]}
+
+
 class TestDrafterReleaseOnLifecycle:
     def test_reconcile_releases_drafter_state_for_invalidated_requests(self) -> None:
         released: list[set[str]] = []
@@ -2714,6 +2785,51 @@ class TestPipelineGateSpecDecodeDerivation:
         assert decision.eligible is False
         assert decision.reason == "speculative decode"
 
+    def test_deferred_capable_drafter_gates_per_step(self) -> None:
+        # A drafter that can consume a deferred step (the DSpark seam) keeps
+        # the pipeline unless it would draft at the end of this step.
+        class Drafter:
+            def __init__(self, allowed: bool) -> None:
+                self.allowed = allowed
+                self.calls: list = []
+
+            def deferred_step_allowed(self, decode_reqs, num_speculative_tokens):
+                self.calls.append((list(decode_reqs), num_speculative_tokens))
+                return self.allowed
+
+            def ingest_deferred_step(self, ctx):
+                pytest.fail("the gate must not ingest")
+
+        runner = self._runner(drafter=Drafter(allowed=True))
+        scheduler_output = self._cached_decode_output("r0")
+        runner._request_states = {
+            "r0": mr.RequestState(
+                token_ids=[1, 7],
+                prompt_len=1,
+                cache=[],
+                sampling_params=SamplingParams(temperature=0.0),
+                generator=None,
+                generated_tokens=1,
+            )
+        }
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+        assert decision.eligible is True and decision.reason == "eligible"
+        ((decode_reqs, k),) = runner._drafter.calls
+        assert [req_id for req_id, _ in decode_reqs] == ["r0"] and k == 0
+
+        runner._drafter = Drafter(allowed=False)
+        decision = runner._evaluate_pipeline_gate(scheduler_output)
+        assert decision.eligible is False
+        assert decision.reason == "drafter may draft"
+
+        # Scheduled draft tokens still block the step before the drafter is asked.
+        runner._drafter = Drafter(allowed=True)
+        decision = runner._evaluate_pipeline_gate(
+            self._scheduler_output({"r0": [7, 9]})
+        )
+        assert decision.eligible is False
+        assert decision.reason == "speculative decode"
+
     def test_active_spec_tokens_disable_pipeline_without_drafter(self) -> None:
         # Arrange — scheduler-driven drafts (e.g. ngram) with no drafter
         runner = self._runner(drafter=None)
@@ -2882,6 +2998,57 @@ class TestDeferredDecodeSampleThreading:
         assert state.token_ids[-1] == mr.PENDING_TOKEN_PLACEHOLDER
         assert state.generated_tokens == 2
         assert runner._paged_request_seq_lens["r0"] == 2
+
+    def test_submit_hands_the_step_to_a_deferred_capable_drafter(self) -> None:
+        # Arrange — the drafter receives this step's features and segments
+        # after the placeholder was appended (its rows end at the anchor).
+        class Drafter:
+            def __init__(self) -> None:
+                self.contexts: list = []
+
+            def deferred_step_allowed(self, decode_reqs, num_speculative_tokens):
+                return True
+
+            def ingest_deferred_step(self, ctx):
+                self.contexts.append(ctx)
+                assert self.owner.token_ids[-1] == mr.PENDING_TOKEN_PLACEHOLDER
+
+        runner = make_stub_runner()
+        drafter = Drafter()
+        runner._drafter = drafter
+        state = self._decode_state("r0")
+        drafter.owner = state
+        runner._paged_request_seq_lens = {"r0": 1}
+        segment = mr.PagedDecodeSegment(
+            req_id="r0",
+            input_token_ids=(state.token_ids[-1],),
+            start_row=0,
+            num_query_tokens=1,
+            draft_token_ids=(),
+            cache_start_pos=1,
+            block_ids=((0,),),
+        )
+        features = mx.zeros((1, 8))
+        runner._execute_model_state = self._paged_state(
+            runner, [("r0", state)]
+        )._replace(decode_segments=(segment,), target_hidden_states=features)
+        runner._decode_pipeline.begin_step(
+            mr.PipelineGateDecision(eligible=True, reason="eligible")
+        )
+
+        # Act
+        output = runner._submit_deferred_decode_sample()
+
+        # Assert — one context, decode-only, no token values, the step's
+        # features and boundaries, and the sample still resolves.
+        (ctx,) = drafter.contexts
+        assert ctx.target_hidden_states is features
+        assert ctx.decode_segments == (segment,)
+        assert [req_id for req_id, _ in ctx.decode_reqs] == ["r0"]
+        assert list(ctx.decode_token_ids) == [()]
+        assert ctx.prefill_reqs == [] and ctx.num_decode_segments == 1
+        assert list(ctx.cu_seqlens) == [0, 1]
+        assert output.get_output().sampled_token_ids == [[1]]
 
     def test_resolve_backfills_the_submitted_token(self) -> None:
         # Arrange

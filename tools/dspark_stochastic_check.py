@@ -130,7 +130,7 @@ def worker(config: dict, output: Path) -> None:
         max_num_batched_tokens=config["max_num_batched_tokens"],
         enable_chunked_prefill=True,
         enable_prefix_caching=False,
-        async_scheduling=False,
+        async_scheduling=bool(config.get("async_scheduling", False)),
         disable_log_stats=True,
         seed=0,
         speculative_config=(
@@ -484,6 +484,11 @@ def main() -> None:
     parser.add_argument("--min-count", type=int, default=10)
     parser.add_argument("--alpha", type=float, default=0.001)
     parser.add_argument("--max-num-seqs", type=int, default=64)
+    parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="run every engine with async scheduling (DSpark supports it since M9b)",
+    )
     parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--memory-fraction", default="0.22")
     parser.add_argument(
@@ -528,6 +533,7 @@ def main() -> None:
             "prompt_index": args.prompt_index,
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": args.max_num_batched_tokens,
+            "async_scheduling": args.async_scheduling,
         }
         if name == "k0":
             config["compare_to"] = str(results[f"k{args.width}"])

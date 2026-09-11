@@ -180,7 +180,11 @@ width for every eligible request, and `bypass` keeps the drafter loaded but
 never drafts. The artifacts come from
 `tools/dspark_confidence_calibrate.py` and `tools/dspark_cost_profile.py`;
 startup fails with the reason when either is missing or belongs to another
-pair.
+pair. `VLLM_METAL_DSPARK_DRAFT_PRECISION=source` keeps the drafter in the
+checkpoint's own precision instead of the qualified affine 4-bit conversion
+(more memory, a different cost profile; re-profile the cost model for it);
+`tools/dspark_acceptance_eval.py` measures the accepted length per drafting
+round on the DeepSpec evaluation prompt sets for either setting.
 
 Fixed-K performance on M5 Max with the 4B pair (see the progress record for
 the protocol and every cell): at one request, `num_speculative_tokens` 2-4
@@ -212,8 +216,17 @@ trajectory and the spec-decode counters.
   token from the target distribution, all from the request's own random
   streams (seeded requests reproduce). The emitted distribution equals the
   target's; the tokens at a given seed differ from target-only serving.
-- **Batched drafting.** The backbone runs across selected requests with padded
-  per-request contexts. Memory is reserved for up to
+- **Load regime.** When the calibrated planner declines to draft for 32
+  consecutive steps (the batch is too large for verification to pay on
+  this machine), the proposer lapses: no target feature is captured, no
+  context is kept, and the server runs at target-only cost; it primes new
+  requests again once the load has dropped below the count it lapsed at and
+  the planner would draft, on 8 consecutive steps.
+  The bypass mode lapses from the start (`VLLM_METAL_DSPARK_LAPSE`).
+- **Batched drafting.** The backbone runs across selected requests, each row
+  attending to its own slot of a per-layer context arena (no padding, gather or
+  mask), and a step's accepted rows are ingested in one batched pass per layer.
+  Memory is reserved for up to
   `min(max_num_seqs, VLLM_METAL_DSPARK_MAX_CONTEXTS)` complete contexts
   (default 32); a request scheduled while every slot is held uses target-only
   generation, and slots are reused as requests finish.
@@ -222,6 +235,20 @@ trajectory and the spec-decode counters.
 - **Contiguous context.** Every prefill chunk contributes features, including
   no-sample steps. Missing features on a target prefix-cache hit use target-only
   generation; the proposer does not replay full prompts or share private KV.
+- **Decode pipeline on non-drafting steps.** The proposer can consume a
+  pure-decode step whose sampling sync the runner's one-step-ahead pipeline
+  defers (the `bypass` mode, or the `adaptive` planner's bypass decision for
+  the batch), ingesting that step's target features without the sampled
+  token values; drafting and verification steps stay synchronous. The
+  pipeline requires asynchronous scheduling, which DSpark servers run by
+  default (below); `--no-async-scheduling` keeps every step synchronous.
+- **Asynchronous scheduling.** A DSpark server runs vLLM's asynchronous
+  scheduler (the production default for target-only serving): the scheduler
+  books `num_speculative_tokens` placeholder slots per running request and
+  the runner fills them with the drafts it produced at the end of the
+  request's previous step, reporting unused slots so the speculative-decode
+  metrics count real drafts. The other Metal speculative methods still force
+  synchronous scheduling.
 
 ### Limitations
 
@@ -229,9 +256,11 @@ trajectory and the spec-decode counters.
   similar model name or tensor shape.
 - **Incomplete DSpark features.** Calibrated confidence scheduling and
   production serving qualification remain roadmap work.
-- **Bounded context and workspace.** The planner subtracts the draft context,
-  capture and execution reservation before sizing target KV. Context buffers
-  grow in reusable chunks up to the planned model length. Insufficient startup
+- **Bounded context and workspace.** The context arena is allocated once at
+  load (every slot holds the planned model length plus the block's scratch
+  positions) and is then part of the measured model memory; the target KV
+  planner subtracts the capture staging and the per-step workspace that
+  remain. Insufficient startup
   capacity fails explicitly; request admission and recoverable draft allocation
   failures fall back to the target. Lower context, sequence and batch-token
   limits to reduce the reservation. The earlier `0.12` memory-fraction example

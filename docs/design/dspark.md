@@ -104,8 +104,8 @@ release wiring; the older `Dspark-implement` branch is not the integration base.
 | `v1/model_lifecycle.py`, `v1/model_runner.py::install_drafter` | Target loading; draft factory | Resolve and validate the model pair and reserve draft resources before target cache allocation. |
 | `v1/dspark/{config,loader,model}.py` | Checkpoint parsing, quantization, MLX draft backbone, context K/V, heads | Strict architecture/precision validation, revision-aware loading, provenance, reference parity; make the confidence path usable. |
 | `v1/hidden_state_tap.py`, `v1/model_adapter.py` | Selected residual capture and target logits | Preserve the model's forward semantics and selective logits layout. Avoid a generic hand-written layer loop for unqualified architectures. |
-| `v1/dspark_proposer.py` | Context ingestion, prompt replay, padded batched drafting, fixed cap | Exact position coverage, bounded storage/replay, per-row caps, fair admission, explicit proposal records. |
-| `v1/spec_decode.py` | Eligibility, packed verify segments and greedy verification | Retain one target verification owner; add probability-aware verification here or a helper it owns. |
+| `v1/dspark_proposer.py` | Context ingestion, prompt replay, padded batched drafting (an arena with per-row attention since M9), fixed cap, the load regime that lapses capture and contexts while the planner declines (M9e) | Exact position coverage, bounded storage/replay, per-row caps, fair admission, explicit proposal records. |
+| `v1/spec_decode.py` | Eligibility, packed verify segments and greedy verification; since M9b the asynchronous scheduler's placeholder slots are resolved from the runner's retained drafts here | Retain one target verification owner; add probability-aware verification here or a helper it owns. |
 | `v1/cache_policy.py`, `v1/worker.py` | Physical/scheduler cache planning | Account for DSpark weights, context, workspace and lookahead; coordinate admission and eviction. |
 | `v1/model_runner.py::_reconcile_request_lifecycle` | Finish, preemption and resume invalidation | Preserve existing `release_requests` calls; extend cleanup to future probability, calibration-history and workspace state. |
 
@@ -273,11 +273,14 @@ from zero through gamma, further limited by the scheduler, remaining output
 budget, context limit, and available memory. Reserve a correction/bonus slot for
 continuing verification. Use each row's own cap; do not read only `plans[0].cap`.
 
-The current padded mask correctly allows each row's valid context and every
-block position when physical lengths and offsets agree. Preserve that behavior.
-Use per-request absolute RoPE offsets, mask all padding, and retain GQA/MQA K/V
-head counts without tiling them to query-head counts. Prove batched execution
-against independent rows, including unequal context lengths and request order.
+Each row must see exactly its own valid context and every block position when
+physical lengths and offsets agree. Since M9 the batched path attends every
+row to a strided view of its slot in the per-layer context arena (no padding
+and no mask); a padded buffer with a mask that hides the padding is the
+equivalent fallback. Use per-request absolute RoPE offsets and retain GQA/MQA
+K/V head counts without tiling them to query-head counts. Prove batched
+execution against independent rows, including unequal context lengths and
+request order.
 
 Budget the following before deciding target cache capacity:
 
@@ -291,9 +294,10 @@ For full-attention standalone context, per-token K/V bytes are
 sum_over_layers(Hkv * (Dk + Dv) * bytes_per_element). For the official Qwen3
 drafts with five layers, eight KV heads, 128-dimensional K/V and two-byte values,
 this is 20 KiB/token: an 8,192-token context is 160 MiB/request. Thirty-two such
-requests require 5 GiB just for persistent context. The prototype can create
-another similarly sized padded batch copy, before other temporaries. These are
-analytical storage estimates, not measured peak-memory results.
+requests require 5 GiB just for persistent context. The prototype created
+another similarly sized padded batch copy before other temporaries; the M9
+arena attends rows in place and copies nothing. These are analytical storage
+estimates, not measured peak-memory results.
 
 Load/materialize the drafter or conservatively reserve its measured peak before
 target KV allocation. Prefer reusing the existing cache planner, but do not
@@ -306,16 +310,18 @@ epochs, rather than relying solely on target token hashes.
 
 M3 implements the bounded reservation in `DSparkMemoryPlan`: the configured
 request slots/model length/step-token limit determine context, capture and
-workspace bytes using the actual draft dtype. Chunks of 256 tokens reuse storage
-within a hard context capacity. Startup and request admission fail explicitly or
+workspace bytes using the actual draft dtype. M9 turns the reservation into
+the per-layer context arena (`ContextArena`), allocated once at load with the
+block's scratch positions per slot. Startup and request admission fail explicitly or
 use target-only output as appropriate; recognized draft allocation failures
 release private context. The [M3 evidence](dspark-m3-validation.md) includes
 full-capacity storage, sustained drain/reuse, pressure and precision checks.
 
 Optimize in measured order: remove duplicate prefill work; avoid full-context
 copies and concatenation each step; reuse allocated buffers; group ragged work
-by length or implement paged cross-attention; then optimize sequential head and
-host synchronization. CPU scheduling is acceptable initially for small batches
+by length or implement paged cross-attention (M9: per-row attention on arena
+views and batched ingest); then optimize sequential head and host
+synchronization. CPU scheduling is acceptable initially for small batches
 if its full cost is measured. Add Metal kernels only after profiling identifies
 the bottleneck and a reference implementation defines the result.
 

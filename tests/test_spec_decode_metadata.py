@@ -204,6 +204,95 @@ class TestSpecDecodePolicy:
                 speculative_config=_gemma4_mtp_speculative_config(),
             )
 
+    def test_dspark_may_run_under_async_scheduling(self) -> None:
+        SpeculativeDecodeController().validate_supported(
+            _scheduler_output(scheduled_spec_decode_tokens={}),
+            (),
+            paged_attention_enabled=True,
+            is_hybrid=False,
+            use_async_scheduling=True,
+            speculative_config=SimpleNamespace(method="dspark"),
+        )
+        with pytest.raises(NotImplementedError, match="no-async-scheduling"):
+            SpeculativeDecodeController().validate_supported(
+                _scheduler_output(scheduled_spec_decode_tokens={}),
+                (),
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                use_async_scheduling=True,
+                speculative_config=SimpleNamespace(method="ngram"),
+            )
+
+    def test_retained_drafts_fill_placeholder_slots_and_report_unused(self) -> None:
+        output = _scheduler_output(
+            scheduled_spec_decode_tokens={
+                "a": [-1, -1, -1],
+                "b": [-1, -1, -1],
+                "c": [5, 6],
+            }
+        )
+        resolved, runner_invalid = (
+            SpeculativeDecodeController.substitute_retained_drafts(
+                output, {"a": [7, 8], "c": [9], "d": [1]}
+            )
+        )
+        # "a": two retained drafts in three slots; "b": none; "c": the
+        # synchronous handoff passes through; "d": not scheduled.
+        assert resolved == {"a": (7, 8), "c": (5, 6)}
+        assert runner_invalid == {"a": 1, "b": 3}
+        assert output.num_invalid_spec_tokens == {"a": 1, "b": 3}
+        # More retained drafts than slots are cut to the slots.
+        output = _scheduler_output(scheduled_spec_decode_tokens={"a": [-1, -1]})
+        resolved, runner_invalid = (
+            SpeculativeDecodeController.substitute_retained_drafts(
+                output, {"a": [7, 8, 9]}
+            )
+        )
+        assert resolved == {"a": (7, 8)} and runner_invalid == {}
+        assert output.num_invalid_spec_tokens is None
+        with pytest.raises(ValueError, match="real token ids"):
+            SpeculativeDecodeController.substitute_retained_drafts(
+                _scheduler_output(scheduled_spec_decode_tokens={"a": [-1]}),
+                {"a": [-1]},
+            )
+
+    def test_validate_supported_accepts_runner_resolved_slots(self) -> None:
+        controller = SpeculativeDecodeController()
+        output = _scheduler_output(
+            scheduled_spec_decode_tokens={"a": [-1, -1, -1], "b": [-1, -1, -1]}
+        )
+        resolved, runner_invalid = controller.substitute_retained_drafts(
+            output, {"a": [7, 8]}
+        )
+        # Fewer verified rows than scheduled slots is the runner's accounting.
+        controller.validate_supported(
+            output,
+            [("a", _request_state()), ("b", _request_state())],
+            paged_attention_enabled=True,
+            is_hybrid=False,
+            use_async_scheduling=True,
+            speculative_config=SimpleNamespace(method="dspark"),
+            resolved_spec_tokens=resolved,
+            runner_invalid_counts=runner_invalid,
+        )
+        # A scheduler-reported invalid count on another request still fails closed.
+        output.num_invalid_spec_tokens = {**output.num_invalid_spec_tokens, "c": 1}
+        with pytest.raises(NotImplementedError, match="scheduler-invalid"):
+            controller.validate_supported(
+                output,
+                [
+                    ("a", _request_state()),
+                    ("b", _request_state()),
+                    ("c", _request_state()),
+                ],
+                paged_attention_enabled=True,
+                is_hybrid=False,
+                use_async_scheduling=True,
+                speculative_config=SimpleNamespace(method="dspark"),
+                resolved_spec_tokens=resolved,
+                runner_invalid_counts=runner_invalid,
+            )
+
     def test_non_paged_scheduled_tokens_are_rejected(self) -> None:
         with pytest.raises(NotImplementedError, match="requires paged attention"):
             SpeculativeDecodeController().validate_supported(

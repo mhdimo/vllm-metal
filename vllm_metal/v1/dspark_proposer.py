@@ -11,19 +11,25 @@ cancellation, preemption and resume, before any same-step request-ID reuse.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import mlx.core as mx
 import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
+from vllm_metal import envs
 from vllm_metal.v1.dspark.adaptive import AdaptivePlanner, DSparkCounters
 from vllm_metal.v1.dspark.calibration import ConfidenceRecorder
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import CONTEXT_ALIGNMENT, DSparkMemoryPlan
-from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
+from vllm_metal.v1.dspark.model import (
+    ArenaBatch,
+    ArenaCache,
+    ContextArena,
+    CtxCache,
+    DSparkDrafter,
+)
 from vllm_metal.v1.dspark.sampling import (
     DSparkProposal,
     RequestRandomStreams,
@@ -47,16 +53,17 @@ logger = init_logger(__name__)
 # One informational counters snapshot per this many drafting steps.
 COUNTER_LOG_EVERY = 2000
 
-
-def _ctx_block_mask(ctx_lens: list[int], n_block: int) -> mx.array:
-    """Each row attends its valid context and the entire bidirectional block."""
-    max_ctx = max(ctx_lens)
-    lens = mx.array(ctx_lens, dtype=mx.int32)[:, None, None, None]
-    columns = mx.arange(max_ctx + n_block)[None, None, None, :]
-    return mx.broadcast_to(
-        (columns >= max_ctx) | (columns < lens),
-        (len(ctx_lens), 1, n_block, max_ctx + n_block),
-    )
+# Load regime. When the planner would decline to draft a batch of the step's
+# size on this many consecutive steps, the proposer lapses: it stops capturing
+# and ingesting target features and releases every context, so the server
+# costs what target-only serving costs while drafting cannot pay; it resumes
+# priming new requests after the load has dropped below the count it lapsed
+# at and the planner would draft, on this many consecutive steps. Requests
+# that ran through a lapse keep target-only generation. (A verdict alone is
+# not enough to leave: at a steady load near the planner's threshold it flips
+# between arrivals, and every flip re-primed every new prompt for nothing.)
+LAPSE_ENTER_STEPS = 32
+LAPSE_EXIT_STEPS = 8
 
 
 @dataclass
@@ -67,6 +74,18 @@ class _RequestContext:
     caches: list[CtxCache] = field(default_factory=list)
     covered_end: int = 0
     disabled_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _SpanWrite:
+    """A validated feature span whose context write is deferred to one batch."""
+
+    req_id: str
+    record: _RequestContext
+    start_row: int
+    start_pos: int
+    count: int
+    end_pos: int
 
 
 @dataclass(frozen=True)
@@ -114,6 +133,21 @@ class DSparkProposer:
         self._mask_token_id = config.mask_token_id
         self._contexts: dict[str, _RequestContext] = {}
         self.memory_plan = memory_plan
+        # One shared K/V arena per draft layer: a slot per reserved context,
+        # the committed context first and the block's scratch positions after
+        # it, so a drafting batch gathers its rows with one op per layer.
+        self._arena = [
+            ContextArena(
+                slots=memory_plan.max_contexts,
+                kv_heads=config.n_kv_heads,
+                capacity=memory_plan.max_context_tokens,
+                block_size=config.block_size,
+                head_dim=config.attn_head_dim,
+                dtype=drafter.hidden_norm.weight.dtype,
+            )
+            for _ in drafter.layers
+        ]
+        mx.eval([(layer.keys, layer.values) for layer in self._arena])
         self._memory_budget_bytes = memory_budget_bytes
         limit = memory_plan.max_contexts
         if max_drafts_per_step is not None:
@@ -142,6 +176,11 @@ class DSparkProposer:
         # request is drafted (the planner's alternative step, made explicit).
         self.bypass_only = False
         self.counters = DSparkCounters()
+        self.lapse_enabled = envs.VLLM_METAL_DSPARK_LAPSE
+        self._lapsed = False
+        self._decline_streak = 0
+        self._draft_streak = 0
+        self._lapse_entry_active = 0
 
     @property
     def proposals(self) -> Mapping[str, DSparkProposal]:
@@ -195,12 +234,15 @@ class DSparkProposer:
         *,
         has_final_prefill: bool,
     ) -> bool:
-        # Context must advance even for intermediate chunks and K=0 steps.
-        return True
+        # Context must advance even for intermediate chunks and K=0 steps,
+        # except in a lapse, where no context is kept at all.
+        return not self._lapsed
 
     def release_requests(self, req_ids: set[str]) -> None:
         for req_id in req_ids:
-            self._contexts.pop(req_id, None)
+            record = self._contexts.pop(req_id, None)
+            if record is not None:
+                self._release_slot(record)
             self._last_drafted.pop(req_id, None)
             self._proposals.pop(req_id, None)
             self._streams.pop(req_id, None)
@@ -220,11 +262,112 @@ class DSparkProposer:
             self._streams[req_id] = streams
         return streams
 
-    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
-        self.counters.steps += 1
+    @staticmethod
+    def _scheduled(ctx: ProposeContext) -> set[str]:
         scheduled = {seg.req_id for seg in ctx.decode_segments}
         scheduled.update(req_id for req_id, _ in ctx.decode_reqs)
         scheduled.update(pr.req_id for pr in ctx.prefill_reqs)
+        return scheduled
+
+    def deferred_step_allowed(
+        self,
+        decode_reqs: Sequence[tuple[str, RequestState]],
+        num_speculative_tokens: int,
+    ) -> bool:
+        """Whether a pure-decode step may defer its sampling sync.
+
+        True when this proposer will not draft at the end of the step: no
+        speculative tokens are scheduled, the bypass mode is on, or the
+        adaptive planner declines the batch for its request count, context
+        and calibrated expectations. Every draftable request is offered at
+        its full cap, so a batch the planner declines here it would decline
+        after sampling as well; the fixed mode drafts every eligible request
+        and always keeps the sync.
+        """
+        if num_speculative_tokens <= 0 or self.bypass_only or self._lapsed:
+            return True
+        if self.adaptive is None:
+            return False
+        candidates: list[tuple[str, Any, str, int]] = []
+        lengths: list[int] = []
+        for req_id, state in decode_reqs:
+            lengths.append(len(state.token_ids))
+            record = self._contexts.get(req_id)
+            if (
+                record is None
+                or record.owner is not state
+                or record.disabled_reason is not None
+            ):
+                continue
+            mode = self._controller.draft_mode(state)
+            if mode is None:
+                continue
+            cap = self._draft_cap(state, num_speculative_tokens)
+            if cap <= 0:
+                continue
+            candidates.append((req_id, state, mode, cap))
+        if not candidates:
+            return True
+        decision = self.adaptive.decide(
+            candidates,
+            active_requests=len(decode_reqs),
+            context=max(1, round(sum(lengths) / len(lengths))),
+        )
+        return not decision.draft
+
+    def ingest_deferred_step(self, ctx: ProposeContext) -> None:
+        """Advance every scheduled context on a step whose sync is deferred.
+
+        The step's sampled tokens are still on the device, so nothing here
+        reads token values: the scheduled requests' proposal records are
+        spent, the target features are ingested and the arenas are queued
+        for evaluation behind the step's own work. No request is drafted.
+        """
+        self.counters.steps += 1
+        self.counters.bypass_reasons["deferred-step"] += 1
+        if self.counters.bypass_reasons["deferred-step"] == 1:
+            logger.info(
+                "DSpark: first deferred step ingested; the decode pipeline is "
+                "running on non-drafting steps"
+            )
+        scheduled = self._scheduled(ctx)
+        self._observe_outcomes(ctx)
+        for req_id in scheduled:
+            self._proposals.pop(req_id, None)
+        if self._lapsed:
+            self.counters.bypass_reasons["lapse"] += 1
+            self._forget_idle(scheduled, ())
+            self._regime_step(ctx, drafted=False)
+            return
+        try:
+            self._ingest_step(ctx)
+            mx.async_eval([(arena.keys, arena.values) for arena in self._arena])
+        except Exception as error:
+            self._recover(error, scheduled)
+            return
+        self._forget_idle(scheduled, ())
+        self._regime_step(ctx, drafted=False)
+
+    def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        self.counters.steps += 1
+        scheduled = self._scheduled(ctx)
+        if self._lapsed:
+            # No feature was captured for this step and no context is kept:
+            # spend the records, count the step and re-evaluate the regime.
+            self._observe_outcomes(ctx)
+            for req_id in scheduled:
+                self._proposals.pop(req_id, None)
+            self.counters.bypass_reasons["lapse"] += 1
+            self._forget_idle(scheduled, ())
+            self._regime_step(ctx, drafted=False)
+            return None
+        result = self._propose_synchronous(ctx, scheduled)
+        self._regime_step(ctx, drafted=result is not None and bool(result.req_ids))
+        return result
+
+    def _propose_synchronous(
+        self, ctx: ProposeContext, scheduled: set[str]
+    ) -> DraftTokenIds | None:
         # The scheduler consumes a request's drafts the next time it schedules
         # the request (verified this step, clipped, or dropped for a prefill
         # chunk), so a record of a scheduled request is spent either way.
@@ -236,12 +379,19 @@ class DSparkProposer:
             # Materialize once per step, including K=0 and intermediate chunks.
             # Persistent KV must not retain the target activation graph from
             # every earlier chunk. There is no full-prompt feature stash/replay.
-            mx.eval(
-                [
+            # Every context lives in the per-layer arenas, so one call settles
+            # all of this step's writes; it is queued behind the step's GPU
+            # work without a host wait (a drafting step's own evaluation
+            # waits for it, a non-drafting step overlaps it with the next
+            # step's preparation).
+            mx.async_eval(
+                [(arena.keys, arena.values) for arena in self._arena]
+                + [
                     (cache.k, cache.v)
                     for req_id in scheduled
                     if (record := self._contexts.get(req_id)) is not None
                     for cache in record.caches
+                    if not isinstance(cache, ArenaCache)
                 ]
             )
             if ctx.num_speculative_tokens <= 0:
@@ -321,30 +471,119 @@ class DSparkProposer:
                 return None
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
         except Exception as error:
-            # A partially written layer set cannot survive an ingest/draft
-            # failure, even if the engine subsequently retries these requests.
-            self.release_requests(scheduled)
-            if isinstance(error, MemoryError) or (
-                isinstance(error, RuntimeError)
-                and str(error).startswith(
-                    (
-                        "[metal::malloc] Resource limit (",
-                        "[metal::malloc] Attempting to allocate ",
-                        "[malloc] Unable to allocate ",
-                    )
+            self._recover(error, scheduled)
+            return None
+
+    def _would_draft(self, ctx: ProposeContext) -> bool:
+        """The planner's verdict for a batch of this step's size with prior expectations.
+
+        Every draftable decode request is offered at its full cap whether or
+        not it holds a context, so the verdict follows the load (request
+        count and context) rather than the contexts a lapse released.
+        """
+        if self.adaptive is None or ctx.num_speculative_tokens <= 0:
+            return False
+        candidates: list[tuple[str, Any, str, int]] = []
+        lengths: list[int] = []
+        for req_id, state in ctx.decode_reqs:
+            lengths.append(len(state.token_ids))
+            mode = self._controller.draft_mode(state)
+            if mode is None:
+                continue
+            cap = self._draft_cap(state, ctx.num_speculative_tokens)
+            if cap <= 0:
+                continue
+            candidates.append((req_id, state, mode, cap))
+        if not candidates:
+            return False
+        decision = self.adaptive.decide(
+            candidates,
+            active_requests=len(ctx.decode_reqs),
+            context=max(1, round(sum(lengths) / len(lengths))),
+        )
+        return bool(decision.draft)
+
+    def _regime_step(self, ctx: ProposeContext, *, drafted: bool) -> None:
+        """Enter or leave the lapse from this step's load; fixed mode never lapses."""
+        if drafted:
+            self._decline_streak = 0
+        if not self.lapse_enabled or self.adaptive is None or self.bypass_only:
+            return
+        if not ctx.decode_reqs:
+            return
+        if self._lapsed:
+            # Leave only on a real drop in load: fewer requests than the lapse
+            # began with, and the planner's verdict for that batch is to draft.
+            dropped = len(ctx.decode_reqs) < self._lapse_entry_active
+            resume = dropped and self._would_draft(ctx)
+            self._draft_streak = self._draft_streak + 1 if resume else 0
+            if self._draft_streak >= LAPSE_EXIT_STEPS:
+                self._lapsed = False
+                self._draft_streak = 0
+                self._decline_streak = 0
+                self.counters.lapse_exits += 1
+                logger.info(
+                    "DSpark: load regime resumed drafting at %d requests "
+                    "(lapsed at %d; new requests are primed again)",
+                    len(ctx.decode_reqs),
+                    self._lapse_entry_active,
                 )
-            ):
-                # Drafting has no target KV side effects. Discard all private
-                # context under allocation pressure and keep the already
-                # sampled target output. Later requests/recomputation can
-                # obtain fresh complete context; other failures remain fatal.
-                self.release_requests(set(self._contexts))
-                mx.clear_cache()
-                logger.warning(
-                    "DSpark allocation failed; released draft context and using target-only output"
+            return
+        would_draft = drafted or self._would_draft(ctx)
+        self._decline_streak = 0 if would_draft else self._decline_streak + 1
+        if self._decline_streak >= LAPSE_ENTER_STEPS:
+            self._enter_lapse(len(ctx.decode_reqs))
+
+    def lapse_for_bypass(self) -> None:
+        """The bypass mode never drafts: lapse from the start (no capture, no context)."""
+        if self.lapse_enabled and not self._lapsed:
+            self._lapsed = True
+            logger.info(
+                "DSpark: bypass mode keeps no draft context; target features are not captured"
+            )
+
+    def _enter_lapse(self, active: int) -> None:
+        self._lapsed = True
+        self._lapse_entry_active = active
+        self._decline_streak = 0
+        self._draft_streak = 0
+        self.counters.lapse_entries += 1
+        released = len(self._contexts)
+        self.release_requests(set(self._contexts))
+        logger.info(
+            "DSpark: load regime lapse at %d requests after %d declined steps; "
+            "%d draft contexts released, features no longer captured",
+            active,
+            LAPSE_ENTER_STEPS,
+            released,
+        )
+
+    def _recover(self, error: Exception, scheduled: set[str]) -> None:
+        """Release the step's contexts; swallow allocation failures, re-raise the rest."""
+        # A partially written layer set cannot survive an ingest/draft
+        # failure, even if the engine subsequently retries these requests.
+        self.release_requests(scheduled)
+        if isinstance(error, MemoryError) or (
+            isinstance(error, RuntimeError)
+            and str(error).startswith(
+                (
+                    "[metal::malloc] Resource limit (",
+                    "[metal::malloc] Attempting to allocate ",
+                    "[malloc] Unable to allocate ",
                 )
-                return None
-            raise
+            )
+        ):
+            # Drafting has no target KV side effects. Discard all private
+            # context under allocation pressure and keep the already
+            # sampled target output. Later requests/recomputation can
+            # obtain fresh complete context; other failures remain fatal.
+            self.release_requests(set(self._contexts))
+            mx.clear_cache()
+            logger.warning(
+                "DSpark allocation failed; released draft context and using target-only output"
+            )
+            return
+        raise error
 
     @staticmethod
     def _active_requests(ctx: ProposeContext) -> int:
@@ -476,10 +715,16 @@ class DSparkProposer:
             ),
         )
 
+    def _release_slot(self, record: _RequestContext) -> None:
+        for cache in record.caches:
+            if isinstance(cache, ArenaCache):
+                cache.arena.release(cache.slot)
+        record.caches = []
+
     def _disable(self, req_id: str, record: _RequestContext, reason: str) -> None:
         if record.disabled_reason is None:
             logger.debug("DSpark target-only fallback for %s: %s", req_id, reason)
-        record.caches = []
+        self._release_slot(record)
         record.covered_end = 0
         record.disabled_reason = reason
 
@@ -511,6 +756,9 @@ class DSparkProposer:
                 "DSpark target feature shape disagrees with packed requests"
             )
         seen = set()
+        # Decode spans are at most one verification window each; their
+        # context writes go out as one batched pass per layer.
+        pending: list[_SpanWrite] = []
         for (req_id, state), segment in zip(
             ctx.decode_reqs, ctx.decode_segments, strict=True
         ):
@@ -535,7 +783,9 @@ class DSparkProposer:
                 segment.cache_start_pos,
                 segment.num_query_tokens,
                 end,
+                pending,
             )
+        self._flush_span_writes(hidden, pending)
         for index, (prefill, mode) in enumerate(
             zip(ctx.prefill_reqs, ctx.prefill_result_modes, strict=True)
         ):
@@ -575,15 +825,19 @@ class DSparkProposer:
         start_pos: int,
         available_rows: int,
         end_pos: int,
+        pending: list[_SpanWrite] | None = None,
     ) -> None:
         record = self._contexts.get(req_id)
         if record is None or record.owner is not owner:
+            if record is not None:
+                self._release_slot(record)
             record = _RequestContext(owner)
             self._contexts[req_id] = record
         if record.disabled_reason is not None:
             if start_pos != 0:
                 return
             # A scheduler recompute from zero supplies a complete new prefix.
+            self._release_slot(record)
             record = _RequestContext(owner)
             self._contexts[req_id] = record
         if not 0 <= start_pos <= end_pos <= start_pos + available_rows:
@@ -596,15 +850,13 @@ class DSparkProposer:
             self._disable(req_id, record, "context length exceeds reserved capacity")
             return
         if not record.caches:
-            if (
-                sum(bool(context.caches) for context in self._contexts.values())
-                >= self.memory_plan.max_contexts
-            ):
+            if self._arena[0].free_slots == 0:
                 self._disable(req_id, record, "context capacity exhausted")
                 return
-            record.caches = self._drafter.make_ctx_cache(
-                self.memory_plan.max_context_tokens
-            )
+            slot = self._arena[0].acquire()
+            for layer in self._arena[1:]:
+                assert layer.acquire() == slot
+            record.caches = [ArenaCache(layer, slot) for layer in self._arena]
         required = (
             min(
                 self.memory_plan.max_context_tokens,
@@ -632,14 +884,53 @@ class DSparkProposer:
             if hidden is None:
                 self._disable(req_id, record, "target features are unavailable")
                 return
+            if pending is not None and count <= self._block_size + 1:
+                pending.append(
+                    _SpanWrite(req_id, record, start_row, start_pos, count, end_pos)
+                )
+                return
             self._drafter.update_context(
                 hidden[start_row : start_row + count][None],
                 ctx_offset=start_pos,
                 ctx_caches=record.caches,
             )
+        self._commit_span(record, end_pos)
+
+    @staticmethod
+    def _commit_span(record: _RequestContext, end_pos: int) -> None:
         if any(cache.length != end_pos for cache in record.caches):
             raise RuntimeError("DSpark context update wrote an incomplete layer span")
         record.covered_end = end_pos
+
+    def _flush_span_writes(
+        self, hidden: mx.array | None, pending: list[_SpanWrite]
+    ) -> None:
+        """Write every deferred span: one request keeps the single-row path."""
+        if not pending:
+            return
+        if hidden is None:
+            raise RuntimeError("deferred DSpark spans need target features")
+        if len(pending) == 1:
+            write = pending[0]
+            self._drafter.update_context(
+                hidden[write.start_row : write.start_row + write.count][None],
+                ctx_offset=write.start_pos,
+                ctx_caches=write.record.caches,
+            )
+            self._commit_span(write.record, write.end_pos)
+            return
+        spans = []
+        for write in pending:
+            caches = write.record.caches
+            if not caches or not all(isinstance(cache, ArenaCache) for cache in caches):
+                raise RuntimeError("batched context ingest needs arena-backed contexts")
+            slot = cast("ArenaCache", caches[0]).slot
+            spans.append((write.start_row, write.start_pos, write.count, slot))
+        self._drafter.update_context_spans(hidden, spans, self._arena)
+        for write in pending:
+            for cache in write.record.caches:
+                cast("ArenaCache", cache).extend_to(write.end_pos)
+            self._commit_span(write.record, write.end_pos)
 
     def _batch_draft(
         self, plans: list[_DraftPlan]
@@ -663,8 +954,7 @@ class DSparkProposer:
             )
         )
         lengths = [plan.context.covered_end for plan in plans]
-        max_len = max(lengths)
-        batched_ctx = []
+        batched_ctx: list = []
         for layer_index in range(len(self._drafter.layers)):
             caches = [plan.context.caches[layer_index] for plan in plans]
             if any(
@@ -674,40 +964,20 @@ class DSparkProposer:
                 raise RuntimeError(
                     "DSpark draft context has inconsistent physical lengths"
                 )
-            if len(plans) == 1 and max_len:
-                # Common latency path: no padded copy of the whole context.
+            if all(isinstance(cache, ArenaCache) for cache in caches):
+                batched_ctx.append(
+                    ArenaBatch(
+                        self._arena[layer_index],
+                        [cache.slot for cache in caches],
+                        lengths,
+                    )
+                )
+            elif len(plans) == 1:
                 batched_ctx.append(caches[0])
-                continue
-            reference = next((cache for cache in caches if cache.k is not None), None)
-            dtype = reference.k.dtype if reference is not None else noise.dtype
-            empty_shape = (1, self._config.n_kv_heads, 0, self._config.attn_head_dim)
-            keys, values = [], []
-            for cache, length in zip(caches, lengths, strict=True):
-                padding = [(0, 0), (0, 0), (0, max_len - length), (0, 0)]
-                key = (
-                    cache.k
-                    if cache.k is not None
-                    else mx.zeros(empty_shape, dtype=dtype)
-                )
-                value = (
-                    cache.v
-                    if cache.v is not None
-                    else mx.zeros(empty_shape, dtype=dtype)
-                )
-                keys.append(mx.pad(key, padding))
-                values.append(mx.pad(value, padding))
-            batched_ctx.append(
-                SimpleNamespace(
-                    k=mx.concatenate(keys, axis=0), v=mx.concatenate(values, axis=0)
-                )
-            )
+            else:
+                raise RuntimeError("batched drafting needs arena-backed contexts")
         hidden = self._drafter.backbone(
-            noise,
-            mx.array(lengths, dtype=mx.int32),
-            batched_ctx,
-            mask=(
-                _ctx_block_mask(lengths, self._block_size) if len(plans) > 1 else None
-            ),
+            noise, mx.array(lengths, dtype=mx.int32), batched_ctx
         )
         cap = max(plan.cap for plan in plans)
         logits = self._drafter.compute_logits(hidden[:, :cap])

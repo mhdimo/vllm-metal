@@ -334,9 +334,19 @@ def build_matrix(tokenizer, batch_tokens: int) -> dict:
 
 
 def run_matrix(
-    server: Server, baseline: Server | None, matrix: dict, results: dict
+    server: Server,
+    baseline: Server | None,
+    matrix: dict,
+    results: dict,
+    *,
+    expect_no_drafts: bool = False,
 ) -> dict:
-    """Run every scenario against ``server``; compare with ``baseline`` when given."""
+    """Run every scenario against ``server``; compare with ``baseline`` when given.
+
+    ``expect_no_drafts`` qualifies a speculative server in a mode that must
+    never draft (the ``bypass`` mode): its outputs must still match the
+    target-only server and its metrics must report no draft token at all.
+    """
     base = server.base
     client = httpx.Client(timeout=900)
     report: dict = {"scenarios": {}, "failures": []}
@@ -550,7 +560,12 @@ def run_matrix(
         name: after_metrics.get(name, 0.0) - before.get(name, 0.0)
         for name in SPEC_METRICS
     }
-    if server.width:
+    if server.width and expect_no_drafts:
+        if report["metrics"]["vllm:spec_decode_num_draft_tokens_total"] > 0:
+            report["failures"].append(
+                "draft tokens reported by a mode that must not draft"
+            )
+    elif server.width:
         if report["metrics"]["vllm:spec_decode_num_draft_tokens_total"] <= 0:
             report["failures"].append("no draft tokens reported by /metrics")
         if report["metrics"]["vllm:spec_decode_num_accepted_tokens_total"] <= 0:
@@ -576,6 +591,18 @@ def main() -> None:
     parser.add_argument("--batch-tokens", type=int, default=64)
     parser.add_argument("--memory-fraction", default="0.22")
     parser.add_argument("--startup-timeout", type=float, default=900)
+    parser.add_argument(
+        "--async-scheduling",
+        action="store_true",
+        help="start every server with --async-scheduling (DSpark supports it "
+        "since M9b) instead of --no-async-scheduling",
+    )
+    parser.add_argument(
+        "--expect-no-drafts",
+        action="store_true",
+        help="the speculative servers run a mode that never drafts (bypass): "
+        "require zero draft tokens instead of draft work",
+    )
     args = parser.parse_args()
     if not args.target.is_dir() or not args.draft.is_dir():
         parser.error("target and draft must be already downloaded snapshots")
@@ -596,12 +623,24 @@ def main() -> None:
     failures = 0
     try:
         for width, prefix in plan:
-            server = Server(args, width, prefix, args.output_dir)
+            server = Server(
+                args,
+                width,
+                prefix,
+                args.output_dir,
+                async_scheduling=args.async_scheduling,
+            )
             print(f"starting {server.name}: {' '.join(server.command)}", flush=True)
             server.wait_ready(args.startup_timeout)
             started = time.monotonic()
             baseline = baselines.get(prefix) if width else None
-            report = run_matrix(server, baseline, matrix, results)
+            report = run_matrix(
+                server,
+                baseline,
+                matrix,
+                results,
+                expect_no_drafts=args.expect_no_drafts,
+            )
             report["elapsed_s"] = time.monotonic() - started
             report["command"] = server.command
             reports[server.name] = report

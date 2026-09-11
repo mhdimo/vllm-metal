@@ -85,7 +85,7 @@ from vllm_metal.v1.decode_pipeline import (
     SamplingShape,
     SchedulerStepShape,
 )
-from vllm_metal.v1.dspark.adaptive import MODES, load_adaptive
+from vllm_metal.v1.dspark.adaptive import DRAFT_PRECISIONS, MODES, load_adaptive
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.contracts import is_dspark_config
 from vllm_metal.v1.dspark.loader import load_drafter
@@ -117,6 +117,7 @@ from vllm_metal.v1.prompt_logprobs import (
     full_prompt_logprobs,
 )
 from vllm_metal.v1.proposer import (
+    DeferredStepProposer,
     Gemma4MTPProposer,
     MetalProposer,
     ProposeContext,
@@ -434,6 +435,13 @@ class MetalModelRunner:
         # Keep the latest execution output so sample_tokens can return it.
         self._pending_output: ModelRunnerOutput | None = None
         self._draft_token_ids: DraftTokenIds | None = None
+        # Asynchronous scheduling: the engine never takes the drafts, so the
+        # runner keeps each request's last drafts until the scheduler's next
+        # placeholder slots for that request (or the request's release).
+        self._retained_drafts: dict[str, list[int]] = {}
+        self._step_spec_tokens: (
+            tuple[SchedulerOutput, dict[str, tuple[int, ...]], dict[str, int]] | None
+        ) = None
 
         # Paged attention state (set by worker when enabled)
         self._paged_attention_runtime: PagedAttentionRuntime | None = None
@@ -695,9 +703,16 @@ class MetalModelRunner:
         mx.eval(self.model.parameters())
         mx.clear_cache()
         draft = spec.draft_model_config
+        precision = envs.VLLM_METAL_DSPARK_DRAFT_PRECISION
+        if precision not in DRAFT_PRECISIONS:
+            raise ValueError(
+                f"VLLM_METAL_DSPARK_DRAFT_PRECISION={precision!r} is not one of "
+                f"{DRAFT_PRECISIONS}"
+            )
         model, config = load_drafter(
             draft.model,
             revision=draft.revision,
+            quantize=precision == "quantized",
             memory_budget_bytes=budget - mx.get_active_memory(),
             expected_config=DSparkConfig.from_dict(draft.hf_config.to_dict()),
         )
@@ -755,11 +770,12 @@ class MetalModelRunner:
             )
         elif mode == "bypass":
             proposer.bypass_only = True
+            proposer.lapse_for_bypass()
         logger.info(
             "DSpark drafter loaded for speculative decoding: %s "
             "(block_size=%d, target_layer_ids=%s); reserved context=%.2f MB, "
             "capture=%.2f MB, workspace=%.2f MB, context_slots=%d, "
-            "drafts_per_step=%d, mode=%s",
+            "drafts_per_step=%d, mode=%s, draft_precision=%s",
             draft.model,
             config.block_size,
             config.target_layer_ids,
@@ -769,6 +785,7 @@ class MetalModelRunner:
             plan.max_contexts,
             proposer._max_drafts_per_step,
             mode,
+            precision,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -932,6 +949,53 @@ class MetalModelRunner:
         draft_token_ids = self._draft_token_ids
         self._draft_token_ids = None
         return draft_token_ids
+
+    def _retain_drafts(self) -> None:
+        """Keep this step's drafts for the asynchronous scheduler's next slots."""
+        drafts = self._draft_token_ids
+        if not self.use_async_scheduling or drafts is None:
+            return
+        for req_id, token_ids in zip(
+            drafts.req_ids, drafts.draft_token_ids, strict=True
+        ):
+            if token_ids:
+                self._retained_drafts[req_id] = list(token_ids)
+            else:
+                self._retained_drafts.pop(req_id, None)
+
+    def _active_spec_tokens(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[str, tuple[int, ...]]:
+        """This step's drafts to verify, resolved once per scheduler output.
+
+        Synchronous scheduling verifies the scheduler's own draft handoff.
+        Under asynchronous scheduling the scheduler books placeholder slots
+        for every running request and the runner fills them with the drafts
+        it retained from the request's previous step; a request's retained
+        drafts are spent (used or dropped) by the first step that schedules
+        it again, because its anchor token then changes.
+        """
+        return self._resolve_spec_tokens(scheduler_output)[0]
+
+    def _resolve_spec_tokens(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[dict[str, tuple[int, ...]], dict[str, int]]:
+        """Resolved drafts and the unused placeholder slots the runner reported."""
+        cached = self._step_spec_tokens
+        if cached is not None and cached[0] is scheduler_output:
+            return cached[1], cached[2]
+        controller = self._spec_decode_controller
+        runner_invalid: dict[str, int] = {}
+        if self.use_async_scheduling:
+            resolved, runner_invalid = controller.substitute_retained_drafts(
+                scheduler_output, self._retained_drafts
+            )
+            for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+                self._retained_drafts.pop(req_id, None)
+        else:
+            resolved = controller.active_spec_decode_tokens(scheduler_output)
+        self._step_spec_tokens = (scheduler_output, resolved, runner_invalid)
+        return resolved, runner_invalid
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.
@@ -1375,7 +1439,7 @@ class MetalModelRunner:
         """
         decode_segments = self._spec_decode_controller.build_decode_segments(
             decode_reqs,
-            self._spec_decode_controller.active_spec_decode_tokens(scheduler_output),
+            self._active_spec_tokens(scheduler_output),
             self._paged_request_seq_lens,
         )
         num_decode_tokens = sum(segment.num_query_tokens for segment in decode_segments)
@@ -1702,6 +1766,20 @@ class MetalModelRunner:
             and adapter.forward_ready
             and adapter.requires_explicit_positions
         )
+        drafter = self._drafter
+        spec_configured = (
+            self.vllm_config.speculative_config is not None or drafter is not None
+        )
+        # A drafter that can consume a deferred step decides per step whether
+        # it will draft (and so needs the sampled tokens on the host).
+        deferred_drafter = isinstance(drafter, DeferredStepProposer)
+        drafter_needs_sync = False
+        if spec_configured and deferred_drafter and not states_missing:
+            assert drafter is not None
+            drafter_needs_sync = not drafter.deferred_step_allowed(
+                [(req_id, self._request_states[req_id]) for req_id in decode_req_ids],
+                scheduler_output.num_spec_tokens_to_schedule,
+            )
         capabilities = RunnerCapabilities(
             pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
             use_async_scheduling=self.use_async_scheduling,
@@ -1711,10 +1789,7 @@ class MetalModelRunner:
             hybrid_without_lazy_gdn=(
                 self.is_hybrid and not envs.VLLM_METAL_GDN_LAZY_KERNELS
             ),
-            spec_decode_configured=(
-                self.vllm_config.speculative_config is not None
-                or self._drafter is not None
-            ),
+            spec_decode_configured=spec_configured and not deferred_drafter,
             uniproc_executor=(
                 self.vllm_config.parallel_config.distributed_executor_backend == "uni"
             ),
@@ -1727,12 +1802,11 @@ class MetalModelRunner:
             has_resumed_requests=bool(cached_reqs.resumed_req_ids),
             has_preempted_requests=bool(scheduler_output.preempted_req_ids),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
-            has_spec_tokens=bool(
-                self._spec_decode_controller.active_spec_decode_tokens(scheduler_output)
-            ),
+            has_spec_tokens=bool(self._active_spec_tokens(scheduler_output)),
             has_structured_output=scheduler_output.has_structured_output_requests,
             has_mm_decode=has_mm_decode or mm_forward_forced,
             decode_req_ids=tuple(decode_req_ids),
+            drafter_needs_sync=drafter_needs_sync,
         )
         sampling = SamplingShape(
             native_greedy=(
@@ -1853,6 +1927,7 @@ class MetalModelRunner:
                         finished_req_ids=scheduler_output.finished_req_ids,
                     )
                 )
+                self._retain_drafts()
             return batch, scheduler_output
 
         # ---- wait for MLX forward to complete ----
@@ -2067,6 +2142,7 @@ class MetalModelRunner:
         self._draft_token_ids = (
             self._drafter.propose(draft_ctx) if self._drafter is not None else None
         )
+        self._retain_drafts()
 
         return batch, scheduler_output
 
@@ -2229,6 +2305,16 @@ class MetalModelRunner:
             # Only a proposer that keeps exact proposal distributions may
             # draft non-greedy requests.
             allow_stochastic=getattr(self._drafter, "proposals", None) is not None,
+            resolved_spec_tokens=(
+                self._resolve_spec_tokens(scheduler_output)[0]
+                if self.use_async_scheduling
+                else None
+            ),
+            runner_invalid_counts=(
+                self._resolve_spec_tokens(scheduler_output)[1]
+                if self.use_async_scheduling
+                else None
+            ),
         )
 
     def _run_vision_encoders(
@@ -2947,6 +3033,8 @@ class MetalModelRunner:
         # resumed request re-acquires it during recompute.
         if invalidated and self._drafter is not None:
             self._drafter.release_requests(invalidated)
+        for req_id in invalidated:
+            self._retained_drafts.pop(req_id, None)
 
         if runtime is not None:
             if invalidated:
@@ -3209,6 +3297,31 @@ class MetalModelRunner:
                     row=row,
                     token_index=len(state.token_ids) - 1,
                     output_idx=output_idx,
+                )
+            )
+
+        # A deferred-step-capable drafter advances its per-request state from
+        # this step's target features; the token values stay on the device.
+        # The placeholders are already appended, so the step's feature rows
+        # end at each request's pending anchor exactly as on the sync path.
+        drafter = self._drafter
+        if isinstance(drafter, DeferredStepProposer):
+            drafter.ingest_deferred_step(
+                ProposeContext(
+                    target_hidden_states=paged_state.target_hidden_states,
+                    decode_reqs=decode_reqs,
+                    decode_segments=paged_state.decode_segments,
+                    decode_token_ids=[() for _ in decode_reqs],
+                    prefill_reqs=[],
+                    prefill_token_ids=[],
+                    prefill_result_modes=[],
+                    request_states=self._request_states,
+                    cu_seqlens=paged_state.cu_seqlens,
+                    num_decode_segments=len(paged_state.decode_segments),
+                    num_speculative_tokens=(
+                        paged_state.scheduler_output.num_spec_tokens_to_schedule
+                    ),
+                    finished_req_ids=paged_state.scheduler_output.finished_req_ids,
                 )
             )
 
