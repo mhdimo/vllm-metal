@@ -220,7 +220,8 @@ trajectory and the spec-decode counters.
   consecutive steps (the batch is too large for verification to pay on
   this machine), the proposer lapses: no target feature is captured, no
   context is kept, and the server runs at target-only cost; it primes new
-  requests again once the planner would draft on 4 consecutive steps.
+  requests again once the load has dropped below the count it lapsed at and
+  the planner would draft, on 8 consecutive steps.
   The bypass mode lapses from the start (`VLLM_METAL_DSPARK_LAPSE`).
 - **Batched drafting.** The backbone runs across selected requests, each row
   attending to its own slot of a per-layer context arena (no padding, gather or

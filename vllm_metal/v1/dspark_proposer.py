@@ -57,10 +57,13 @@ COUNTER_LOG_EVERY = 2000
 # size on this many consecutive steps, the proposer lapses: it stops capturing
 # and ingesting target features and releases every context, so the server
 # costs what target-only serving costs while drafting cannot pay; it resumes
-# priming new requests after the planner would draft on this many consecutive
-# steps again. Requests that ran through a lapse keep target-only generation.
+# priming new requests after the load has dropped below the count it lapsed
+# at and the planner would draft, on this many consecutive steps. Requests
+# that ran through a lapse keep target-only generation. (A verdict alone is
+# not enough to leave: at a steady load near the planner's threshold it flips
+# between arrivals, and every flip re-primed every new prompt for nothing.)
 LAPSE_ENTER_STEPS = 32
-LAPSE_EXIT_STEPS = 4
+LAPSE_EXIT_STEPS = 8
 
 
 @dataclass
@@ -177,6 +180,7 @@ class DSparkProposer:
         self._lapsed = False
         self._decline_streak = 0
         self._draft_streak = 0
+        self._lapse_entry_active = 0
 
     @property
     def proposals(self) -> Mapping[str, DSparkProposal]:
@@ -507,9 +511,12 @@ class DSparkProposer:
             return
         if not ctx.decode_reqs:
             return
-        would_draft = drafted or self._would_draft(ctx)
         if self._lapsed:
-            self._draft_streak = self._draft_streak + 1 if would_draft else 0
+            # Leave only on a real drop in load: fewer requests than the lapse
+            # began with, and the planner's verdict for that batch is to draft.
+            dropped = len(ctx.decode_reqs) < self._lapse_entry_active
+            resume = dropped and self._would_draft(ctx)
+            self._draft_streak = self._draft_streak + 1 if resume else 0
             if self._draft_streak >= LAPSE_EXIT_STEPS:
                 self._lapsed = False
                 self._draft_streak = 0
@@ -517,10 +524,12 @@ class DSparkProposer:
                 self.counters.lapse_exits += 1
                 logger.info(
                     "DSpark: load regime resumed drafting at %d requests "
-                    "(new requests are primed again)",
+                    "(lapsed at %d; new requests are primed again)",
                     len(ctx.decode_reqs),
+                    self._lapse_entry_active,
                 )
             return
+        would_draft = drafted or self._would_draft(ctx)
         self._decline_streak = 0 if would_draft else self._decline_streak + 1
         if self._decline_streak >= LAPSE_ENTER_STEPS:
             self._enter_lapse(len(ctx.decode_reqs))
@@ -535,6 +544,7 @@ class DSparkProposer:
 
     def _enter_lapse(self, active: int) -> None:
         self._lapsed = True
+        self._lapse_entry_active = active
         self._decline_streak = 0
         self._draft_streak = 0
         self.counters.lapse_entries += 1

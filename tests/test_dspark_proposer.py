@@ -925,7 +925,8 @@ def test_lapse_enters_after_sustained_declines_and_resumes(monkeypatch, caplog):
     assert any("load regime lapse" in r.message for r in caplog.records)
     assert proposer.needs_target_hidden_states((), has_final_prefill=True) is False
     assert proposer.deferred_step_allowed([("r", state)], 2) is True
-    # Lapsed steps neither ingest nor draft; the planner's verdict is still asked.
+    # Lapsed steps neither ingest nor draft; while the load has not dropped below
+    # the count the lapse began at, the planner is not even asked.
     calls = proposer.adaptive.calls
     result = proposer.propose(
         _context(
@@ -934,13 +935,22 @@ def test_lapse_enters_after_sustained_declines_and_resumes(monkeypatch, caplog):
     )
     assert result is None and proposer._contexts == {}
     assert proposer.counters.bypass_reasons["lapse"] >= 1
-    assert proposer.adaptive.calls == calls + 1
+    assert proposer.adaptive.calls == calls
     # A prefill during the lapse creates no context either.
     fresh = _state([4, 5, 6, 7])
     proposer.propose(_context(prefill=[("p", fresh, 0, 3, True)], hidden=False))
     assert "p" not in proposer._contexts
-    # The planner would draft again: after LAPSE_EXIT_STEPS steps the regime resumes.
+    # The planner would draft again but the load has not dropped (the lapse
+    # began at one request and one is still running): the regime stays.
     proposer.adaptive = _Planner(draft=True)
+    for _ in range(module.LAPSE_EXIT_STEPS + 2):
+        state.token_ids.append(-1)
+        proposer.ingest_deferred_step(_deferred_ctx(state))
+        state.token_ids[-1] = 7
+    assert proposer._lapsed is True and proposer.counters.lapse_exits == 0
+    # A real drop (fewer requests than at entry) with the verdict to draft, on
+    # LAPSE_EXIT_STEPS consecutive steps, resumes the regime.
+    proposer._lapse_entry_active = 2
     for _ in range(module.LAPSE_EXIT_STEPS):
         assert proposer._lapsed is True
         state.token_ids.append(-1)

@@ -144,7 +144,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # steps, the proposer stops capturing and ingesting target features and
     # releases its draft contexts, so a server that cannot profit from
     # drafting costs what target-only serving costs; it primes new requests
-    # again after the planner would draft on 4 consecutive steps. Set to "0"
+    # again once the load has dropped below the count it lapsed at and the
+    # planner would draft, on 8 consecutive steps. Set to "0"
     # to keep every context current at all loads (the M9 behaviour).
     "VLLM_METAL_DSPARK_LAPSE": lambda: os.getenv("VLLM_METAL_DSPARK_LAPSE", "1") == "1",
     # DSpark serving mode: "fixed" verifies the configured width; "adaptive"
