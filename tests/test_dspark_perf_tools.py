@@ -122,16 +122,18 @@ def test_heavy_other_processes_counts_only_outside_user_land_load() -> None:
     from tools.dspark_perf_bench import heavy_other_processes
 
     lines = [
-        " 98.6 bun /Users/x/scan.ts",  # another session's work: counts
-        " 45.0 /System/Library/PrivateFrameworks/SkyLight.framework/WindowServer -daemon",
-        " 41.2 /Applications/Foo.app/Contents/MacOS/Foo",
-        " 59.5 VLLM::EngineCore",  # our server
-        " 80.0 /Users/x/.venv/bin/python -m tools.dspark_perf_bench",  # this client
-        " 39.9 node build.js",  # below the threshold
-        " 55.0 node /Users/x/vitest",  # counts
+        "  11  98.6 bun /Users/x/scan.ts",  # another session's work: counts
+        "  12  45.0 /System/Library/PrivateFrameworks/SkyLight.framework/WindowServer -daemon",
+        "  13  41.2 /Applications/Foo.app/Contents/MacOS/Foo",
+        "  14  59.5 VLLM::EngineCore",  # our server
+        "  15  80.0 /Users/x/.venv/bin/python -m tools.dspark_perf_bench",  # this client (pid)
+        "  16  70.0 /Users/x/.venv/bin/python probe.py",  # another python: counts
+        "  17  39.9 node build.js",  # below the threshold
+        "  18  55.0 node /Users/x/vitest",  # counts
         "bad line",
     ]
-    assert heavy_other_processes(lines) == 2
+    assert heavy_other_processes(lines, {15}) == 3
+    assert heavy_other_processes(lines) == 4
 
 
 class _FakeSampler:

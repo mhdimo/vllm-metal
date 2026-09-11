@@ -201,25 +201,28 @@ def paired_summary(reference: list[dict], candidate: list[dict]) -> dict:
 
 
 HEAVY_CPU_PERCENT = 40.0
-# The run's own processes (servers, this client) and the desktop's daemons are
-# not outside load; anything else above HEAVY_CPU_PERCENT is.
-_OWN_PROCESS = re.compile(r"VLLM|vllm|python|/zsh|\bzsh\b|\bps\b")
+# The run's own processes (the servers, this client and its children) and the
+# desktop's daemons are not outside load; anything else above HEAVY_CPU_PERCENT
+# is, another Python process included.
+_OWN_PROCESS = re.compile(r"VLLM|vllm|\bzsh\b|\bps\b")
 _SYSTEM_PATHS = ("/System", "/Applications", "/Library", "/usr/libexec", "/usr/sbin")
 
 
-def heavy_other_processes(ps_lines: list[str]) -> int:
-    """Count user-land processes above HEAVY_CPU_PERCENT in ``ps -Ao pcpu,command`` output."""
+def heavy_other_processes(ps_lines: list[str], own_pids: set[int] | None = None) -> int:
+    """Count user-land processes above HEAVY_CPU_PERCENT in ``ps -Ao pid,pcpu,command`` output."""
     count = 0
+    own = own_pids or set()
     for line in ps_lines:
-        parts = line.strip().split(None, 1)
-        if len(parts) != 2:
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
             continue
         try:
-            cpu = float(parts[0])
+            pid = int(parts[0])
+            cpu = float(parts[1])
         except ValueError:
             continue
-        command = parts[1]
-        if cpu <= HEAVY_CPU_PERCENT or _OWN_PROCESS.search(command):
+        command = parts[2]
+        if pid in own or cpu <= HEAVY_CPU_PERCENT or _OWN_PROCESS.search(command):
             continue
         if command.startswith(_SYSTEM_PATHS):
             continue
@@ -239,7 +242,7 @@ class LoadSampler:
     def _sample(self) -> dict:
         try:
             lines = subprocess.run(
-                ["ps", "-Ao", "pcpu,command", "-r"],
+                ["ps", "-Ao", "pid,pcpu,command", "-r"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -249,7 +252,7 @@ class LoadSampler:
         return {
             "t": time.time(),
             "load1": os.getloadavg()[0],
-            "heavy_other": heavy_other_processes(lines),
+            "heavy_other": heavy_other_processes(lines, {os.getpid()}),
         }
 
     def _loop(self) -> None:
