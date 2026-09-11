@@ -137,6 +137,7 @@ class TestAsyncSchedulingRetainedDrafts:
     def test_retained_drafts_are_resolved_once_and_spent(self) -> None:
         runner = make_stub_runner()
         runner.use_async_scheduling = True
+        runner._drafter = object()  # placeholder slots exist only with a drafter
         runner._draft_token_ids = DraftTokenIds(
             req_ids=["r0", "r1"], draft_token_ids=[[4, 5], []]
         )
@@ -3885,3 +3886,29 @@ class TestStateBlockIdLifecycle:
 
         assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
         assert runner._request_states["r"].block_ids == [[80]]
+
+
+def test_resolve_spec_tokens_without_a_drafter_skips_substitution():
+    """No drafter, asynchronous scheduler: the scheduler's own handoff, no substitution.
+
+    Regression: multimodal runners with a mock controller and no drafter hit
+    the placeholder substitution and failed to unpack its result (PR #18).
+    """
+    from unittest.mock import MagicMock
+
+    from tests.stub_runner import make_stub_runner
+
+    runner = make_stub_runner()
+    runner.use_async_scheduling = True
+    runner._drafter = None
+    runner._spec_decode_controller = MagicMock()
+    runner._spec_decode_controller.active_spec_decode_tokens = MagicMock(
+        return_value={}
+    )
+    output = MagicMock()
+    resolved, invalid = runner._resolve_spec_tokens(output)
+    assert resolved == {} and invalid == {}
+    runner._spec_decode_controller.substitute_retained_drafts.assert_not_called()
+    runner._spec_decode_controller.active_spec_decode_tokens.assert_called_once_with(
+        output
+    )
