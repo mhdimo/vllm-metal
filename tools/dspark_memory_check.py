@@ -470,8 +470,19 @@ def worker(config: dict, output: Path) -> None:
         mx.synchronize()
         assert abs(mx.get_active_memory() - active_samples[-1]) <= 2 * 1024**2
         assert not proposer._contexts
-    assert mx.get_peak_memory() <= budget, "peak active allocation exceeds allowance"
-    assert max(total_samples + [counts["max_active_plus_cache_bytes"]]) <= budget
+    peak = mx.get_peak_memory()
+    observed = max(total_samples + [counts["max_active_plus_cache_bytes"]])
+    if peak > budget:
+        raise AssertionError(
+            f"peak active allocation {peak / 1024**3:.2f} GB exceeds the allowance "
+            f"{budget / 1024**3:.2f} GB"
+        )
+    if observed > budget:
+        raise AssertionError(
+            f"active plus cache memory {observed / 1024**3:.2f} GB exceeds the "
+            f"allowance {budget / 1024**3:.2f} GB (peak active {peak / 1024**3:.2f} GB, "
+            f"cache limit {mx.get_cache_limit() / 1024**3:.2f} GB)"
+        )
     if width:
         assert counts["verified"] > 0 and counts["accepted"] > 0
         if config["faults"]:
