@@ -46,6 +46,7 @@ _CLEAN_STEP_KWARGS = {
     "has_structured_output": False,
     "has_mm_decode": False,
     "decode_req_ids": (),
+    "drafter_needs_sync": False,
 }
 
 _GREEDY_SAMPLING_KWARGS = {
@@ -206,6 +207,7 @@ class TestGate:
             ("has_preempted_requests", True, "preempted requests"),
             ("has_encoder_inputs", True, "encoder inputs scheduled"),
             ("has_spec_tokens", True, "speculative decode"),
+            ("drafter_needs_sync", True, "drafter may draft"),
             ("has_structured_output", True, "structured output"),
             ("has_mm_decode", True, "multimodal decode state"),
         ],

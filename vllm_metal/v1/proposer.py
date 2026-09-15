@@ -17,7 +17,7 @@ exact proposal distributions of its scheduled drafts as ``proposals``
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import mlx.core as mx
 from vllm.v1.outputs import DraftTokenIds
@@ -93,6 +93,33 @@ class MetalProposer(Protocol):
         blocks) must release it here rather than hold it while the request waits;
         a stateless proposer is a no-op.
         """
+        ...
+
+
+@runtime_checkable
+class DeferredStepProposer(Protocol):
+    """A proposer that stays current on steps whose sampling sync is deferred.
+
+    The decode pipeline (``decode_pipeline.py``) keeps a pure-decode step's
+    sampled tokens on the device until the next step. A proposer that can
+    advance its per-request state from that step's target features alone,
+    without the token values, implements this seam; the runner then defers
+    such a step when :meth:`deferred_step_allowed` says the proposer will not
+    draft at its end, and hands it the step through
+    :meth:`ingest_deferred_step` instead of :meth:`MetalProposer.propose`.
+    Proposers without this seam keep the pipeline off for the server's life.
+    """
+
+    def deferred_step_allowed(
+        self,
+        decode_reqs: Sequence[tuple[str, RequestState]],
+        num_speculative_tokens: int,
+    ) -> bool:
+        """Whether this pure-decode step may defer its sampling sync."""
+        ...
+
+    def ingest_deferred_step(self, ctx: ProposeContext) -> None:
+        """Consume a deferred step: ``ctx.decode_token_ids`` carries no values."""
         ...
 
 

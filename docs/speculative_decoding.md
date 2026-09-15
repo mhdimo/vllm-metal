@@ -19,8 +19,9 @@ All four methods currently have these Metal-specific constraints:
   penalties, token constraints, or sample logprobs) are drafted. MTP,
   draft-model and n-gram drafting requires greedy requests; DSpark also
   drafts plain sampled requests. Other requests run without speculation.
-- Scheduling must be synchronous. The Metal platform disables async scheduling
-  when speculative decoding is configured.
+- MTP, draft-model and n-gram scheduling must be synchronous: the Metal
+  platform disables async scheduling for them. A DSpark server keeps vLLM's
+  asynchronous scheduler (see [DSpark](#dspark)).
 - Pipeline parallelism is not supported with speculative decoding.
 - Hybrid GDN targets and heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
@@ -106,8 +107,8 @@ pass, and a rank-256 Markov head corrects each position on the token before
 it. The target then verifies the block exactly as for the other methods, so
 greedy output is unchanged. The Metal implementation covers greedy and
 sampled drafting and verification with a bounded per-request drafter context,
-and adds calibrated adaptive planning that skips drafting when it does not
-pay.
+adds calibrated adaptive planning that skips drafting when it does not pay,
+and runs under vLLM's asynchronous scheduler.
 
 A DSpark drafter is **trained per target** — it consumes that target's
 hidden states and predicts that target's continuations, so it only works for
@@ -146,8 +147,9 @@ checkpoint's `block_size`. vLLM itself implements DSpark only in its GPU
 V2 model runner and rejects the `dspark` method on the V1 runner that Metal
 uses, so after validating the pair the platform presents it to vLLM as the
 `draft_model` method; the Metal runner recognises the drafter under either
-name. Async scheduling is downgraded to synchronous by the platform, as for
-every Metal speculative method.
+name. A DSpark server runs vLLM's asynchronous scheduler, vLLM's own
+production default; the other Metal speculative methods downgrade async
+scheduling to synchronous.
 
 Startup validates the pair — a `Qwen3ForCausalLM` target with a
 `Qwen3DSparkModel` drafter of matching hidden size, vocabulary and layer
@@ -171,13 +173,18 @@ machine's cost model (`VLLM_METAL_DSPARK_CALIBRATION`,
 `VLLM_METAL_DSPARK_COST_MODEL`), produced by the tools described in
 [Tools](tools.md#dspark-adaptive-mode-artifacts); startup fails with the
 reason when either is missing or belongs to another pair.
+`VLLM_METAL_DSPARK_DRAFT_PRECISION=source` keeps the drafter in the
+checkpoint's own precision instead of the qualified affine 4-bit conversion
+(more memory, a different cost profile; re-profile the cost model for it).
 
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,
 target_layer_ids=[...]) ... mode=<fixed|adaptive|bypass>` with the reserved
-context, capture and workspace sizes, and the periodic
+context, capture and workspace sizes, the periodic
 `SpecDecoding metrics ... Avg Draft acceptance rate` line reflects the live
-acceptance. `tools/check_sd_lossless.py --method dspark`
+acceptance, and every 2,000 drafting steps the proposer logs a
+`DSpark counters` snapshot (bypass reasons, proposed, scheduled and accepted
+tokens, per-position acceptance, planner lengths). `tools/check_sd_lossless.py --method dspark`
 compares a pair's greedy output against a target-only engine
 (see [Tools](tools.md#speculative-decoding-losslessness)).
 
@@ -191,6 +198,13 @@ compares a pair's greedy output against a target-only engine
   token from the target distribution, all from the request's own random
   streams (seeded requests reproduce). The emitted distribution equals the
   target's; the tokens at a given seed differ from target-only serving.
+- **Load regime.** When the calibrated planner declines to draft for 32
+  consecutive steps (the batch is too large for verification to pay on this
+  machine), the proposer lapses: no target feature is captured, no context is
+  kept, and the server runs at target-only cost; it primes new requests again
+  once the load has dropped below the count it lapsed at and the planner
+  would draft, on 8 consecutive steps. The bypass mode lapses from the start
+  (`VLLM_METAL_DSPARK_LAPSE`).
 - **Contiguous per-request context.** The proposer keeps, for each request,
   the drafter's context KV over every committed target position. Every
   prefill chunk contributes its captured features (including chunks that
@@ -201,16 +215,32 @@ compares a pair's greedy output against a target-only engine
   prefix caching on (the default), requests that share a cached prefix
   of at least one KV block are therefore not drafted; pass
   `--no-enable-prefix-caching` to draft such workloads.
-- **Batched drafting.** Every eligible request drafts in one backbone pass
-  over padded contexts. Memory is reserved for
+- **Batched drafting.** The backbone runs across selected requests, each row
+  attending to its own slot of a per-layer context arena (no padding, gather
+  or mask), and a step's accepted rows are ingested in one batched pass per
+  layer. Memory is reserved for up to
   `min(max_num_seqs, VLLM_METAL_DSPARK_MAX_CONTEXTS)` complete contexts
   (default 32); a request scheduled while every slot is held uses target-only
-  generation. `VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP` bounds the requests
-  drafted per step with least-recently-drafted rotation; see
+  generation, and slots are reused as requests finish.
+  `VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP` bounds the requests drafted per
+  step with least-recently-drafted rotation; see
   [configuration](configuration.md#environment-variables).
-- **Bounded memory.** The drafter's context, capture staging and per-step
-  workspace are reserved before the target KV cache is sized and appear as
-  `dspark_context_and_workspace` in the paged-attention plan log line. A
+- **Decode pipeline on non-drafting steps.** The proposer can consume a
+  pure-decode step whose sampling sync the runner's one-step-ahead pipeline
+  defers (the `bypass` mode, or the `adaptive` planner's bypass decision for
+  the batch), ingesting that step's target features without the sampled
+  token values; drafting and verification steps stay synchronous.
+- **Asynchronous scheduling.** A DSpark server runs vLLM's asynchronous
+  scheduler (the production default for target-only serving): the scheduler
+  books `num_speculative_tokens` placeholder slots per running request and
+  the runner fills them with the drafts it produced at the end of the
+  request's previous step, reporting unused slots so the speculative-decode
+  metrics count real drafts. `--no-async-scheduling` keeps every step
+  synchronous; the other Metal speculative methods always are.
+- **Bounded memory.** The drafter's context arena is allocated when the
+  drafter loads; its capture staging and per-step workspace are reserved
+  before the target KV cache is sized and appear as
+  `dspark_capture_and_workspace` in the paged-attention plan log line. A
   configuration that cannot fit fails at startup naming the limits to lower
   (`--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens`); a
   recoverable allocation failure while drafting releases the draft context
@@ -219,58 +249,77 @@ compares a pair's greedy output against a target-only engine
 ### Performance
 
 Measured on an Apple M5 Max (48 GB) with `mlx-community/Qwen3-4B-4bit` and
-`deepseek-ai/dspark_qwen3_4b_block7`, against a target-only server started
-with identical flags. `vllm bench serve --temperature 0`, so these cells
-compare the greedy path against the same target-only baseline; sampled drafting
-is covered below. The `/metrics` spec-decode counters confirm each speculative
-run drafted.
+`deepseek-ai/dspark_qwen3_4b_block7`. Serving figures are paired A/B runs
+against a target-only server started with identical flags: the two servers
+alternate, five repeats per cell, 95% confidence interval by bootstrap, and a
+pair is discarded and retried if another process loads the machine while it
+runs.
 
-Natural short prompts (10 each from the DeepSpec gsm8k, humaneval, mbpp and
-alpaca sets, chat template, 256 output tokens), `--max-num-seqs 4`:
+### Serving
 
-| Server | Clients | Output tok/s | Median TPOT | Accepted per round |
-| --- | --- | --- | --- | --- |
-| target-only | 1 | 153.1 | 6.4 ms | – |
-| DSpark K=4 | 1 | 178.7 (+17%) | 5.1 ms | 1.79 of 4 |
-| DSpark K=7 | 1 | 149.9 (−2%) | 6.5 ms | 2.05 of 7 |
-| target-only | 4 | 463.3 | 8.5 ms | – |
-| DSpark K=4 | 4 | 374.3 (−19%) | 9.7 ms | 1.39 of 4 |
-| DSpark K=7 | 4 | 358.5 (−23%) | 9.6 ms | 1.53 of 7 |
+`adaptive` mode against target-only, prompt length × output length, one to
+eight clients:
 
-The `sonnet` benchmark (≈550-token prompts sharing a 200-token prefix, 150
-output tokens) with prefix caching disabled on both servers, so the shared
-prefix does not turn the requests target-only:
+| Prompt × output | Clients | Fixed `K=7` | `adaptive` |
+| --- | --- | --- | --- |
+| 128 × 128 | 1 | +5.7% [4.6, 12.7] | **+50.1%** [41.5, 57.0] |
+| 128 × 128 | 8 | −11.8% [−21.2, 6.6] | **−5.9%** [−28.0, 38.0] |
+| 1024 × 128 | 1 | −18.1% [−32.2, −6.3] | **+6.2%** [−27.3, 33.4] |
+| 1024 × 128 | 8 | −30.4% [−37.3, −11.6] | **−6.3%** [−20.6, 3.3] |
 
-| Server | Clients | Output tok/s | Median TPOT | Accepted per round |
-| --- | --- | --- | --- | --- |
-| target-only | 1 | 138.1 | 6.5 ms | – |
-| DSpark K=4 | 1 | 159.4 (+15%) | 5.7 ms | 1.66 of 4 |
-| target-only | 4 | 327.0 | 9.5 ms | – |
-| DSpark K=4 | 4 | 248.5 (−24%) | 14.3 ms | 1.62 of 4 |
+The planner reaches this by not drafting when verification will not repay it.
+Across the 128 × 128 cells at four, eight and sixteen clients it issues 12, 26
+and 28 draft tokens in total; fixed `K=7` issues 24,063 at eight clients. The
+residual few percent is the capture and planning the server still does while
+bypassing, and the load regime bounds it further by stopping capture entirely
+while the planner keeps declining.
 
-A fixed draft width is a single-stream win at `K=4` and a loss once several
-requests share a step: verification adds `K` rows per request per step, and a
-wider block adds rows faster than it adds accepted tokens. Choose `K` for the
-workload, and leave the method off for a server that is usually busy.
-Plain sampled requests are drafted and verified by exact rejection sampling at
-the same throughput as the greedy cells above.
+Long outputs are where drafting pays most, and the planner keeps drafting
+there: 128 × 512 at one client is +28.3% [24.9, 47.6], and at eight clients it
+resumes drafting mid-run (5,525 accepted of 5,740 drafted) for −1.3%
+[−14.1, 7.3].
 
-`adaptive` mode removes the fixed-width trade-off by deciding it per step. The
-planner reads the drafter's own confidence head, calibrated per mode against
-observed acceptance (`tools/dspark_confidence_calibrate.py`), and the step
-costs measured through the serving path on this machine
-(`tools/dspark_cost_profile.py`). It then chooses the draft width whose
-expected step cost per accepted token is lowest, and bypasses drafting
-entirely when no width beats a plain decode step. On the cells above that
-means it drafts at one client and stops drafting at four and beyond, so the
-single-stream win is kept without the multi-client loss. Both artifacts are
-optional: without them the proposer serves at its fixed width, exactly as
-before.
+### Single stream against the standalone runtime
+
+The same three prompts through `mlx-dspark`, the reference standalone MLX
+implementation of this drafter, and through this port (200 new tokens, three
+trials, `MLX_ENABLE_TF32=0` on both):
+
+| Prompt | `mlx-dspark` | This port |
+| --- | --- | --- |
+| chat | 181.3 → 212.4 tok/s (1.17×) | 142.8 → 217.6 tok/s (**1.52×**) |
+| code | 182.8 → 205.9 tok/s (1.13×) | 142.3 → 311.2 tok/s (**2.19×**) |
+| math | 182.1 → 209.4 tok/s (1.15×) | 138.5 → 317.0 tok/s (**2.29×**) |
+
+Each row is that runtime's own target-only rate → its DSpark rate. The paged
+target here starts slower than the standalone MLX one, and ends faster.
+
+### Accepted length per drafting round
+
+Full block width, `T=1.0`, 64 prompts per set from the DeepSpec evaluation
+sets, against the DSpark paper's Table 1 (bf16 target, full sets, 2,048
+tokens):
+
+| Evaluation set | This port | Paper | Acceptance rate |
+| --- | --- | --- | --- |
+| gsm8k | 6.12 | 6.11 | 73.2% |
+| math500 | 5.69 | 5.70 | 67.2% |
+| humaneval | 5.11 | 5.38 | 58.8% |
+| mbpp | 4.81 | 5.13 | 54.4% |
+| mt-bench | 3.54 | 3.64 | 36.5% |
+| alpaca | 3.40 | 3.54 | 34.3% |
+
+The drafter reproduces the published acceptance lengths on a 4-bit target,
+which is the check that the port is faithful rather than merely fast.
+
+### What still costs
 
 Requests that hit the target prefix cache are never drafted — their hidden
 states were never captured — so with the default prefix caching a workload
-with a long shared prefix pays the idle drafter's cost (11–13% on the sonnet
-workload above). Pass `--no-enable-prefix-caching` for such workloads.
+with a long shared prefix pays the idle drafter's cost. Pass
+`--no-enable-prefix-caching` for such workloads. Both the calibration and the
+cost model are per machine and per model pair; without them the proposer
+serves at its fixed width.
 
 ### Limitations
 
@@ -280,7 +329,8 @@ workload above). Pass `--no-enable-prefix-caching` for such workloads.
 - **Concurrency.** Verifying `K+1` rows per request costs more than a decode
   step on this path, so a fixed width loses once several requests share a
   step. The `adaptive` mode weighs that trade-off per step from the pair's
-  calibration and this machine's cost model.
+  calibration and this machine's cost model, and the load regime stops
+  capturing and drafting while the planner declines (see Performance).
 - **Output parity is exact up to the target's own numerical stability.**
   `tools/check_sd_lossless.py` on the 4B pair (12 prompts, 64 greedy tokens):
   served one prompt at a time, K=4 and K=7 each give 5 exact outputs and 7
@@ -293,10 +343,9 @@ workload above). Pass `--no-enable-prefix-caching` for such workloads.
   16-token prefill chunks. The n-gram method on the same target and batch
   shows the same class (9 exact, 3 ties). Degenerate repetitive prompts can
   flip between near-tied tokens on any execution path.
-- **Not implemented:** asynchronous scheduling, LoRA and tensor or pipeline
-  parallelism. The `adaptive` mode needs a per-pair calibration artifact and a
-  cost model measured on the serving machine; without them, serve the `fixed`
-  mode.
+- **Not implemented:** LoRA and tensor or pipeline parallelism. The `adaptive`
+  mode needs a per-pair calibration artifact and a cost model measured on the
+  serving machine; without them, serve the `fixed` mode.
 
 ---
 

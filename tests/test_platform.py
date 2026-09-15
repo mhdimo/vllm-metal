@@ -1172,6 +1172,30 @@ class TestMetalPlatform:
 
         assert vllm_config.scheduler_config.async_scheduling is False
 
+    def test_check_and_update_config_keeps_async_scheduling_for_dspark(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """DSpark follows the asynchronous scheduler's placeholder contract."""
+        monkeypatch.setattr(
+            "vllm_metal.v1.dspark.contracts.validate_dspark_config",
+            lambda *args, **kwargs: None,
+        )
+        vllm_config = self._platform_config(
+            speculative_config=SimpleNamespace(
+                use_heterogeneous_vocab=False,
+                num_speculative_tokens=7,
+                method="dspark",
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(block_size=8, target_layer_ids=[0, 2])
+                ),
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=True),
+        )
+
+        MetalPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.async_scheduling is True
+
     def test_check_and_update_config_rejects_hybrid_all_cache_mode(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
