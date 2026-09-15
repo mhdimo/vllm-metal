@@ -8,8 +8,10 @@ are interchangeable implementations; the runner holds no per-method knowledge.
 
 The shared *verify* half stays in
 :class:`vllm_metal.v1.spec_decode.SpeculativeDecodeController`
-(``build_decode_segments`` + ``verify_greedy``); only the *propose* half is
-polymorphic here.
+(``build_decode_segments`` + ``verify``); only the *propose* half is
+polymorphic here. A proposer that drafts non-greedy requests exposes the
+exact proposal distributions of its scheduled drafts as ``proposals``
+(DSpark); the others draft greedy requests only.
 """
 
 from __future__ import annotations

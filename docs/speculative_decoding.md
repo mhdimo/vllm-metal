@@ -15,9 +15,10 @@ for method behavior and configuration details.
 
 All four methods currently have these Metal-specific constraints:
 
-- Only plain greedy requests (`temperature=0`, without penalties, token
-  constraints, or sample logprobs) are drafted. Other requests run without
-  speculation.
+- Only plain requests (greedy, or plain temperature/top-k/top-p without
+  penalties, token constraints, or sample logprobs) are drafted. MTP,
+  draft-model and n-gram drafting requires greedy requests; DSpark also
+  drafts plain sampled requests. Other requests run without speculation.
 - Scheduling must be synchronous. The Metal platform disables async scheduling
   when speculative decoding is configured.
 - Pipeline parallelism is not supported with speculative decoding.
@@ -103,9 +104,9 @@ the fused residuals of a few target layers (the drafter's `target_layer_ids`),
 proposes a `block_size`-token block (7 in the published checkpoints) in one
 pass, and a rank-256 Markov head corrects each position on the token before
 it. The target then verifies the block exactly as for the other methods, so
-greedy output is unchanged. The Metal implementation covers greedy drafting
-and verification with a per-request drafter context; DeepSpec's adaptive and
-sampled drafting modes are not implemented.
+greedy output is unchanged. The Metal implementation covers greedy and
+sampled drafting and verification with a bounded per-request drafter context;
+DeepSpec's adaptive drafting is not implemented.
 
 A DSpark drafter is **trained per target** — it consumes that target's
 hidden states and predicts that target's continuations, so it only works for
@@ -169,8 +170,14 @@ compares a pair's greedy output against a target-only engine
 
 ### Characteristics
 
-- **Greedy only**, like every Metal speculative method: sampled requests run
-  target-only.
+- **Greedy and sampled requests.** Greedy requests are verified exactly.
+  A plain temperature/top-k/top-p request samples its drafts from exact
+  float32 proposal distributions that stay attached to the scheduled proposal,
+  and verification accepts each draft with probability `min(1, p/q)`, samples
+  the first rejected position from the normalized residual and the bonus
+  token from the target distribution, all from the request's own random
+  streams (seeded requests reproduce). The emitted distribution equals the
+  target's; the tokens at a given seed differ from target-only serving.
 - **Contiguous per-request context.** The proposer keeps, for each request,
   the drafter's context KV over every committed target position. Every
   prefill chunk contributes its captured features (including chunks that
@@ -182,8 +189,12 @@ compares a pair's greedy output against a target-only engine
   of at least one KV block are therefore not drafted; pass
   `--no-enable-prefix-caching` to draft such workloads.
 - **Batched drafting.** Every eligible request drafts in one backbone pass
-  over padded contexts. Memory is reserved for `min(max_num_seqs, 32)`
-  complete contexts; requests beyond that use target-only generation.
+  over padded contexts. Memory is reserved for
+  `min(max_num_seqs, VLLM_METAL_DSPARK_MAX_CONTEXTS)` complete contexts
+  (default 32); a request scheduled while every slot is held uses target-only
+  generation. `VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP` bounds the requests
+  drafted per step with least-recently-drafted rotation; see
+  [configuration](configuration.md#environment-variables).
 - **Bounded memory.** The drafter's context, capture staging and per-step
   workspace are reserved before the target KV cache is sized and appear as
   `dspark_context_and_workspace` in the paged-attention plan log line. A
@@ -196,9 +207,10 @@ compares a pair's greedy output against a target-only engine
 
 Measured on an Apple M5 Max (48 GB) with `mlx-community/Qwen3-4B-4bit` and
 `deepseek-ai/dspark_qwen3_4b_block7`, against a target-only server started
-with identical flags. `vllm bench serve --temperature 0`: only greedy
-requests are drafted, so a sampled benchmark would measure an idle drafter.
-The `/metrics` spec-decode counters confirm each speculative run drafted.
+with identical flags. `vllm bench serve --temperature 0`, so these cells
+compare the greedy path against the same target-only baseline; sampled drafting
+is covered below. The `/metrics` spec-decode counters confirm each speculative
+run drafted.
 
 Natural short prompts (10 each from the DeepSpec gsm8k, humaneval, mbpp and
 alpaca sets, chat template, 256 output tokens), `--max-num-seqs 4`:
@@ -227,6 +239,14 @@ A fixed draft width is a single-stream win at `K=4` and a loss once several
 requests share a step: verification adds `K` rows per request per step, and a
 wider block adds rows faster than it adds accepted tokens. Choose `K` for the
 workload, and leave the method off for a server that is usually busy.
+Plain sampled requests (temperature, top-k, top-p, no penalties or token
+constraints) are drafted and verified by exact rejection sampling, at the same
+throughput as the greedy cells above: the verifier's work per step does not
+depend on the sampling parameters, only on the draft width.
+
+`VLLM_METAL_DSPARK_MAX_CONTEXTS` and `VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP`
+bound what a busy server spends on drafting, so the loss above is capped
+rather than growing with `--max-num-seqs`.
 
 Requests that hit the target prefix cache are never drafted — their hidden
 states were never captured — so with the default prefix caching a workload
@@ -252,9 +272,8 @@ workload above). Pass `--no-enable-prefix-caching` for such workloads.
   16-token prefill chunks. The n-gram method on the same target and batch
   shows the same class (9 exact, 3 ties). Degenerate repetitive prompts can
   flip between near-tied tokens on any execution path.
-- **Not implemented:** sampled-request verification, DeepSpec's adaptive and
-  confidence-based draft lengths, asynchronous scheduling, LoRA and tensor or
-  pipeline parallelism.
+- **Not implemented:** DeepSpec's adaptive and confidence-based draft lengths,
+  asynchronous scheduling, LoRA and tensor or pipeline parallelism.
 
 ---
 

@@ -72,7 +72,7 @@ def validate_dspark_config(config: VllmConfig) -> None:
             f"the checkpoint block_size ({dspark.block_size})"
         )
 
-    # These options otherwise reach the greedy MLX proposer without effect.
+    # vLLM options that select upstream implementations this proposer does not use.
     unsupported = {
         "enable_adaptive_verification": spec.enable_adaptive_verification,
         "draft_sample_method": spec.draft_sample_method != "greedy",
