@@ -66,6 +66,60 @@ nonzero when any prompt fails (1) or when the run was inconclusive (2). See the
 [speculative decoding guide](speculative_decoding.md) for what each method
 guarantees.
 
+## DSpark adaptive-mode artifacts
+
+The `adaptive` DSpark mode (`VLLM_METAL_DSPARK_MODE=adaptive`) plans each
+request's draft length from two artifacts that belong to one target and drafter
+pair: a confidence calibration and a cost model measured on the serving machine.
+Produce both with the pair you will serve, from a source checkout, alone on an
+idle machine. Each artifact records the pair's manifest, and startup rejects an
+artifact that belongs to another pair.
+
+**Confidence calibration** (`VLLM_METAL_DSPARK_CALIBRATION`): record the
+drafter's confidence and the verified outcomes for greedy and sampled requests,
+then fit one temperature per draft position.
+
+```bash
+python -m tools.dspark_confidence_calibrate record --target <target> --draft <drafter> \
+    --mode greedy --output calibration/greedy.json
+python -m tools.dspark_confidence_calibrate record --target <target> --draft <drafter> \
+    --mode stochastic --output calibration/stochastic.json
+python -m tools.dspark_confidence_calibrate fit \
+    --records calibration/greedy.json calibration/stochastic.json \
+    --output calibration/calibration.json
+```
+
+Recording runs the pair offline on 240 deterministic prompts (the natural prompts
+plus windows cut from this repository's documentation), split by prompt into
+calibration and holdout halves; `fit` reports calibration error before and after
+fitting on both halves. On an Apple M5 Max with the 4B pair, recording takes about a minute per mode
+and the fit a few seconds.
+
+**Cost model** (`VLLM_METAL_DSPARK_COST_MODEL`): measure the serving step for
+each request count, drafted width and decode context.
+
+```bash
+python -m tools.dspark_cost_profile --target <target> --draft <drafter> --output-dir cost
+```
+
+It starts one `vllm serve` per drafted width (width 0 runs the `bypass` mode, the
+step the planner weighs drafting against), streams concurrent requests, and takes
+the median gap between streamed chunks while every request of the batch is
+decoding. The drafter's own work per step comes from
+`tools/dspark_step_profile.py`, which instruments an in-process engine. Use
+`--requests`, `--widths` and `--contexts` to match the serving limits, and
+`--gpu-memory-utilization` for the memory allowance. The default grid (request counts 1-16, widths 0-7, three decode contexts) takes
+about twelve minutes on an M5 Max.
+
+Then serve with both artifacts:
+
+```bash
+VLLM_METAL_DSPARK_MODE=adaptive \
+VLLM_METAL_DSPARK_CALIBRATION=calibration/calibration.json \
+VLLM_METAL_DSPARK_COST_MODEL=cost/cost.json \
+vllm serve <target> --speculative-config '{"method":"dspark","model":"<drafter>","num_speculative_tokens":7}'
+```
+
 ## Scheduled and requested CI
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.

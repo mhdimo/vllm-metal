@@ -105,8 +105,9 @@ proposes a `block_size`-token block (7 in the published checkpoints) in one
 pass, and a rank-256 Markov head corrects each position on the token before
 it. The target then verifies the block exactly as for the other methods, so
 greedy output is unchanged. The Metal implementation covers greedy and
-sampled drafting and verification with a bounded per-request drafter context;
-DeepSpec's adaptive drafting is not implemented.
+sampled drafting and verification with a bounded per-request drafter context,
+and adds calibrated adaptive planning that skips drafting when it does not
+pay.
 
 A DSpark drafter is **trained per target** — it consumes that target's
 hidden states and predicts that target's continuations, so it only works for
@@ -160,11 +161,23 @@ headers against the config, rejects non-finite weights, converts one tensor
 at a time within the memory budget, and materializes the drafter before the
 target KV cache is sized.
 
+The serving mode is selected with `VLLM_METAL_DSPARK_MODE`: `fixed`, the
+default, verifies the configured width for every eligible request;
+`adaptive` plans each request's draft prefix from its calibrated confidence
+and the measured step costs, and skips drafting altogether when the bypass
+step is predicted to be faster; `bypass` keeps the drafter loaded but never
+drafts. The adaptive mode needs the pair's calibration artifact and this
+machine's cost model (`VLLM_METAL_DSPARK_CALIBRATION`,
+`VLLM_METAL_DSPARK_COST_MODEL`), produced by the tools described in
+[Tools](tools.md#dspark-adaptive-mode-artifacts); startup fails with the
+reason when either is missing or belongs to another pair.
+
 Confirm speculative decoding is active: the server log shows
 `DSpark drafter loaded for speculative decoding: <model> (block_size=7,
-target_layer_ids=[...])` with the reserved context, capture and workspace
-sizes, and the periodic `SpecDecoding metrics ... Avg Draft acceptance rate`
-line reflects the live acceptance. `tools/check_sd_lossless.py --method dspark`
+target_layer_ids=[...]) ... mode=<fixed|adaptive|bypass>` with the reserved
+context, capture and workspace sizes, and the periodic
+`SpecDecoding metrics ... Avg Draft acceptance rate` line reflects the live
+acceptance. `tools/check_sd_lossless.py --method dspark`
 compares a pair's greedy output against a target-only engine
 (see [Tools](tools.md#speculative-decoding-losslessness)).
 
@@ -239,14 +252,20 @@ A fixed draft width is a single-stream win at `K=4` and a loss once several
 requests share a step: verification adds `K` rows per request per step, and a
 wider block adds rows faster than it adds accepted tokens. Choose `K` for the
 workload, and leave the method off for a server that is usually busy.
-Plain sampled requests (temperature, top-k, top-p, no penalties or token
-constraints) are drafted and verified by exact rejection sampling, at the same
-throughput as the greedy cells above: the verifier's work per step does not
-depend on the sampling parameters, only on the draft width.
+Plain sampled requests are drafted and verified by exact rejection sampling at
+the same throughput as the greedy cells above.
 
-`VLLM_METAL_DSPARK_MAX_CONTEXTS` and `VLLM_METAL_DSPARK_MAX_DRAFTS_PER_STEP`
-bound what a busy server spends on drafting, so the loss above is capped
-rather than growing with `--max-num-seqs`.
+`adaptive` mode removes the fixed-width trade-off by deciding it per step. The
+planner reads the drafter's own confidence head, calibrated per mode against
+observed acceptance (`tools/dspark_confidence_calibrate.py`), and the step
+costs measured through the serving path on this machine
+(`tools/dspark_cost_profile.py`). It then chooses the draft width whose
+expected step cost per accepted token is lowest, and bypasses drafting
+entirely when no width beats a plain decode step. On the cells above that
+means it drafts at one client and stops drafting at four and beyond, so the
+single-stream win is kept without the multi-client loss. Both artifacts are
+optional: without them the proposer serves at its fixed width, exactly as
+before.
 
 Requests that hit the target prefix cache are never drafted — their hidden
 states were never captured — so with the default prefix caching a workload
@@ -258,8 +277,10 @@ workload above). Pass `--no-enable-prefix-caching` for such workloads.
 - **Matched models required.** Do not infer support for another target from
   a similar model name or tensor shape; only the Qwen3 family has a qualified
   hidden-state capture.
-- **Low-concurrency method.** The single-stream gain turns into a loss once
-  several requests share a step (see Performance).
+- **Concurrency.** Verifying `K+1` rows per request costs more than a decode
+  step on this path, so a fixed width loses once several requests share a
+  step. The `adaptive` mode weighs that trade-off per step from the pair's
+  calibration and this machine's cost model.
 - **Output parity is exact up to the target's own numerical stability.**
   `tools/check_sd_lossless.py` on the 4B pair (12 prompts, 64 greedy tokens):
   served one prompt at a time, K=4 and K=7 each give 5 exact outputs and 7
@@ -272,8 +293,10 @@ workload above). Pass `--no-enable-prefix-caching` for such workloads.
   16-token prefill chunks. The n-gram method on the same target and batch
   shows the same class (9 exact, 3 ties). Degenerate repetitive prompts can
   flip between near-tied tokens on any execution path.
-- **Not implemented:** DeepSpec's adaptive and confidence-based draft lengths,
-  asynchronous scheduling, LoRA and tensor or pipeline parallelism.
+- **Not implemented:** asynchronous scheduling, LoRA and tensor or pipeline
+  parallelism. The `adaptive` mode needs a per-pair calibration artifact and a
+  cost model measured on the serving machine; without them, serve the `fixed`
+  mode.
 
 ---
 

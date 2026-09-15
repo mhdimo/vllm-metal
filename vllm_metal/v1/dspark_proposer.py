@@ -19,6 +19,8 @@ import numpy as np
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 
+from vllm_metal.v1.dspark.adaptive import AdaptivePlanner, DSparkCounters
+from vllm_metal.v1.dspark.calibration import ConfidenceRecorder
 from vllm_metal.v1.dspark.config import DSparkConfig
 from vllm_metal.v1.dspark.memory import CONTEXT_ALIGNMENT, DSparkMemoryPlan
 from vllm_metal.v1.dspark.model import CtxCache, DSparkDrafter
@@ -87,6 +89,10 @@ class _DraftPlan:
     streams: RequestRandomStreams | None = None
 
 
+def _plan_mode(plan: _DraftPlan) -> str:
+    return "stochastic" if plan.transforms is not None else "greedy"
+
+
 class DSparkProposer:
     """DSpark proposer with contiguous per-request feature coverage.
 
@@ -127,17 +133,69 @@ class DSparkProposer:
         # in, so a binding cap rotates least-recently-drafted requests first.
         self._last_drafted: dict[str, int] = {}
         self._draft_step = 0
-        # Stochastic proposals of the most recent draft per request, consumed
-        # by the verifier at the request's next scheduled step, and the
-        # request-owned random streams behind them.
+        # Proposal records of the most recent draft per request (tokens,
+        # confidence logits, and for stochastic rows the exact distributions),
+        # consumed at the request's next scheduled step, and the request-owned
+        # random streams behind stochastic rows.
         self._proposals: dict[str, DSparkProposal] = {}
         self._streams: dict[str, RequestRandomStreams] = {}
         self._stream_ordinal = 0
+        # Optional confidence recorder (calibration tooling attaches it); it
+        # observes every verified proposal's raw logits and survival labels.
+        self.recorder: ConfidenceRecorder | None = None
+        # Adaptive mode (runner attaches it when configured): calibrated
+        # planning of each draft prefix and the draft-or-not decision.
+        self.adaptive: AdaptivePlanner | None = None
+        # Bypass mode: the drafter stays loaded and contexts advance, but no
+        # request is drafted (the planner's alternative step, made explicit).
+        self.bypass_only = False
+        self.counters = DSparkCounters()
 
     @property
     def proposals(self) -> Mapping[str, DSparkProposal]:
         """Proposal records of the drafts handed to the scheduler last step."""
         return self._proposals
+
+    def _observe_outcomes(self, ctx: ProposeContext) -> None:
+        """Feed the recorder with each scheduled proposal's verification outcome.
+
+        The runner has already committed the accepted prefix and the
+        correction or bonus token, so the accepted draft count is the distance
+        from the anchor to the new pending token minus one. Positions the
+        scheduler clipped are censored (the record is cut to the scheduled
+        width); a request that finished during verification is not scheduled
+        again and records nothing.
+        """
+        recorder = self.recorder
+        for (req_id, state), segment in zip(
+            ctx.decode_reqs, ctx.decode_segments, strict=True
+        ):
+            record = self._proposals.get(req_id)
+            width = len(segment.draft_token_ids)
+            if (
+                record is None
+                or record.confidence is None
+                or width == 0
+                or not record.matches(
+                    state, segment.cache_start_pos, segment.input_token_ids[0]
+                )
+                or list(record.token_ids[:width]) != list(segment.draft_token_ids)
+            ):
+                continue
+            accepted = len(state.token_ids) - 2 - segment.cache_start_pos
+            if not 0 <= accepted <= width:
+                continue
+            self.counters.observe_outcome(width, accepted)
+            if recorder is None:
+                continue
+            params = state.sampling_params
+            recorder.observe(
+                mode="stochastic" if record.stochastic else "greedy",
+                logits=record.confidence,
+                scheduled=width,
+                accepted=accepted,
+                temperature=float(params.temperature),
+            )
 
     def needs_target_hidden_states(
         self,
@@ -154,6 +212,8 @@ class DSparkProposer:
             self._last_drafted.pop(req_id, None)
             self._proposals.pop(req_id, None)
             self._streams.pop(req_id, None)
+        if self.adaptive is not None:
+            self.adaptive.forget(list(req_ids))
 
     def _streams_for(self, req_id: str, state: RequestState) -> RequestRandomStreams:
         streams = self._streams.get(req_id)
@@ -169,12 +229,14 @@ class DSparkProposer:
         return streams
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
+        self.counters.steps += 1
         scheduled = {seg.req_id for seg in ctx.decode_segments}
         scheduled.update(req_id for req_id, _ in ctx.decode_reqs)
         scheduled.update(pr.req_id for pr in ctx.prefill_reqs)
         # The scheduler consumes a request's drafts the next time it schedules
         # the request (verified this step, clipped, or dropped for a prefill
         # chunk), so a record of a scheduled request is spent either way.
+        self._observe_outcomes(ctx)
         for req_id in scheduled:
             self._proposals.pop(req_id, None)
         try:
@@ -227,12 +289,42 @@ class DSparkProposer:
                     plan = _DraftPlan(req_id, state.token_ids[-1], record, cap)
                 plans.append(plan)
             if not plans:
+                self._forget_idle(scheduled, ())
                 return None
             if not self._memory_available():
                 logger.debug("DSpark draft skipped: workspace memory budget exhausted")
+                self._forget_idle(scheduled, ())
                 return None
-            req_ids, rows, proposals = self._batch_draft(self._select_plans(plans))
+            if self.bypass_only:
+                self.counters.bypass_reasons["mode-bypass"] += 1
+                return None
+            selected = self._select_plans(plans)
+            active = self._active_requests(ctx)
+            context = self._batch_context(ctx)
+            if self.adaptive is not None:
+                decision = self.adaptive.decide(
+                    [
+                        (plan.req_id, plan.context.owner, _plan_mode(plan), plan.cap)
+                        for plan in selected
+                    ],
+                    active_requests=active,
+                    context=context,
+                )
+                if not decision.draft:
+                    self.counters.bypass_reasons[decision.reason] += 1
+                    self._forget_idle(scheduled, ())
+                    return None
+            req_ids, rows, proposals = self._batch_draft(selected)
+            if self.adaptive is not None:
+                req_ids, rows = self._allocate(
+                    selected, req_ids, rows, proposals, active, context
+                )
+            self._forget_idle(scheduled, req_ids)
             self._proposals.update(proposals)
+            self.counters.drafting_steps += 1
+            self.counters.proposed_tokens += sum(len(row) for row in rows)
+            if not req_ids:
+                return None
             return DraftTokenIds(req_ids=req_ids, draft_token_ids=rows)
         except Exception as error:
             # A partially written layer set cannot survive an ingest/draft
@@ -259,6 +351,83 @@ class DSparkProposer:
                 )
                 return None
             raise
+
+    @staticmethod
+    def _active_requests(ctx: ProposeContext) -> int:
+        """Requests the next target step decodes or verifies (one row each at least)."""
+        decoding = sum(1 for ids in ctx.decode_token_ids if ids)
+        finishing = sum(
+            1 for mode in ctx.prefill_result_modes if mode != "intermediate"
+        )
+        return max(1, decoding + finishing)
+
+    @staticmethod
+    def _batch_context(ctx: ProposeContext) -> int:
+        """Mean committed length of the requests the next step decodes."""
+        lengths = [
+            len(state.token_ids)
+            for (_, state), ids in zip(
+                ctx.decode_reqs, ctx.decode_token_ids, strict=True
+            )
+            if ids
+        ]
+        for prefill, mode in zip(
+            ctx.prefill_reqs, ctx.prefill_result_modes, strict=True
+        ):
+            if mode != "intermediate":
+                state = ctx.request_states.get(prefill.req_id)
+                if state is not None:
+                    lengths.append(len(state.token_ids))
+        return max(1, round(sum(lengths) / len(lengths))) if lengths else 1
+
+    def _forget_idle(self, scheduled: set[str], drafted: Sequence[str]) -> None:
+        if self.adaptive is not None:
+            self.adaptive.forget_idle(sorted(scheduled), drafted)
+
+    def _allocate(
+        self,
+        plans: list[_DraftPlan],
+        req_ids: list[str],
+        rows: list[list[int]],
+        proposals: dict[str, DSparkProposal],
+        active: int,
+        context: int,
+    ) -> tuple[list[str], list[list[int]]]:
+        """Cut every drafted row to the planner's prefix; drop empty ones."""
+        assert self.adaptive is not None
+        lengths = self.adaptive.allocate(
+            [
+                (
+                    plan.req_id,
+                    plan.context.owner,
+                    _plan_mode(plan),
+                    plan.cap,
+                    proposals[plan.req_id].confidence or [],
+                )
+                for plan in plans
+            ],
+            active_requests=active,
+            context=context,
+        )
+        plan_result = self.adaptive.last_plan
+        self.counters.planner_predicted_ratio = plan_result.ratio
+        self.counters.planner_target_only_ratio = plan_result.target_only_ratio
+        kept_ids: list[str] = []
+        kept_rows: list[list[int]] = []
+        for req_id, row, length in zip(req_ids, rows, lengths, strict=True):
+            self.counters.planner_lengths[length] += 1
+            if length <= 0:
+                proposals.pop(req_id, None)
+                continue
+            record = proposals[req_id]
+            record.token_ids = row[:length]
+            if record.distributions is not None:
+                record.distributions = record.distributions[:length]
+            if record.confidence is not None:
+                record.confidence = record.confidence[:length]
+            kept_ids.append(req_id)
+            kept_rows.append(row[:length])
+        return kept_ids, kept_rows
 
     def _select_plans(self, plans: list[_DraftPlan]) -> list[_DraftPlan]:
         """Apply the per-step draft cap fairly.
@@ -594,6 +763,21 @@ class DSparkProposer:
             drafts.append(tokens)
             previous = tokens
         draft_array = mx.stack(drafts, axis=1)
+        # Raw confidence logit per block position: the head reads the block
+        # hidden state and the embedding of the token preceding each position
+        # (the anchor, then the drafted tokens), as in the reference evaluator.
+        confidence = None
+        if self._drafter.confidence_head is not None:
+            previous_tokens = mx.concatenate(
+                [
+                    mx.array([[plan.pending] for plan in plans], dtype=mx.int32),
+                    draft_array[:, : cap - 1],
+                ],
+                axis=1,
+            )
+            confidence = self._drafter.confidence_logits(
+                hidden[:, :cap], previous_tokens
+            ).astype(mx.float32)
         slices = []
         if distributions:
             stacked = mx.stack(distributions, axis=1)
@@ -601,19 +785,30 @@ class DSparkProposer:
                 stacked[position, : plans[index].cap]
                 for position, index in enumerate(stochastic)
             ]
-        mx.eval(draft_array, *slices)
+        mx.eval(draft_array, *slices, *([confidence] if confidence is not None else []))
         rows = cast("list[list[int]]", draft_array.tolist())
         clipped = [row[: plan.cap] for row, plan in zip(rows, plans, strict=True)]
+        confidence_rows = (
+            cast("list[list[float]]", confidence.tolist())
+            if confidence is not None
+            else None
+        )
         proposals = {}
-        for position, index in enumerate(stochastic):
-            plan = plans[index]
+        stochastic_slot = {index: position for position, index in enumerate(stochastic)}
+        for index, plan in enumerate(plans):
+            slot = stochastic_slot.get(index)
             proposals[plan.req_id] = DSparkProposal(
                 owner=plan.context.owner,
                 anchor_position=plan.context.covered_end,
                 anchor_token=plan.pending,
                 token_ids=clipped[index],
-                distributions=slices[position],
-                transforms=cast("SamplingTransforms", plan.transforms),
-                streams=cast("RequestRandomStreams", plan.streams),
+                distributions=slices[slot] if slot is not None else None,
+                transforms=plan.transforms,
+                streams=plan.streams,
+                confidence=(
+                    confidence_rows[index][: plan.cap]
+                    if confidence_rows is not None
+                    else None
+                ),
             )
         return [plan.req_id for plan in plans], clipped, proposals
