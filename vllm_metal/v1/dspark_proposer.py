@@ -36,12 +36,14 @@ class DSparkProposer(BlockDraftProposer):
         num_draft_tokens: int,
         controller: SpeculativeDecodeController,
         draft_topk: int | None = None,
+        enable_prefix_caching: bool = False,
     ) -> None:
         model.validate_draft_topk(draft_topk, model.config.backbone.vocab_size)
         super().__init__(
             model.backbone,
             num_draft_tokens=num_draft_tokens,
             controller=controller,
+            enable_prefix_caching=enable_prefix_caching,
         )
         self.draft_model = model
         self.draft_topk = draft_topk
@@ -92,6 +94,7 @@ class DSparkProposer(BlockDraftProposer):
             num_draft_tokens=spec.num_speculative_tokens,
             controller=runner._spec_decode_controller,
             draft_topk=draft_topk,
+            enable_prefix_caching=runner.vllm_config.cache_config.enable_prefix_caching,
         )
         proposer.max_model_len = min(
             proposer.max_model_len, spec.draft_model_config.max_model_len

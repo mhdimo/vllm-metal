@@ -113,7 +113,10 @@ def test_candidate_limit_resolves_explicit_option_before_checkpoint(
         num_speculative_tokens=7,
     )
     runner = SimpleNamespace(
-        vllm_config=SimpleNamespace(speculative_config=spec),
+        vllm_config=SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=False),
+        ),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(to_dict=dict)),
         kv_cache_dtype=mx.float16,
         _spec_decode_controller=SpeculativeDecodeController(),
