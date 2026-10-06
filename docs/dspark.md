@@ -3,8 +3,9 @@
 DSpark greedy serving is an experimental stage of [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825).
 It uses the shared DFlash target-capture and committed-feature lifecycle with
 scheduler-owned draft KV. DSpark's own embeddings and Markov head propose tokens;
-the target verifies every proposal. Confidence-based planning, sampled
-verification, prefix reuse, and asynchronous scheduling remain subsequent work.
+the target verifies every proposal. Prefix reuse is supported in synchronous
+serving. Confidence-based planning, sampled verification, and asynchronous
+scheduling remain subsequent work.
 
 `vllm_metal/v1/dspark.py` adapts the [MIT-licensed DeepSpec implementation](https://github.com/deepseek-ai/DeepSpec/blob/005e03b81cec38b7da6399833d609ee89a2587f2/LICENSE).
 It retains DeepSpec's copyright and full MIT permission notice, following the
@@ -16,7 +17,7 @@ existing DFlash module's approach to third-party attribution.
 vllm serve mlx-community/Qwen3-4B-4bit \
     --revision 4dcb3d101c2a062e5c1d4bb173588c54ea6c4d25 \
     --max-model-len 2048 \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
     --no-async-scheduling \
     --speculative-config '{
       "method": "dspark",
@@ -41,7 +42,16 @@ verified target features still commit during a pause. A K-token proposal writes
 exactly K draft slots (anchor plus K-1 masks), including at the context boundary.
 Drafting stops when the selected span would exceed the effective target/draft
 context limit. Cancellation and preemption discard logical feature coverage;
-recomputation overwrites reused pages before drafting resumes.
+resumed prefills adopt the scheduler's new common prefix and commit the suffix
+before drafting resumes.
+
+Prefix reuse follows the shared [DFlash cache lifecycle](dflash.md#cache-lifecycle-and-validation).
+Both target and draft groups must have the prefix; an independently missing
+group forces suffix recomputation. Fallback and zero-width requests still commit
+draft features, so they can populate reusable prefixes. The scheduler owns
+hashing, shared pages, eviction, and cache reset. Its existing speculative
+block-drop policy stays in effect, and temporary draft slots are never committed
+prefix data. Use `--no-enable-prefix-caching` for a cold-cache comparison.
 
 `enable_adaptive_verification`, non-greedy `draft_sample_method`, and nonstandard
 `rejection_sample_method` are rejected rather than ignored.
@@ -74,11 +84,27 @@ reuse, stop/EOS handling, and scheduler-driven width changes through zero.
 
 ```bash
 pytest -m slow tests/test_block_draft_serving_e2e.py tests/test_block_draft_schedule_e2e.py
+pytest -m slow tests/test_block_draft_prefix_caching_e2e.py -k dspark
 python -m tools.dflash_serving_parity \
     --method dspark --num-draft-tokens 7 \
     --target /path/to/target/snapshot --draft /path/to/draft/snapshot \
     --batch-size 1 2 --max-tokens 32 --output-dir /path/to/new-serving-results
 ```
+
+The prefix-reuse tests pin the documented 4B target/DSpark revisions and
+use K=7 with top-K=64 in both verification layouts. They require exact output IDs
+against cache-disabled serving, observed cache hits and verified drafts after
+reuse, reduced prefill work, fallback-produced prefixes, shared prompts,
+cancellation, and cache-pressure resume. Per-case IDs, counters, and elapsed times
+are retained in pytest's temporary directory; timings are observations rather
+than performance gates. A retained-page preemption case requires a nonzero hit
+on resume. A deliberately incorrect proposal exercises rejection without relying
+on the model making a natural mistake; its output must still match the original
+greedy continuation.
+The first verification window also checks the sampled anchor, absolute position,
+and first-proposal IDs against cache-disabled serving, so target corrections cannot
+hide a draft shift after prefill or resume. Separately trained drafters are not
+required to match an identical target/draft-model control's acceptance rate.
 
 The shared parity tool compares native mlx-lm, target-only serving, and DSpark
 serving. It records actual verification counts and reports `EXACT`, `TOP_K_MATCH`,

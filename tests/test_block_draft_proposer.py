@@ -237,6 +237,45 @@ def test_prefix_caching_cannot_adopt_unknown_decode_coverage(proposer):
     assert not proposer._valid_ends
 
 
+@pytest.mark.parametrize("start", [0, 16])
+def test_first_prefill_draft_uses_sampled_anchor_at_absolute_position(
+    proposer, monkeypatch, start
+):
+    proposer.enable_prefix_caching = True
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2, 7, 1]],
+    )
+    features = _features(31)
+    if start:
+        proposer.cache.write_context(
+            [f[:start] for f in features], [(state.block_ids[1], 0, start)]
+        )
+    compile_draft = proposer._compile_draft
+    calls = []
+
+    def record_compile(width):
+        forward = compile_draft(width)
+
+        def record_forward(anchors, rows):
+            calls.append((anchors.tolist(), rows))
+            return forward(anchors, rows)
+
+        return record_forward
+
+    monkeypatch.setattr(proposer, "_compile_draft", record_compile)
+    result = proposer.propose(
+        _prefill(state, [f[start:] for f in features], start, True)
+    )
+    assert result is not None
+    # The final prompt token is 1; the target has already emitted anchor 2 at
+    # position 31. A cached suffix must preserve that absolute position and
+    # must not draft from the final prompt token or ingest anchor 2 twice.
+    assert calls == [([2], [(state.block_ids[1], 31)])]
+
+
 @pytest.mark.parametrize("proposer_cls", [DFlashProposer, DSparkProposer])
 @pytest.mark.parametrize("restriction", ["lora", "tp", "block_size"])
 def test_unsupported_configuration_fails_before_loading(restriction, proposer_cls):
