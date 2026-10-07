@@ -13,7 +13,12 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 from vllm.v1.request import Request
 
-from tests.test_block_draft_proposer import _dense_tokens, _features, _prefill
+from tests.test_block_draft_proposer import (
+    _assert_committed,
+    _dense_tokens,
+    _features,
+    _prefill,
+)
 from tests.test_dflash_paged import make_cache
 from tests.test_dspark_paged import make_cache as make_dspark_cache
 from vllm_metal.attention.caches.storage import KVCacheStorage
@@ -128,26 +133,6 @@ def _context(manager, request, features, start, *, final=True):
     )
 
 
-def _assert_committed(proposer, manager, request, features):
-    blocks = manager.get_blocks(request.request_id).get_block_ids()[1]
-    for layer, (keys, values) in enumerate(
-        proposer.model._project_context([f[None] for f in features])
-    ):
-        for stored, expected in (
-            (proposer.cache.cache.key_caches[layer], keys),
-            (proposer.cache.cache.value_caches[layer], values),
-        ):
-            actual = mx.stack(
-                [stored[blocks[p // 16], p % 16] for p in range(len(features[0]))]
-            )
-            np.testing.assert_allclose(
-                np.array(actual),
-                np.array(expected[0].transpose(1, 0, 2)),
-                atol=0.004,
-                rtol=0.004,
-            )
-
-
 @pytest.mark.parametrize("live", [False, True])
 @pytest.mark.parametrize("drop", [False, True])
 def test_scheduler_hits_share_only_committed_prefix(runtime, live, drop):
@@ -184,7 +169,9 @@ def test_scheduler_hits_share_only_committed_prefix(runtime, live, drop):
         result.draft_token_ids
         == _dense_tokens(proposer, mx.array([4]), [f[None] for f in full], 3).tolist()
     )
-    _assert_committed(proposer, manager, second, full)
+    _assert_committed(
+        proposer, manager.get_blocks(second.request_id).get_block_ids()[1], full
+    )
     for saved, stored in zip(
         shared,
         [
@@ -224,7 +211,9 @@ def test_missing_group_recomputes_common_suffix(runtime, missing_group):
         proposer.propose(_context(manager, second, [f[start:] for f in full], start))
         is not None
     )
-    _assert_committed(proposer, manager, second, full)
+    _assert_committed(
+        proposer, manager.get_blocks(second.request_id).get_block_ids()[1], full
+    )
 
 
 def test_chunked_cached_prefill_commits_only_suffix(runtime):
@@ -250,7 +239,11 @@ def test_chunked_cached_prefill_commits_only_suffix(runtime):
     result = proposer.propose(
         _context(manager, second, [f[32:39] for f in features], 32)
     )
-    _assert_committed(proposer, manager, second, [f[:39] for f in features])
+    _assert_committed(
+        proposer,
+        manager.get_blocks(second.request_id).get_block_ids()[1],
+        [f[:39] for f in features],
+    )
     assert (
         result.draft_token_ids
         == _dense_tokens(
@@ -318,7 +311,11 @@ def test_same_step_prefix_consumer_waits_for_all_context_writes(runtime):
     )
     result = proposer.propose(ctx)
     assert result.req_ids == ["consumer", "producer"]
-    _assert_committed(proposer, manager, second, [f[:39] for f in features])
+    _assert_committed(
+        proposer,
+        manager.get_blocks(second.request_id).get_block_ids()[1],
+        [f[:39] for f in features],
+    )
     assert (
         result.draft_token_ids[0]
         == _dense_tokens(
@@ -346,7 +343,11 @@ def test_resume_or_id_reuse_adopts_new_scheduler_hit(runtime, reuse_id):
         )
         is not None
     )
-    _assert_committed(proposer, manager, resumed, [f[:39] for f in features])
+    _assert_committed(
+        proposer,
+        manager.get_blocks(resumed.request_id).get_block_ids()[1],
+        [f[:39] for f in features],
+    )
 
 
 def test_evicted_page_ids_do_not_retain_request_coverage(runtime):
@@ -369,4 +370,6 @@ def test_evicted_page_ids_do_not_retain_request_coverage(runtime):
     features = _features(47)
     proposer.propose(_context(manager, new, features, 0))
     assert set(old) & set(manager.get_blocks("r").get_block_ids()[1])
-    _assert_committed(proposer, manager, new, features)
+    _assert_committed(
+        proposer, manager.get_blocks(new.request_id).get_block_ids()[1], features
+    )

@@ -65,6 +65,7 @@ def _base_config(**cache_overrides) -> SimpleNamespace:
             enable_chunked_prefill=True,
             max_num_batched_tokens=2048,
             max_num_scheduled_tokens=None,
+            long_prefill_token_threshold=0,
         ),
         lora_config=None,
         aux_output_config=AuxOutputConfig(),
@@ -115,6 +116,36 @@ def test_offloading_size_translates_to_metal_connector() -> None:
     # Upstream translation must be disarmed (it would force-set a connector
     # name after this hook has run).
     assert vllm_config.cache_config.kv_offloading_size is None
+
+
+@pytest.mark.parametrize("method", ["dflash", "dspark"])
+@pytest.mark.parametrize("prefix_caching", [False, True])
+@pytest.mark.parametrize(
+    "source", [None, "size", "OffloadingConnector", "MetalOffloadingConnector"]
+)
+def test_block_drafting_rejects_kv_offloading(method, prefix_caching, source):
+    vllm_config = _base_config(
+        enable_prefix_caching=prefix_caching,
+        kv_offloading_size=1.0 if source == "size" else None,
+    )
+    vllm_config.speculative_config = SimpleNamespace(
+        method=method, use_heterogeneous_vocab=False, num_speculative_tokens=3
+    )
+    if source not in (None, "size"):
+        vllm_config.kv_transfer_config = SimpleNamespace(
+            kv_connector=source,
+            kv_connector_module_path=None,
+            kv_role="kv_both",
+            kv_connector_extra_config={"cpu_bytes_to_use": 1 << 30},
+        )
+
+    if source is None:
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert vllm_config.kv_transfer_config is None
+        assert vllm_config.cache_config.enable_prefix_caching is prefix_caching
+    else:
+        with pytest.raises(NotImplementedError, match="(?i)KV offloading.*" + method):
+            MetalPlatform.check_and_update_config(vllm_config)
 
 
 def test_secondary_tiers_select_tiering_spec() -> None:

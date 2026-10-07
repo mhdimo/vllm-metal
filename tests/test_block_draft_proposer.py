@@ -58,6 +58,30 @@ def _features(count):
     return tuple(mx.random.normal((count, 64)).astype(mx.float16) for _ in range(3))
 
 
+def _assert_committed(proposer, blocks, features):
+    """Compare committed draft KV with independent full-context projections."""
+    for layer, (keys, values) in enumerate(
+        proposer.model._project_context([f[None] for f in features])
+    ):
+        for stored, expected in (
+            (proposer.cache.cache.key_caches[layer], keys),
+            (proposer.cache.cache.value_caches[layer], values),
+        ):
+            block_size = stored.shape[1]
+            actual = mx.stack(
+                [
+                    stored[blocks[p // block_size], p % block_size]
+                    for p in range(len(features[0]))
+                ]
+            )
+            np.testing.assert_allclose(
+                np.array(actual),
+                np.array(expected[0].transpose(1, 0, 2)),
+                atol=0.004,
+                rtol=0.004,
+            )
+
+
 def _prefill(state, features, start, final):
     count = features[0].shape[0]
     return ProposeContext(
@@ -131,31 +155,15 @@ def test_chunked_prefill_then_rejection_overwrites_temporary_kv(accepted, propos
     )
     actual = proposer.propose(ctx)
     features = [
-        mx.concatenate([a, b, c[: accepted + 1]])[None]
+        mx.concatenate([a, b, c[: accepted + 1]])
         for a, b, c in zip(first, second, feature, strict=True)
     ]
-    expected = _dense_tokens(proposer, mx.array([4]), features, 3)
+    expected = _dense_tokens(proposer, mx.array([4]), [f[None] for f in features], 3)
     assert actual.draft_token_ids == expected.tolist()
     assert proposer._valid_ends == {"r": 16 + accepted}
     # Assert the committed KV itself, not just argmax IDs: random residual
     # logits can retain an argmax even if rejected feature rows leak in.
-    for i, (keys, values) in enumerate(proposer.model._project_context(features)):
-        for stored, reference in (
-            (proposer.cache.cache.key_caches[i], keys),
-            (proposer.cache.cache.value_caches[i], values),
-        ):
-            committed = mx.stack(
-                [
-                    stored[state.block_ids[1][p // 16], p % 16]
-                    for p in range(16 + accepted)
-                ]
-            )
-            np.testing.assert_allclose(
-                np.array(committed),
-                np.array(reference[0].transpose(1, 0, 2)),
-                atol=0.004,
-                rtol=0.004,
-            )
+    _assert_committed(proposer, state.block_ids[1], features)
     # Cancellation/preemption invalidates logical coverage, even if the same
     # request ID and physical pages are immediately handed out again.
     proposer.release_requests({"r"})
@@ -276,6 +284,65 @@ def test_first_prefill_draft_uses_sampled_anchor_at_absolute_position(
     assert calls == [([2], [(state.block_ids[1], 31)])]
 
 
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_build_forwards_prefix_caching(monkeypatch, proposer, prefix_caching):
+    spec = SimpleNamespace(
+        draft_model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(), quantization=None, max_model_len=64
+        ),
+        num_speculative_tokens=3,
+        enable_adaptive_verification=False,
+        draft_sample_method="greedy",
+        rejection_sample_method="standard",
+        dspark_draft_topk=None,
+        quantization=None,
+        kv_cache_dtype=None,
+    )
+    runner = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            speculative_config=spec,
+            cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+            additional_config={},
+        ),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(to_dict=dict)),
+        kv_cache_dtype=mx.float16,
+        _spec_decode_controller=SpeculativeDecodeController(),
+    )
+    if isinstance(proposer, DSparkProposer):
+        model = proposer.draft_model
+    else:
+        model = proposer.model
+        runner._target_input_embeddings = proposer.embed
+        runner._forward_model = SimpleNamespace(
+            args=SimpleNamespace(tie_word_embeddings=True),
+            model=SimpleNamespace(embed_tokens=proposer.embed),
+        )
+    method = proposer.name.lower()
+    proposer_cls = type(proposer)
+    # Replace checkpoint I/O only; exercise the real builder and constructor.
+    monkeypatch.setattr(proposer_cls, "_checkpoint_path", lambda _: "unused")
+    monkeypatch.setattr(
+        f"vllm_metal.v1.{method}_proposer.load_{method}", lambda *a, **kw: model
+    )
+    built = proposer_cls.build(runner)
+    built.bind_cache(proposer.cache.storage, group_index=1, max_model_len=64)
+    state = RequestState(
+        token_ids=[1] * 31 + [2],
+        prompt_len=31,
+        sampling_params=SamplingParams(temperature=0),
+        block_ids=[[0, 1], [5, 2, 7, 1]],
+    )
+    features = _features(31)
+    built.cache.write_context([f[:16] for f in features], [(state.block_ids[1], 0, 16)])
+    ctx = _prefill(state, [f[16:] for f in features], 16, True)
+    if prefix_caching:
+        assert built.propose(ctx) is not None
+        _assert_committed(built, state.block_ids[1], features)
+    else:
+        with pytest.raises(RuntimeError, match="discontinuous"):
+            built.propose(ctx)
+
+
 @pytest.mark.parametrize("proposer_cls", [DFlashProposer, DSparkProposer])
 @pytest.mark.parametrize("restriction", ["lora", "tp", "block_size"])
 def test_unsupported_configuration_fails_before_loading(restriction, proposer_cls):
@@ -372,22 +439,7 @@ def test_width_changes_commit_verified_rows_and_reuse_compiled_callables(
         assert proposer._valid_ends == {"r": end}
         full_features = [f[None] for f in committed]
         # Inspect actual KV: argmax agreement alone can hide a bad ingest.
-        for layer, (keys, values) in enumerate(
-            proposer.model._project_context(full_features)
-        ):
-            for stored, expected in (
-                (proposer.cache.cache.key_caches[layer], keys),
-                (proposer.cache.cache.value_caches[layer], values),
-            ):
-                actual = mx.stack(
-                    [stored[state.block_ids[1][p // 16], p % 16] for p in range(end)]
-                )
-                np.testing.assert_allclose(
-                    np.array(actual),
-                    np.array(expected[0].transpose(1, 0, 2)),
-                    atol=0.004,
-                    rtol=0.004,
-                )
+        _assert_committed(proposer, state.block_ids[1], committed)
         if width == 0:
             assert result is None
         else:
@@ -476,12 +528,14 @@ def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
     result = proposer.propose(_prefill(state, suffix, 16, True))
     assert result is not None
     features = [
-        mx.concatenate([prefix[:16], tail])[None]
+        mx.concatenate([prefix[:16], tail])
         for prefix, tail in zip(original, suffix, strict=True)
     ]
     assert (
         result.draft_token_ids
-        == _dense_tokens(proposer, mx.array([4]), features, 3).tolist()
+        == _dense_tokens(
+            proposer, mx.array([4]), [f[None] for f in features], 3
+        ).tolist()
     )
     for saved, stored in zip(
         shared,
@@ -496,20 +550,7 @@ def test_prefix_hit_reuses_committed_kv_without_writing_shared_blocks(
         strict=True,
     ):
         np.testing.assert_array_equal(np.array(stored[5]), saved)
-    for layer, (keys, values) in enumerate(proposer.model._project_context(features)):
-        for stored, expected in (
-            (proposer.cache.cache.key_caches[layer], keys),
-            (proposer.cache.cache.value_caches[layer], values),
-        ):
-            actual = mx.stack(
-                [stored[state.block_ids[1][p // 16], p % 16] for p in range(23)]
-            )
-            np.testing.assert_allclose(
-                np.array(actual),
-                np.array(expected[0].transpose(1, 0, 2)),
-                atol=0.004,
-                rtol=0.004,
-            )
+    _assert_committed(proposer, state.block_ids[1], features)
 
 
 def test_prefix_hit_does_not_allow_a_later_gap(proposer):

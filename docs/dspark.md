@@ -54,6 +54,10 @@ hashing, shared pages, eviction, and cache reset. Its existing speculative
 block-drop policy stays in effect, and temporary draft slots are never committed
 prefix data. Use `--no-enable-prefix-caching` for a cold-cache comparison.
 
+KV offloading is rejected during configuration: the Metal offloader does not
+support restoring the target and draft cache groups. Remove `--kv-offloading-size`
+and any offloading connector from `--kv-transfer-config` when using DSpark.
+
 `enable_adaptive_verification`, non-greedy `draft_sample_method`, and nonstandard
 `rejection_sample_method` are rejected rather than ignored.
 The Metal compatibility bridge exempts only `MetalWorker` from the GPU V1

@@ -25,7 +25,9 @@ Use `temperature=0` without penalties, token constraints, or sample logprobs to
 exercise drafting. Other requests use ordinary target sampling. The current
 serving path requires a single-device Qwen3 text target, matching FP16 or BF16
 target/draft activation precision, and a native cache block size (8, 16, or 32).
-LoRA and TurboQuant fail explicitly.
+LoRA, TurboQuant, and KV offloading fail explicitly. Remove
+`--kv-offloading-size` and any offloading connector from `--kv-transfer-config`;
+the Metal offloader does not support restoring the target and draft cache groups.
 For this checkpoint, the configured maximum draft width may be 1–15. Near the context limit,
 requests continue with target-only decoding when a complete block cannot fit.
 

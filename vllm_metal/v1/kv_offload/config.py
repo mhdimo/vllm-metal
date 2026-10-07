@@ -145,6 +145,19 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
             "KV offloading on Metal does not support MLA models yet; the "
             "paged latent cache is not in the offload inventory."
         )
+    speculative_config = vllm_config.speculative_config
+    if speculative_config is not None and speculative_config.method in (
+        "dflash",
+        "dspark",
+    ):
+        # Block drafters need both target and draft cache groups restored;
+        # the Metal connector only supports one full-attention group.
+        raise NotImplementedError(
+            "KV offloading on Metal does not support "
+            f"{speculative_config.method} target/draft cache groups; remove "
+            "--kv-offloading-size and any offloading connector from "
+            "--kv-transfer-config."
+        )
 
     if kv_transfer_config is None:
         from vllm.config import KVTransferConfig
