@@ -23,7 +23,7 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 
 @pytest.mark.parametrize("width", [1, 3, 7])
-@pytest.mark.parametrize("draft_topk", [None, 8])
+@pytest.mark.parametrize("draft_topk", [None, 8, np.uint64(8)])
 @pytest.mark.parametrize("quantized", [False, True])
 def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(
     width, draft_topk, quantized
@@ -35,6 +35,7 @@ def test_dspark_uses_exactly_k_slots_at_context_and_page_limit(
         controller=SpeculativeDecodeController(),
         draft_topk=draft_topk,
     )
+    assert proposer.draft_topk is None or type(proposer.draft_topk) is int
     proposer.bind_cache(cache.storage, group_index=1, max_model_len=16)
     length = 16 - width
     features = _features(length)
@@ -104,6 +105,8 @@ def test_unsupported_drafting_options_fail_before_loading(option, value):
         (64, None, 64),
         (np.int64(8), None, 8),
         (None, np.int64(8), 8),
+        (np.uint64(8), None, 8),
+        (None, np.uint64(8), 8),
     ],
 )
 @pytest.mark.parametrize("quantized", [False, True])
@@ -146,6 +149,7 @@ def test_candidate_limit_resolves_explicit_option_before_checkpoint(
     monkeypatch.setattr(dspark_proposer, "load_dspark", load)
     proposer = DSparkProposer.build(runner)
     assert proposer.draft_topk == expected
+    assert proposer.draft_topk is None or type(proposer.draft_topk) is int
     assert proposer.max_model_len == 32
     assert isinstance(proposer.draft_model.lm_head, nn.QuantizedLinear) == quantized
 

@@ -2,6 +2,7 @@
 """DSpark proposals over scheduler-owned committed and lookahead draft KV."""
 
 from collections.abc import Callable, Sequence
+from numbers import Integral
 
 import mlx.core as mx
 
@@ -35,7 +36,7 @@ class DSparkPagedCache(BlockDraftPagedCache):
         self,
         *,
         num_draft_tokens: int,
-        draft_topk: int | None = None,
+        draft_topk: Integral | None = None,
         corrected_logits: bool = True,
     ) -> Callable[
         [mx.array, Sequence[tuple[Sequence[int], int]]],
@@ -50,7 +51,9 @@ class DSparkPagedCache(BlockDraftPagedCache):
         before the repeated forward. Metadata validation remains in the graph.
         """
         model = self.draft_model
-        model.validate_draft_topk(draft_topk, model.config.backbone.vocab_size)
+        draft_topk = model.validate_draft_topk(
+            draft_topk, model.config.backbone.vocab_size
+        )
         return self.compile_block(
             width=num_draft_tokens,
             embed=lambda anchors: model.block_embeddings(anchors, num_draft_tokens),

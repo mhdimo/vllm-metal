@@ -100,8 +100,11 @@ def test_ragged_proposals_commit_verified_features_and_reuse_pages(
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("width", [1, 7])
-def test_candidate_limited_proposals_commit_features_and_reuse_pages(dtype, width):
-    _check_ragged_proposals(dtype, 16, width, True, True, draft_topk=8)
+@pytest.mark.parametrize("draft_topk", [8, np.uint64(8)])
+def test_candidate_limited_proposals_commit_features_and_reuse_pages(
+    dtype, width, draft_topk
+):
+    _check_ragged_proposals(dtype, 16, width, True, True, draft_topk=draft_topk)
 
 
 def _check_ragged_proposals(

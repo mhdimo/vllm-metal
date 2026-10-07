@@ -257,7 +257,7 @@ class DSparkModel(nn.Module):
         hidden: mx.array,
         anchors: mx.array,
         *,
-        draft_topk: int | None = None,
+        draft_topk: Integral | None = None,
         corrected_logits: bool = True,
     ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         """Return token IDs, corrected logits, and optional raw confidence logits.
@@ -281,10 +281,9 @@ class DSparkModel(nn.Module):
         # The vocabulary projection may have packed integer weights.
         if hidden.dtype != self.embed_tokens.weight.dtype:
             raise ValueError("DSpark block states must use the checkpoint precision")
-        self.validate_draft_topk(draft_topk, self.config.backbone.vocab_size)
-        if draft_topk is not None:
-            # NumPy 1.x can promote unsigned integer subtraction to float.
-            draft_topk = int(draft_topk)
+        draft_topk = self.validate_draft_topk(
+            draft_topk, self.config.backbone.vocab_size
+        )
         logits = self.lm_head(hidden)
         indices = values = None
         if draft_topk is not None and draft_topk < logits.shape[-1]:
@@ -349,7 +348,7 @@ class DSparkModel(nn.Module):
         features: Sequence[mx.array],
         *,
         num_draft_tokens: int,
-        draft_topk: int | None = None,
+        draft_topk: Integral | None = None,
         corrected_logits: bool = True,
     ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         hidden = self.block_hidden(anchors, features, num_draft_tokens=num_draft_tokens)
@@ -361,16 +360,19 @@ class DSparkModel(nn.Module):
         )
 
     @staticmethod
-    def validate_draft_topk(draft_topk: int | None, vocab_size: int) -> None:
-        if draft_topk is not None and (
-            isinstance(draft_topk, bool)
-            or not isinstance(draft_topk, Integral)
-            or not 1 <= draft_topk <= vocab_size
-        ):
-            raise ValueError(
-                f"DSpark draft_topk must be an integer in [1, {vocab_size}], "
-                f"got {draft_topk!r}"
-            )
+    def validate_draft_topk(draft_topk: Integral | None, vocab_size: int) -> int | None:
+        """Validate and normalize a candidate limit for backend arithmetic."""
+        if draft_topk is None:
+            return None
+        if not isinstance(draft_topk, bool) and isinstance(draft_topk, Integral):
+            # NumPy 1.x can promote unsigned integer subtraction to float.
+            value = draft_topk if type(draft_topk) is int else int(draft_topk)
+            if 1 <= value <= vocab_size:
+                return value
+        raise ValueError(
+            f"DSpark draft_topk must be an integer in [1, {vocab_size}], "
+            f"got {draft_topk!r}"
+        )
 
     def validate_anchors(self, anchors: mx.array) -> None:
         self.backbone.validate_anchors(anchors)
