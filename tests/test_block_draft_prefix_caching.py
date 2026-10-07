@@ -13,7 +13,7 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 from vllm.v1.request import Request
 
-from tests.test_block_draft_proposer import (
+from tests.block_draft_helpers import (
     _assert_committed,
     _dense_tokens,
     _features,

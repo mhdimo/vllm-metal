@@ -12,7 +12,7 @@ import torch
 from vllm import SamplingParams
 from vllm.config import VllmConfig
 
-from tests.test_block_draft_proposer import _features, _prefill
+from tests.block_draft_helpers import _features, _prefill
 from tests.test_dspark_paged import make_cache
 from tests.test_dspark_quantization import make_model
 from vllm_metal.patches.dspark_config import enable_dspark_for_metal_runner
