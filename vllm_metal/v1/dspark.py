@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -257,6 +258,9 @@ class DSparkModel(nn.Module):
         if hidden.dtype != self.embed_tokens.weight.dtype:
             raise ValueError("DSpark block states must use the checkpoint precision")
         self.validate_draft_topk(draft_topk, self.config.backbone.vocab_size)
+        if draft_topk is not None:
+            # NumPy 1.x can promote unsigned integer subtraction to float.
+            draft_topk = int(draft_topk)
         logits = self.lm_head(hidden)
         indices = values = None
         if draft_topk is not None and draft_topk < logits.shape[-1]:
@@ -335,9 +339,14 @@ class DSparkModel(nn.Module):
     @staticmethod
     def validate_draft_topk(draft_topk: int | None, vocab_size: int) -> None:
         if draft_topk is not None and (
-            type(draft_topk) is not int or not 1 <= draft_topk <= vocab_size
+            isinstance(draft_topk, bool)
+            or not isinstance(draft_topk, Integral)
+            or not 1 <= draft_topk <= vocab_size
         ):
-            raise ValueError("DSpark draft_topk must be an integer in [1, vocab_size]")
+            raise ValueError(
+                f"DSpark draft_topk must be an integer in [1, {vocab_size}], "
+                f"got {draft_topk!r}"
+            )
 
     def validate_anchors(self, anchors: mx.array) -> None:
         self.backbone.validate_anchors(anchors)

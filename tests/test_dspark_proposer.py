@@ -97,7 +97,14 @@ def test_unsupported_drafting_options_fail_before_loading(option, value):
 
 @pytest.mark.parametrize(
     "explicit,checkpoint,expected",
-    [(None, None, None), (None, 8, 8), (16, 8, 16), (64, None, 64)],
+    [
+        (None, None, None),
+        (None, 8, 8),
+        (16, 8, 16),
+        (64, None, 64),
+        (np.int64(8), None, 8),
+        (None, np.int64(8), 8),
+    ],
 )
 @pytest.mark.parametrize("quantized", [False, True])
 def test_candidate_limit_resolves_explicit_option_before_checkpoint(
